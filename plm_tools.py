@@ -10,24 +10,18 @@ def _tool_python() -> dict[str, Any]:
     # passes non-Chat-Completions-shaped tools through unchanged, so this dict
     # reaches the API as-is.
     #
-    # Used by BOTH PLM's top-level loop AND react_llm's inner loop. The
-    # description below is intentionally framed for either context: call
-    # `RETURN(value)` to finalize, author `@policy def helper(): ...` to
-    # create reusable named policies that persist across cells.
+    # Used by BOTH PLM's top-level loop AND react_llm's inner loop, so the
+    # description is intentionally GENERIC — just the python-REPL mechanics plus
+    # the universal `RETURN(value)` finalize primitive.
     return {
         "type": "function",
         "name": "python",
         "description": (
-            "Execute Python in a persistent REPL. Use print statements or "
-            "any variable to output observations. To FINALIZE the task, call "
-            "`RETURN(value)` from inside the python code — this terminates "
-            "the agent loop and returns `value`. You can also author new "
-            "policies with `@policy def helper(...): ...` (registered "
-            "globally, persisting across cells). When called from inside "
-            "`react_llm`, your code runs with restricted globals: only "
-            "`__builtins__`, `RETURN`, and `policy` are ambient — anything "
-            "else needed must be passed via the call's `args` / `kwargs` / "
-            "`objects` channels (preseeded as local names)."
+            "Execute Python in a persistent REPL — state (variables, imports, "
+            "definitions) persists across calls. Use `print(...)` to surface "
+            "observations (cells run in exec mode, so a bare trailing expression "
+            "is NOT printed). To finalize, call `RETURN(value)` from inside the "
+            "code: this ends the agent loop and returns `value`."
         ),
         "parameters": {
             "type": "object",

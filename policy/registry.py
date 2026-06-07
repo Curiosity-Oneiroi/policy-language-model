@@ -25,16 +25,143 @@ from __future__ import annotations
 
 import linecache as _linecache
 import sys
+from contextlib import contextmanager as _contextmanager
 
 
-_PLM_POLICIES: dict = {}            # name -> _FunctionPolicy proxy | real class
 _MISSING = object()                 # sentinel: shared with guard (it imports this one)
 
 # Module-level (NOT __main__) so ordinary cell code can't hold/mutate these by
-# name. Bootstrap populates them after the LLM defaults install; they are
-# rebuilt from scratch on each boot, so no snapshot is needed.
+# name. Bootstrap populates them via `_seal` after the LLM defaults install;
+# they are rebuilt from scratch on each boot, so no snapshot is needed. They
+# carry the immutable/un-duplicable NAMES used by the name-based checks (Guard A,
+# duplicate_policy); the per-OBJECT truth is the policy's `_p_immutable` flag.
 _IMMUTABLE_POLICIES: set = set()
 _UNDUPLICABLE_POLICIES: set = set()
+
+
+# --- the single policy store + its default-policy protection ------------------
+#
+# `_PLM_POLICIES` is the ONE registry (name -> _FunctionPolicy proxy | class
+# policy). Immutability is a property of the policy OBJECT — its `_p_immutable`
+# flag, i.e. a "default policy" vs a "normal policy" — NOT a parallel store.
+# While SEALED (the normal state during cell execution) the store refuses to
+# REPLACE or REMOVE an entry whose current value is a default policy, closing the
+# ordinary tamper paths (`store[k]=x`, `del store[k]`, pop/popitem/update/clear/
+# |=). The harness lifts the seal via `_unsealed()` for the full-reset paths it
+# owns (crash-restart rehydrate, test teardown). Installing a default works
+# because the key is absent at install time; `_seal` flips the flag afterwards.
+#
+# Irreducible boundary (documented; same class as `_BLESSED_CALLERS`): a
+# deliberate `dict.__setitem__(store, ...)` or flipping `_STORE_UNSEALED` from an
+# imported module reference bypasses this — and the blessed-caller gate prevents
+# privilege escalation regardless (a hijacked default still cannot reach
+# `_make_backend`). This is integrity hardening of the edit API, not a sandbox.
+
+_STORE_UNSEALED: bool = False
+
+
+@_contextmanager
+def _unsealed():
+    """Temporarily lift default-policy protection on `_PLM_POLICIES`. HARNESS ONLY
+    (crash-restart rehydrate / test reset). Re-entrant-safe."""
+    global _STORE_UNSEALED
+    _prev = _STORE_UNSEALED
+    _STORE_UNSEALED = True
+    try:
+        yield
+    finally:
+        _STORE_UNSEALED = _prev
+
+
+def _is_default(value) -> bool:
+    """True iff `value` is a DEFAULT (immutable) policy — intrinsic to the object."""
+    return getattr(value, "_p_immutable", False) is True
+
+
+class _PolicyStore(dict):
+    """The single policy registry; refuses to replace/remove a default-policy
+    entry while sealed (see module notes above)."""
+
+    def _blocked(self, key) -> bool:
+        if _STORE_UNSEALED:
+            return False
+        if _is_default(dict.get(self, key)):
+            from .proxy import _policy_note           # local import: break import cycle
+            _policy_note(
+                f"{key!r} is an immutable default policy; the registry refuses to "
+                f"replace/remove it. Use `duplicate_policy({key!r}, '<new_name>')` to fork."
+            )
+            return True
+        return False
+
+    def __setitem__(self, key, value):
+        if dict.get(self, key) is value:              # idempotent re-set -> no-op
+            return
+        if self._blocked(key):
+            return
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        if self._blocked(key):
+            return
+        dict.__delitem__(self, key)
+
+    def pop(self, key, *default):
+        if self._blocked(key):                        # protected: keep it, return current value
+            return dict.__getitem__(self, key)
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        if _STORE_UNSEALED:
+            return dict.popitem(self)
+        for _k in reversed(list(self.keys())):        # remove the last NON-default entry
+            if not _is_default(dict.get(self, _k)):
+                _v = dict.__getitem__(self, _k)
+                dict.__delitem__(self, _k)
+                return (_k, _v)
+        raise KeyError("popitem: only immutable default policies remain")
+
+    def setdefault(self, key, default=None):
+        return dict.setdefault(self, key, default)    # never REPLACES an existing key
+
+    def update(self, other=(), **kwargs):
+        if hasattr(other, "keys"):
+            for _k in other.keys():
+                self[_k] = other[_k]
+        else:
+            for _k, _v in other:
+                self[_k] = _v
+        for _k, _v in kwargs.items():
+            self[_k] = _v
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def clear(self):
+        if _STORE_UNSEALED:
+            dict.clear(self)
+            return
+        for _k in [k for k in list(self.keys()) if not _is_default(dict.get(self, k))]:
+            dict.__delitem__(self, _k)
+
+
+_PLM_POLICIES = _PolicyStore()      # the single name -> policy registry
+
+
+def _seal(name: str) -> None:
+    """Mark a registered policy as a DEFAULT (immutable) + un-duplicable: set the
+    intrinsic `_p_immutable` flag on the object (the default-vs-normal
+    distinction) and record the name in the immutable/un-duplicable name-sets
+    (used by Guard A and the by-name checks). Idempotent."""
+    p = dict.get(_PLM_POLICIES, name)
+    if p is not None:
+        try:
+            p._p_immutable = True                     # idempotent (proxy allows re-set to True)
+        except Exception:
+            pass
+    _IMMUTABLE_POLICIES.add(name)
+    _UNDUPLICABLE_POLICIES.add(name)
 
 
 def _main() -> dict:
@@ -140,8 +267,10 @@ def duplicate_policy(name: str, new_name: str):
     Refuses (with a `_policy_note`, no raise) when:
       * `name` is not registered.
       * `name` is in `_UNDUPLICABLE_POLICIES` (the LLM defaults — model-access base).
-      * `new_name` is not a valid identifier, OR already in `_PLM_POLICIES` /
-        `__main__`.
+      * `new_name` fails the shared `@policy` name rule (`_reserved_name_reason`):
+        not a valid identifier, a reserved kernel name, or a kernel-internal
+        prefix (`__` / `_repl` / `_REPL`) — the same names `@policy` rejects.
+      * `new_name` is already in `_PLM_POLICIES` / `__main__`.
 
     The copy is created via the normal `@policy` install path under a fresh
     `<policy-dup-{new_name}>` linecache slot. Internal references inside the
@@ -152,18 +281,30 @@ def duplicate_policy(name: str, new_name: str):
     """
     from .edits import _compute_rename
     from .proxy import _policy_note
+    from .decorator import _reserved_name_reason
 
     _sync()
     if name not in _PLM_POLICIES:
-        raise KeyError(name)
+        # Docstring promises ALL refusals are a gentle note + return None (no
+        # raise) — the _duplicate/_class_duplicate proxy wrappers rely on it.
+        _policy_note(f"duplicate: {name!r} is not a registered policy")
+        return None
     if name in _UNDUPLICABLE_POLICIES:
         _policy_note(
             f"{name!r} is un-duplicable (model-access base); cannot duplicate"
         )
         return None
-    if not new_name.isidentifier() or new_name in _PLM_POLICIES or new_name in _main():
+    # Pre-check the SAME name rule `@policy` enforces, so a name it would later
+    # reject (reserved / __ / _repl / _REPL prefix / kernel-internal) is refused
+    # here with a gentle note instead of blowing up with a raw ValueError deep in
+    # the install path below.
+    reason = _reserved_name_reason(new_name)
+    if reason is not None:
+        _policy_note(f"duplicate: {reason}")
+        return None
+    if new_name in _PLM_POLICIES or new_name in _main():
         _policy_note(
-            f"duplicate: {new_name!r} is taken or not a valid name"
+            f"duplicate: {new_name!r} is already taken"
         )
         return None
     new_src = _compute_rename(_PLM_POLICIES[name]._p_source, new_name)

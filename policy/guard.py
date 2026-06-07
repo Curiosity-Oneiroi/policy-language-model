@@ -105,6 +105,9 @@ def _audit_stmts(stmts, names, immutable_names=()):
         for h in getattr(s, "handlers", []):    # try/except handler bodies
             if e := _audit_stmts(h.body, names, immutable_names):
                 return e
+        for c in getattr(s, "cases", []):       # match/case bodies (ast.Match.cases[*].body)
+            if e := _audit_stmts(c.body, names, immutable_names):
+                return e
     return None
 
 

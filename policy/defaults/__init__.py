@@ -6,11 +6,16 @@ Layout (per the plan):
     the LLM-policy bodies; owns `_make_backend()`, the depth ContextVar +
     `llm_call`/`descend`/`check_depth_or_raise`/`LLMDepthExceeded`, and the
     blessed-caller gate (`_BLESSED_CALLERS` / `_check_blessed_caller`).
-  * `natural_llm.py`, `react_llm.py` — the v1 policy source files (read as
-    TEXT by `iter_default_policies` and replayed as synthetic cells via the
-    bootstrap loader, NOT imported as Python modules — that's how the policy
-    source extraction + linecache pipeline works uniformly for defaults + extras).
-  * (deferred v1.5) `react_llm_verifier.py`.
+  * `natural_llm.py`, `react_llm.py`, `react_llm_verifier.py` — the immutable
+    LLM-loop policy source files, and `base_verifier.py` — a MUTABLE +
+    DUPLICABLE reference verifier. All are read as TEXT by
+    `iter_default_policies` and replayed as synthetic cells via the bootstrap
+    loader, NOT imported as Python modules — that's how the policy source
+    extraction + linecache pipeline works uniformly for defaults + extras.
+    Immutability/blessing is decided per-name by `UNDUPLICABLE_DEFAULTS`
+    (below), NOT by being a default file: `base_verifier` is a default file that
+    is deliberately NOT in that set, so it stays mutable + duplicable +
+    unblessed (it reaches the model only via `natural_llm` / `react_llm`).
 
 This package exports three names the PREFIX bootstrap uses:
   * `iter_default_policies()` — yields (name, full_source) for each policy file.
@@ -44,9 +49,11 @@ def iter_default_policies():
         yield p.stem, p.read_text()
 
 
-# The v1 LLM-default names. Bootstrap seals these as immutable + un-duplicable.
-# v1.5 will add `"react_llm_verifier"` here (and ship a corresponding .py).
-UNDUPLICABLE_DEFAULTS = frozenset({"natural_llm", "react_llm"})
+# The immutable LLM-default names. Bootstrap seals these as immutable +
+# un-duplicable + blessed. NOTE: `base_verifier` ships as a default file too but
+# is intentionally ABSENT here — that is what keeps it mutable + duplicable +
+# unblessed (a PLM-forkable reference verifier).
+UNDUPLICABLE_DEFAULTS = frozenset({"natural_llm", "react_llm", "react_llm_verifier"})
 
 
 def _bless_llm_callers() -> None:

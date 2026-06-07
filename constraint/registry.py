@@ -11,13 +11,14 @@ PLM (or downstream code) can extend the registry at runtime:
         if rdkit.Chem.MolFromSmiles(s) is None:
             raise ValueError("not a valid SMILES string")
     Constraint.registry["smiles"] = _smiles_check
-    Constraint.of(kind="smiles").validate("CCO")
+    Constraint.field(kind="smiles").validate("CCO")
 """
 
 from __future__ import annotations
 
 import json as _json
 import keyword as _keyword
+import os
 import re as _re
 from datetime import date
 from pathlib import Path
@@ -93,8 +94,11 @@ def _uuid(s: Any) -> None:
 
 
 def _path_exists(s: Any) -> None:
-    p = Path(s)
-    if not p.exists():
+    if not isinstance(s, (str, os.PathLike)):
+        raise ValueError(
+            f"path_exists: expected str/os.PathLike, got {type(s).__name__}"
+        )
+    if not Path(s).exists():
         raise ValueError(f"path_exists: {s!r} does not exist")
 
 

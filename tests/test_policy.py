@@ -296,6 +296,29 @@ def test_structural_fallback_slots_introduced(capsys):
     assert new._p_source and callable(new._rewrite)  # replacement is a full policy
 
 
+def test_class_call_with_wrapped_attr_still_depth_capped_after_rewrite():
+    """#12: editing a class policy to a `__call__` that carries `__wrapped__` (as
+    `@functools.wraps`/`@lru_cache` would set) must STILL install the depth-cap
+    wrapper — the re-wrap guard keys on our private `_plm_depth_wrapped` marker,
+    not the generic `__wrapped__` (which the old check mistook for 'already
+    ours' and skipped, leaving __call__ uncapped)."""
+    @policy
+    class CallerC:
+        def __call__(self, x):
+            return x + 1
+    src = (
+        "class CallerC:\n"
+        "    def __call__(self, x):\n"
+        "        return x + 5\n"
+        "    __call__.__wrapped__ = __call__   # mimics @functools.wraps setting __wrapped__\n"
+    )
+    CallerC._rewrite(src)
+    cc = sys.modules["__main__"].__dict__["CallerC"]
+    installed = cc.__dict__["__call__"]
+    assert getattr(installed, "_plm_depth_wrapped", False) is True   # cap wrapper IS installed
+    assert cc()(10) == 15                                            # behavior preserved
+
+
 # ============================ decorator / guard / registry ============================
 
 def test_decorator_type_and_value_errors():
@@ -314,6 +337,36 @@ def test_decorator_type_and_value_errors():
         return 1
     with pytest.raises(ValueError):
         policy(_repl_x)
+
+
+def test_duplicate_policy_reserved_name_gentle_refusal(capsys):
+    """C26: duplicate_policy must refuse a kernel-reserved / internal-prefix
+    new_name the SAME way @policy would — with a gentle `_policy_note`, NOT a
+    raw ValueError traceback from deep in the install path."""
+    from plm.policy import duplicate_policy
+
+    @policy
+    def src_pol(s):
+        return 1
+
+    # Names @policy rejects: a reserved helper name, and the kernel-internal
+    # prefixes (__ / _repl / _REPL). Each must come back as None + a note.
+    # #11: a NON-STR new_name (e.g. 123) must ALSO be a gentle refusal, not a raw
+    # AttributeError from `.isidentifier()` deep in the shared name rule.
+    for bad in ("list_policies", "__x", "_repl_foo", "_REPLthing", 123, None):
+        capsys.readouterr()                               # clear
+        result = duplicate_policy("src_pol", bad)
+        assert result is None, f"{bad!r} should be refused"
+        err = capsys.readouterr().err
+        assert "[policy] duplicate:" in err
+        # the original is untouched and no broken policy was installed
+        assert bad not in _PLM_POLICIES
+    # sanity: a clean name still works. The successful path re-execs
+    # "@policy\ndef ..." in __main__, which needs the `policy` NAME bound there
+    # (the kernel PREFIX injects it; in-process we bind it for this step).
+    sys.modules["__main__"].__dict__["policy"] = policy
+    dup = duplicate_policy("src_pol", "src_pol_copy")
+    assert dup is not None and "src_pol_copy" in _PLM_POLICIES
 
 
 def test_guard_a_rejects_static_rebind():
@@ -473,6 +526,70 @@ def test_del_via_helper_excludes_from_list():
     assert "predict" not in sys.modules["__main__"].__dict__
 
 
+def test_class_policy_staticmethod_call_not_depth_wrapped():
+    """#R5-6: a class policy whose __call__ is a @staticmethod must NOT be wrapped
+    by the depth-cap (which reads cls.__dict__['__call__'] as a plain method and
+    calls it `_orig_call(self, ...)` — mis-forwarding self for a staticmethod and
+    raising TypeError). The wrap is skipped for non-FunctionType descriptors; the
+    call works and the descriptor is left intact (the LLM-depth gate is enforced
+    independently by the blessed-caller checks, not this advisory cap)."""
+    @policy
+    class CallSM:
+        @staticmethod
+        def __call__():
+            return "ok-static"
+
+    assert CallSM()() == "ok-static"                     # no mis-forwarded-self TypeError
+    assert isinstance(CallSM.__dict__["__call__"], staticmethod)   # left a staticmethod (unwrapped)
+
+    # And the in-place re-wrap path (rewrite) is guarded too: rewriting to another
+    # staticmethod __call__ must not break the call.
+    CallSM._rewrite(
+        "class CallSM:\n    @staticmethod\n    def __call__():\n        return 'ok2'\n"
+    )
+    assert CallSM()() == "ok2"
+    assert isinstance(CallSM.__dict__["__call__"], staticmethod)
+
+
+def test_root_loop_coerces_non_dict_tool_args(monkeypatch):
+    """#R5-3: a `python` tool call whose `arguments` is valid JSON but NOT an object
+    ('null'/'[]'/'123') must not crash PLM.__call__ with a raw AttributeError from
+    `targs.get('code', ...)`. The root loop coerces non-dict targs to {} (mirroring
+    both inner loops), runs an empty cell, and exhausts the budget GRACEFULLY
+    (PLMTaskFailure). A fake REPL keeps this in-process — no subprocess kernel."""
+    import asyncio
+    from plm.plm import PLM, PLMMetaParameters, PLMTaskFailure
+
+    class _FakeRepl:                                     # the shape PLM.__call__ needs
+        kernel_epoch = 0
+        def __init__(self, **kw): pass
+        def execute_cell(self, code, _seed, _delta):
+            return {"type": "result", "stdout": "", "stderr": ""}
+        def close(self): pass
+
+    monkeypatch.setattr("plm.plm.PythonReplSession", _FakeRepl)
+
+    class _BadArgsBackend:                               # always emits non-object tool args
+        model = "stub"
+        def __init__(self): self.calls = 0
+        async def generate(self, messages=None, tools=None, **kw):
+            self.calls += 1
+            return {
+                "content": "",
+                "tool_calls": [{"id": f"t{self.calls}", "type": "function",
+                                "function": {"name": "python", "arguments": "null"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    backend = _BadArgsBackend()
+    plm = PLM(model_backend=backend,
+              metaparams=PLMMetaParameters(system_prompt="solve it"),
+              max_turns=2, return_budget=0)
+    with pytest.raises(PLMTaskFailure):                  # graceful exhaustion, NOT AttributeError
+        asyncio.run(plm([{"role": "user", "content": "go"}]))
+    assert backend.calls >= 1
+
+
 # ============================ integration (subprocess kernel) ============================
 
 @pytest.fixture(scope="module")
@@ -498,12 +615,63 @@ def test_int_liveness(repl):
     assert r["stdout"].strip() == "v2 v2 v2", r
 
 
+def test_int_injected_helpers_protected(repl):
+    """Kernel-injected NON-policy helpers (exec_ns, parallel, policy ops) are restored
+    if a cell rebinds OR deletes them — granted helpers can't be clobbered for the next
+    cell, the same protection immutable policies get. (`plm_messages`, a reseeded list,
+    is deliberately NOT in the protected set, so live trajectory state is untouched.)"""
+    r0 = repl.execute_cell("exec_ns = 5\ndel parallel\nplm_messages.append('keep-me')")
+    assert "reverted" in r0["stderr"], r0                  # the guard noted the revert
+    r = repl.execute_cell(
+        "print(callable(exec_ns), callable(parallel), 'keep-me' in plm_messages)")
+    assert r["stdout"].strip() == "True True True", r      # helpers restored; list NOT wiped
+
+
+def test_int_constraint_surface_ambient_with_pydantic():
+    """The prefix best-effort-injects the WHOLE constraint surface when the kernel has
+    pydantic (standard kernels do, via DEFAULT_PREINSTALL): a cell uses `Constraint`,
+    `ConstraintViolation`, and the `@constraint` decorator with NO import. The default
+    `repl` fixture is dill-only (no pydantic), so it can't show this — boot a pydantic
+    kernel here. This is the end-to-end check that the guarded warmup actually fires."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=15.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        r = s.execute_cell(
+            "ok = (Constraint.__name__ == 'Constraint' and hasattr(Constraint, 'field') "
+            "and ConstraintViolation.__name__ == 'ConstraintViolation' and callable(constraint))\n"
+            "print('AMBIENT_OK' if ok else 'AMBIENT_FAIL')"
+        )
+        assert r["stdout"].strip() == "AMBIENT_OK", r
+    finally:
+        s.close()
+
+
 def test_int_class_hotswap(repl):
     repl.execute_cell("@policy\nclass Netz:\n    def m(self): return 1\n")
     repl.execute_cell("a = Netz()")
     repl.execute_cell("Netz._rewrite('class Netz:\\n    def m(self): return 2\\n    def n(self): return 9\\n')")
     r = repl.execute_cell("print(a.m(), a.n(), isinstance(a, Netz))")
     assert r["stdout"].strip() == "2 9 True", r
+
+
+def test_int_class_redecoration_structural_is_canonical(repl):
+    """#10: re-decorating a class via `@policy` with a STRUCTURAL change (new
+    __slots__) forces _remove_and_recreate. The decorator must bind/return the
+    NEW canonical class — `__main__`'s name, the registry, and instances must all
+    agree (no clobber-back to the dead old class). Cells are separate sources, so
+    the second cell's __slots__ version is recovered correctly (unlike one file)."""
+    repl.execute_cell("@policy\nclass NetRedec:\n    def m(self): return 1\n")
+    repl.execute_cell("@policy\nclass NetRedec:\n    __slots__ = ('z',)\n    def m(self): return 2\n")
+    r = repl.execute_cell(
+        "print(NetRedec().m(), _PLM_POLICIES['NetRedec'] is NetRedec)")
+    assert r["stdout"].strip() == "2 True", r          # new behavior + registry==__main__
 
 
 def test_int_guard_rejects_rebind(repl):
@@ -567,3 +735,715 @@ def test_int_builtin_shadow_doesnt_brick(repl):
     assert r["stdout"].strip() == "1", r
     r2 = repl.execute_cell("p._rewrite('def p(s): return 2'); print(p('x'))")
     assert r2["stdout"].strip() == "2", r2
+
+
+def test_int_guard_survives_cell_rebinding_guard_helpers(repl):
+    """#R5-1: a cell that rebinds the guard helpers in __main__ via bare-name
+    assigns (which Guard A does NOT flag — it only rejects POLICY-name rebinds)
+    must NOT disable Guard A/C. The loop re-imports the helpers fresh from their
+    module every iteration, so a SUBSEQUENT attempt to hijack an immutable
+    default's __main__ binding is still rejected and the real proxy preserved."""
+    # Disable the guards the easy way — plain __main__ rebinds Guard A won't catch.
+    repl.execute_cell(
+        "_audit_cell = lambda *a, **k: None\n"
+        "_post_cell_guard = lambda *a, **k: None\n"
+    )
+    # Now try to hijack an immutable default. Fresh-imported Guard A must reject it.
+    r = repl.execute_cell("natural_llm = lambda *a, **k: 'PWNED'\n")
+    assert "rebind policy 'natural_llm'" in r["stderr"], r
+    # natural_llm is STILL the real immutable proxy, not the hijack lambda — the
+    # __main__ binding equals the registry's canonical object (identity check; no
+    # `type()`/builtins, since the shared session permanently shadows them).
+    r2 = repl.execute_cell(
+        "print('natural_llm' in list_policies(), _PLM_POLICIES['natural_llm'] is natural_llm)"
+    )
+    assert r2["stdout"].strip() == "True True", r2
+
+
+def test_int_immutable_redecoration_skips_closure_warning(repl):
+    """#R5-7: re-decorating an immutable default is refused BEFORE the
+    closure-capture check runs, so the misleading 'will NameError at call' warning
+    is not emitted for a body that is discarded — only the 'ignored' note fires."""
+    r = repl.execute_cell(
+        "def _outer():\n"
+        "    captured = 5\n"
+        "    @policy\n"
+        "    def natural_llm():\n"
+        "        return captured\n"          # a real enclosing-local capture (free var)
+        "    return natural_llm\n"
+        "_outer()\n"
+    )
+    assert "re-decoration ignored" in r["stderr"], r              # the refusal note fired
+    assert "captures enclosing-function local" not in r["stderr"], r   # NOT the closure warning
+
+
+# ===================== seed channel + plm_messages =====================
+
+
+def test_strip_code_fences_unwraps_only_structural_fences():
+    """_strip_code_fences unwraps a genuinely fence-wrapped arg but NEVER touches
+    backticks embedded in valid Python (finding C00/C10)."""
+    from plm._react_helper import _strip_code_fences
+
+    # genuine wrappers -> unwrapped
+    assert _strip_code_fences("```python\nprint('hi')\n```") == "print('hi')"
+    assert _strip_code_fences("```\nx = 1\n```") == "x = 1"
+    assert _strip_code_fences("```py3\n\nprint(1)\n\n```") == "print(1)"
+
+    # valid Python with ``` inside a docstring / string / comment -> UNCHANGED
+    doc = 'def f():\n    """ex:\n    ```\n    f()\n    ```\n    """\n    return 1'
+    assert _strip_code_fences(doc) == doc
+    assert _strip_code_fences("s = '```'\nprint(s)") == "s = '```'\nprint(s)"
+    multiline = 'x = """```\nnot a fence\n```"""\nprint(x)'
+    assert _strip_code_fences(multiline) == multiline
+
+    # no fence at all -> unchanged
+    assert _strip_code_fences("a = 1\nb = 2") == "a = 1\nb = 2"
+
+    # code AFTER a fenced block is NOT silently dropped (old bug took only 'A'):
+    out = _strip_code_fences("```python\nA\n```\nprint('after')")
+    assert "after" in out and "```" in out
+
+
+def test_strip_code_fences_bad_language_raises():
+    """A genuine fence wrapper with a non-Python language tag raises SyntaxError."""
+    import pytest
+    from plm._react_helper import _strip_code_fences
+    with pytest.raises(SyntaxError):
+        _strip_code_fences("```sql\nSELECT 1\n```")
+
+
+def test_compute_insert_no_glue_when_prefix_lacks_newline():
+    """_compute_insert must not glue `content` onto a prefix line that lacks a
+    trailing newline (reachable when a prior _edit stripped the final '\\n')."""
+    from plm.policy.edits import _compute_insert
+    # last line has NO trailing newline -> insert after it must start a new line
+    assert _compute_insert("a = 1\nb = 2", 2, "c = 3\n") == "a = 1\nb = 2\nc = 3\n"
+    # normal case (prefix already ends in '\n') unchanged
+    assert _compute_insert("a = 1\nb = 2\n", 2, "c = 3\n") == "a = 1\nb = 2\nc = 3\n"
+    # mid-file insert still works
+    assert _compute_insert("x\ny\n", 1, "INS\n") == "x\nINS\ny\n"
+    # #16: content lacking a trailing newline on a MID-source insert must not
+    # glue onto the following line (symmetric to the prefix guard).
+    assert _compute_insert("a\nb\nc\n", 1, "X") == "a\nX\nb\nc\n"
+    # content with no trailing '\n' inserted at end-of-source needs no extra '\n'
+    assert _compute_insert("a\nb\n", 2, "X") == "a\nb\nX"
+
+
+def test_public_trajectory_strips_internal_keys():
+    """public_trajectory() drops _-prefixed harness keys, keeps the real
+    conversation fields, and deep-copies (mutating the result can't touch the
+    source trajectory)."""
+    from plm._react_helper import public_trajectory
+
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "hi", "reasoning": "think",
+         "tool_calls": [{"id": "t1", "type": "function",
+                         "function": {"name": "python", "arguments": "{}"}}],
+         "_timestamp": 123.0, "_structured": False},
+        {"role": "tool", "tool_call_id": "t1", "content": "out", "_timestamp": 124.0},
+        {"role": "user", "content": "r", "_plm_meta": "final_round_return_reminder"},
+    ]
+    pub = public_trajectory(msgs)
+    assert all(not any(k.startswith("_") for k in m) for m in pub)   # no _-keys
+    assert pub[1]["reasoning"] == "think"                            # real fields kept
+    assert pub[1]["tool_calls"][0]["id"] == "t1"
+    assert pub[2]["tool_call_id"] == "t1"
+    pub[1]["tool_calls"][0]["id"] = "MUT"                            # deep copy
+    assert msgs[1]["tool_calls"][0]["id"] == "t1"
+
+
+def test_int_plm_messages_additive_accumulation():
+    """plm_messages_delta APPENDS to the kernel accumulator; the public
+    plm_messages is rebound to a fresh copy each cell, so a cell mutating it
+    cannot corrupt the accumulation (the additive-seed optimization, C21)."""
+    from plm.repl import PythonReplSession
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        def run(code, delta=None):
+            return s.execute_cell(code, None, delta)["stdout"].strip()
+        assert run("print(len(plm_messages))", [{"role": "user", "content": "a"}]) == "1"
+        assert run("print(len(plm_messages))", [{"role": "assistant", "content": "b"}]) == "2"
+        assert run("print([m['role'] for m in plm_messages])") == "['user', 'assistant']"  # no delta -> unchanged
+        assert run("plm_messages.clear(); print(len(plm_messages))") == "0"               # public copy cleared
+        assert run("print(len(plm_messages))", [{"role": "tool", "content": "c"}]) == "3"  # accumulator intact -> 3
+    finally:
+        s.close()
+
+
+def test_int_plm_messages_seed_channel():
+    """Real kernel, end-to-end for the seed channel + plm_messages. Uses its OWN
+    session (not the shared module fixture) so it is isolated from cross-test
+    kernel state (e.g. another test shadowing `len` in __main__)."""
+    from plm.repl import PythonReplSession
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        # fresh kernel: plm_messages exists and is empty (no NameError pre-seed)
+        assert s.execute_cell("print(plm_messages)")["stdout"].strip() == "[]"
+        # seed → bound and readable inside the cell
+        seed1 = [{"role": "user", "content": "hi"},
+                 {"role": "assistant", "content": "yo", "tool_calls": None}]
+        r = s.execute_cell(
+            "print(len(plm_messages), plm_messages[0]['role'], plm_messages[1]['content'])",
+            seed={"plm_messages": seed1})
+        assert r["stdout"].strip() == "2 user yo", r
+        # re-seed → updates
+        r2 = s.execute_cell("print(len(plm_messages))",
+                            seed={"plm_messages": seed1 + [{"role": "tool", "content": "x"}]})
+        assert r2["stdout"].strip() == "3", r2
+        # no seed → previous value untouched
+        assert s.execute_cell("print(len(plm_messages))")["stdout"].strip() == "3"
+        # general channel: binds ANY name, not just plm_messages
+        r3 = s.execute_cell("print(my_obj['k'])", seed={"my_obj": {"k": 42}})
+        assert r3["stdout"].strip() == "42", r3
+        # protected name: @policy refuses to shadow it (frozen kernel-internal name)
+        r4 = s.execute_cell("@policy\ndef plm_messages():\n    return 1\n")
+        assert "shadow" in (r4["stderr"] or "").lower(), r4
+        # robustness: seeding binds via _repl_g[name]=obj and never touches __main__
+        # builtins, so it works even if a prior cell shadowed one (read without len).
+        # (MUST be last — it poisons `len` in this session.)
+        s.execute_cell("len = 'x'")
+        r5 = s.execute_cell("print(plm_messages[0]['role'], plm_messages[1]['content'])",
+                            seed={"plm_messages": seed1})
+        assert r5["stdout"].strip() == "user yo", r5
+    finally:
+        s.close()
+
+
+def test_int_policy_depth_cap_fires_in_kernel(repl):
+    """In a REAL kernel (recursion limit raised in PREFIX), a runaway recursive
+    @policy trips the UNIFORM policy-depth cap with the clear message — not an
+    opaque native 'maximum recursion depth' error. This is the production path
+    C13 was about (the cap never fired at the default limit)."""
+    from plm.policy.proxy import POLICY_CALL_DEPTH_CAP
+    repl.execute_cell("@policy\ndef _deep(n):\n    return _deep(n - 1) if n > 0 else 0\n")
+    r = repl.execute_cell(f"_deep({POLICY_CALL_DEPTH_CAP + 50})")
+    err = r["stderr"] or ""
+    assert "Policy call depth" in err, err[-300:]
+    assert "maximum recursion depth" not in err, err[-300:]
+
+
+# =============================================================================
+# Frame transport robustness (#4) + answer-render guard (#5)
+# =============================================================================
+
+def _bare_session():
+    """A PythonReplSession built WITHOUT spawning a kernel — for testing the
+    execute_cell timeout/desync DECISION logic in isolation. Records SIGINTs
+    and respawns; `_read_frame_with_timeout`/`_write_frame` are stubbed per-test."""
+    import threading
+    from plm.repl.session import PythonReplSession
+    s = object.__new__(PythonReplSession)
+    s.execution_count = 0
+    s._io_lock = threading.Lock()
+    s._cell_timeout = 1.0
+    s._sigint_grace = 0.5
+    s.cached_vars_blob = b""
+    s.last_rehydrate_error = None
+    s._pending_boot_stderr = None
+    s.respawns = 0
+    s.signals = []
+
+    class _Proc:
+        def send_signal(_inner, sig):
+            s.signals.append(sig)
+    s._proc = _Proc()
+    s._kill_and_respawn = lambda: setattr(s, "respawns", s.respawns + 1)
+    s._write_frame = lambda frame: None
+    return s
+
+
+def test_frame4_partial_timeout_respawns_without_retry():
+    """#4: a timeout MID-FRAME (stream desynced) must respawn directly — NO
+    SIGINT, NO second read on the misaligned socket."""
+    from plm.repl.session import _CellTimeout
+    s = _bare_session()
+    calls = []
+    def _read(timeout):
+        calls.append(timeout)
+        raise _CellTimeout(partial=True)
+    s._read_frame_with_timeout = _read
+    out = s.execute_cell("x = 1")
+    assert s.respawns == 1
+    assert s.signals == []                 # no naive SIGINT-retry
+    assert len(calls) == 1                  # no second read on a desynced socket
+    assert "timed out" in out["stderr"]
+
+
+def test_frame4_clean_timeout_sigint_then_grace_survives():
+    """#4: a timeout at a CLEAN frame boundary tries a graceful SIGINT; if the
+    kernel writes a clean result, the SESSION SURVIVES (no respawn)."""
+    import signal as _sig
+    from plm.repl.session import _CellTimeout
+    s = _bare_session()
+    seq = [_CellTimeout(partial=False),
+           {"type": "result", "stdout": "ok", "vars_blob": b"", "stderr": ""}]
+    def _read(timeout):
+        item = seq.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+    s._read_frame_with_timeout = _read
+    out = s.execute_cell("slow()")
+    assert s.signals == [_sig.SIGINT]      # graceful interrupt attempted
+    assert s.respawns == 0                 # session survived
+    assert out["stdout"] == "ok"
+
+
+def test_frame4_decode_error_respawns():
+    """#4: a frame decode error (corrupt/misaligned body) respawns instead of
+    escaping uncaught."""
+    from plm.repl.session import _FrameDecodeError
+    s = _bare_session()
+    s._read_frame_with_timeout = lambda timeout: (_ for _ in ()).throw(_FrameDecodeError("corrupt"))
+    out = s.execute_cell("x = 1")
+    assert s.respawns == 1
+    assert "preserved" in out["stderr"]
+
+
+def _fake_resp_stream(data: bytes):
+    class FakeStream:
+        def __init__(self, d): self.buf = d
+        def fileno(self): return -1            # never used when deadline is None
+        def read(self, k):
+            chunk = self.buf[:k]; self.buf = self.buf[k:]; return chunk
+    return FakeStream(data)
+
+
+def test_frame4_timeout_none_waits_and_decodes():
+    """#4: timeout=None must NOT synthesize a timeout — it blocks and decodes a
+    full frame (PLM runs unbounded circuits; 'no timeout' = wait forever)."""
+    import pickle, struct
+    from plm.repl.session import PythonReplSession
+    s = object.__new__(PythonReplSession)
+    payload = {"type": "result", "stdout": "hi"}
+    body = pickle.dumps(payload)
+    s._resp_r = _fake_resp_stream(struct.pack(">I", len(body)) + body)
+    assert s._read_frame_with_timeout(None) == payload
+
+
+def test_frame4_corrupt_body_raises_decode_error():
+    """#4: a corrupt body surfaces as `_FrameDecodeError`, never a raw
+    unpickling error."""
+    import struct
+    from plm.repl.session import PythonReplSession, _FrameDecodeError
+    s = object.__new__(PythonReplSession)
+    body = b"not-a-valid-pickle"
+    s._resp_r = _fake_resp_stream(struct.pack(">I", len(body)) + body)
+    with pytest.raises(_FrameDecodeError):
+        s._read_frame_with_timeout(None)
+
+
+def test_render_answer_never_raises():
+    """#5: `_render_answer` is cosmetic and must never raise — a value whose
+    model_dump_json()/str() blows up falls back to a safe placeholder, so a
+    validated RETURN is never lost to a display bug."""
+    from plm._react_helper import _render_answer
+
+    class StrBoom:
+        def __str__(self): raise RuntimeError("boom")
+
+    class DumpBoom:
+        def model_dump_json(self): raise ValueError("nope")
+
+    class GoodModel:
+        def model_dump_json(self): return '{"ok": true}'
+
+    assert _render_answer(None) == ""
+    assert _render_answer(42) == "42"
+    assert _render_answer(GoodModel()) == '{"ok": true}'
+    assert _render_answer(StrBoom()) == "<unserializable answer: StrBoom>"
+    assert _render_answer(DumpBoom()) == "<unserializable answer: DumpBoom>"
+
+
+# =============================================================================
+# Misc batch: budget coercion (#18), edit int-guards (#24), Guard A match/case
+# (#15), rename clobber-protection (#13)
+# =============================================================================
+
+def test_coerce_budget_normalizes():
+    """#18: model-supplied budgets coerce to a non-negative int."""
+    from plm._react_helper import _coerce_budget
+    assert _coerce_budget(None, 5) == 5         # None -> default
+    assert _coerce_budget("x", 5) == 5          # non-int -> default
+    assert _coerce_budget(True, 5) == 5         # bool excluded -> default
+    assert _coerce_budget(-3, 5) == 0           # negative -> clamp to 0
+    assert _coerce_budget(0, 5) == 0
+    assert _coerce_budget(7, 5) == 7
+
+
+def test_compute_edit_non_int_line_is_noop():
+    """#24: a non-int line arg is a no-op (None), not a raw slice TypeError."""
+    from plm.policy.edits import _compute_insert, _compute_delete
+    assert _compute_insert("a\nb\n", 2.5, "X\n") is None     # float after_line
+    assert _compute_insert("a\nb\n", None, "X\n") is None
+    assert _compute_delete("a\nb\n", 1.5, None) is None       # float start
+    assert _compute_delete("a\nb\n", 1, 2.5) is None          # float end
+    # sanity: valid ints still work
+    assert _compute_insert("a\nb\n", 1, "X\n") == "a\nX\nb\n"
+    assert _compute_delete("a\nb\n", 1, 1) == "b\n"
+
+
+def test_guard_a_descends_into_match_case():
+    """#15: Guard A must reject a policy rebind hidden inside a match/case body."""
+    @policy
+    def predict(s):
+        return 1
+    names = set(_PLM_POLICIES)
+    rebind_in_case = "match 1:\n    case 1:\n        predict = 5\n"
+    assert _audit_cell(rebind_in_case, names)          # flagged (truthy error string)
+    # sanity: a benign match (no policy rebind) is NOT flagged
+    assert not _audit_cell("match 1:\n    case _:\n        y = 2\n", names)
+
+
+def test_rename_refuses_clobbering_plain_global(capsys):
+    """#13: renaming a policy onto an existing plain __main__ global is refused
+    (note, no rename), so the variable isn't silently overwritten."""
+    @policy
+    def predict(s):
+        return 1
+    main = sys.modules["__main__"].__dict__
+    main["existing_var"] = 123
+    try:
+        capsys.readouterr()
+        predict._edit("def predict", "def existing_var")    # rename via edit -> target exists
+        err = capsys.readouterr().err
+        assert "refusing to rename" in err
+        assert "predict" in _PLM_POLICIES and "existing_var" not in _PLM_POLICIES
+        assert main["existing_var"] == 123                   # NOT clobbered
+    finally:
+        main.pop("existing_var", None)
+
+
+def test_int_extra_policy_failure_soft_and_surfaced():
+    """#26: a broken EXTRA policy must NOT brick boot (stays soft) and its
+    traceback is surfaced once on the first cell's stderr (not lost to the reset
+    boot buffer). A broken DEFAULT, by contrast, is a hard boot_error -> the
+    parent raises (can't be exercised here without breaking a bundled default)."""
+    import json
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    bad = {"bad_extra": "@policy\ndef __bad_extra():\n    return 1\n"}   # reserved __ prefix -> @policy raises
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
+                              env={"_PLM_EXTRA_POLICIES": json.dumps(bad)})
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        assert "booted True" in r["stdout"], r          # defaults present; broken extra didn't brick boot
+        assert "boot: extra-policy install warning" in r["stderr"], r   # surfaced once (#26)
+    finally:
+        s.close()
+
+
+def test_safe_describe_never_raises():
+    """#6: _safe_describe falls back to a placeholder instead of letting a
+    describe() failure escape the error/prompt/stderr formatting paths (which
+    would abort the task, violating the never-escape contract)."""
+    from plm._react_helper import _safe_describe
+
+    class Boom:
+        def describe(self):
+            raise RuntimeError("describe blew up")
+
+    class Good:
+        def describe(self):
+            return "ok-desc"
+
+    assert _safe_describe(Boom()) == "<constraint description unavailable>"
+    assert _safe_describe(Good()) == "ok-desc"
+
+
+def test_plmmetaparameters_rejects_non_dict_extra_policies():
+    """#2 (parent fail-fast): a non-dict extra_policies is caught at construction
+    with a clear TypeError, not shipped to the kernel to brick boot."""
+    from plm.plm import PLMMetaParameters
+    PLMMetaParameters(system_prompt="x")                       # None ok
+    PLMMetaParameters(system_prompt="x", extra_policies={"n": "@policy\ndef n(): ...\n"})  # dict[str,str] ok
+    for bad in (["a"], "foo", 123, {"n": 1}):                  # list/str/int/dict[str,int]
+        with pytest.raises(TypeError):
+            PLMMetaParameters(system_prompt="x", extra_policies=bad)
+
+
+def test_int_extra_policies_non_dict_payload_is_soft():
+    """#2 (kernel soft-guard): a valid-JSON-but-not-object _PLM_EXTRA_POLICIES
+    (set directly in env, bypassing the parent check) must NOT brick boot — it's
+    ignored and noted via boot_stderr."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
+                              env={"_PLM_EXTRA_POLICIES": "[]"})
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        assert "booted True" in r["stdout"], r                 # did not brick boot
+        assert "not an object" in r["stderr"], r               # ignored + noted (#26 surface)
+    finally:
+        s.close()
+
+
+def test_int_refused_redecoration_no_linecache_poison(repl):
+    """#4: a refused re-decoration of an immutable default must NOT write the
+    rejected source into the <policy-name> linecache slot (getsource/traceback
+    fidelity)."""
+    repl.execute_cell("@policy\ndef natural_llm():\n    return 'HACKED_SENTINEL'\n")  # refused (immutable)
+    r = repl.execute_cell(
+        "import linecache; _e = linecache.cache.get('<policy-natural_llm>'); "
+        "print('HACKED_SENTINEL' in ''.join(_e[2]) if _e else 'NOSLOT')"
+    )
+    assert r["stdout"].strip() in ("False", "NOSLOT"), r       # slot absent or not poisoned
+
+
+def test_redecoration_function_getsource_still_synced():
+    """#4 regression guard: re-decorating a mutable FUNCTION policy via @policy
+    (same-kind in-place) keeps linecache synced — getsource shows the NEW source.
+    After deferring the top-level linecache write, this path relies SOLELY on
+    _rewrite syncing it (proxy.py:257)."""
+    import inspect
+
+    @policy
+    def foo():
+        return 1
+
+    @policy
+    def foo():
+        return 2
+
+    src = inspect.getsource(foo._inner)
+    assert "return 2" in src and "return 1" not in src      # NEW source, not stale
+    assert foo() == 2
+
+
+def test_frame_respawn_surfaces_pending_boot_stderr():
+    """#10: a pending boot/rehydrate diagnostic must be surfaced on a RESPAWN
+    early-return, not lost when _kill_and_respawn overwrites the field."""
+    from plm.repl.session import _CellTimeout
+    s = _bare_session()
+    s._pending_boot_stderr = "EXTRA_POLICY_BOOM"
+    s._read_frame_with_timeout = lambda timeout: (_ for _ in ()).throw(_CellTimeout(partial=True))
+    out = s.execute_cell("x = 1")
+    assert s.respawns == 1
+    assert "EXTRA_POLICY_BOOM" in out["stderr"]      # surfaced on the respawn path
+    assert s._pending_boot_stderr is None            # captured + cleared (no double-surface)
+
+
+def test_compute_insert_respects_unicode_line_boundaries():
+    """#11: a line ending in a non-\\n/\\r splitlines boundary (\\u2028) must NOT
+    get a spurious '\\n' appended by the newline guard."""
+    from plm.policy.edits import _compute_insert
+    # prefix already ends on a  boundary -> no extra '\n' before content
+    assert _compute_insert("a\u2028b\u2028", 1, "X\n") == "a\u2028X\nb\u2028"
+    # content ending on a  boundary -> no extra '\n' before the tail
+    assert _compute_insert("p\nq\n", 1, "X\u2028") == "p\nX\u2028q\n"
+
+
+def test_int_close_resets_pid_box():
+    """#R4-6: after close() reaps the child, the pid box is cleared so the
+    GC/atexit finalizer can't SIGKILL a recycled PID."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"kernel unavailable: {e}")
+    assert s._child_pid_box[0] is not None              # set on spawn
+    s.close()
+    assert s._child_pid_box[0] is None                  # cleared after reap (#R4-6)
+
+
+def test_int_respawn_drops_deleted_boot_policy_orphan():
+    """#R5-2: deleting a MUTABLE boot policy (base_verifier) then surviving a hard
+    respawn must leave it deleted in BOTH the registry AND __main__. The fresh
+    PREFIX re-installs every default into __main__ on respawn; rehydrate reconciles
+    only the registry, so without the orphan-reap the 'deleted' policy reappears in
+    __main__ as a live callable global invisible to list/get/read/edit_policy and
+    Guard C. The reap is identity-checked, so it never clobbers an immutable
+    default that was force-restored, nor a user value re-bound to that name."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r0 = s.execute_cell("print('base_verifier' in list_policies())")
+        if r0["stdout"].strip() != "True":              # pragma: no cover
+            pytest.skip(f"base_verifier default not present: {r0}")
+        s.execute_cell("delete_policy('base_verifier')")
+        r1 = s.execute_cell(
+            "import sys as _s; _g = _s.modules['__main__'].__dict__; "
+            "print('base_verifier' in list_policies(), 'base_verifier' in _g)"
+        )
+        assert r1["stdout"].strip() == "False False", r1   # gone from both, pre-respawn
+        # Hard-kill the kernel -> EOF -> SIGKILL + respawn + rehydrate from the
+        # cached snapshot (which lacks base_verifier). os._exit gives a deterministic
+        # respawn (a SIGINT-interruptible sleep could recover WITHOUT respawning).
+        s.execute_cell("import os as _o9\n_o9._exit(0)")
+        r2 = s.execute_cell(
+            "import sys as _s; _g = _s.modules['__main__'].__dict__; "
+            "print('base_verifier' in list_policies(), 'base_verifier' in _g, "
+            "'natural_llm' in list_policies(), 'natural_llm' in _g)"
+        )
+        # base_verifier reaped from BOTH; the immutable natural_llm survives in both
+        # (force-restored, identity-distinct from base_verifier -> not over-reaped).
+        assert r2["stdout"].strip() == "False False True True", r2
+    finally:
+        s.close()
+
+
+def test_int_late_sigint_at_idle_read_does_not_drop_next_cell():
+    """#R6-6: a late SIGINT delivered while the kernel is IDLE at the top-level
+    read (the parent sent it on a clean-boundary timeout, but the cell had already
+    finished and reported) must be swallowed and the read re-entered — NOT turned
+    into a boot_error that kills the kernel and silently drops the next cell."""
+    import os
+    import signal
+    import time
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        s.execute_cell("x = 41")                        # kernel now idle at the top-level read
+        pid = s._child_pid_box[0]
+        ep = s.kernel_epoch                             # respawns bump kernel_epoch (+ the pid)
+        assert pid is not None
+        os.kill(pid, signal.SIGINT)                     # late SIGINT while idle
+        time.sleep(0.2)                                 # let it deliver + be swallowed
+        r = s.execute_cell("print(x + 1)")              # the NEXT cell must still run
+        assert r["stdout"].strip() == "42", r           # not dropped (with the bug: "")
+        assert s.kernel_epoch == ep, r                  # no respawn (no spurious boot_error)
+        assert s._child_pid_box[0] == pid, r            # same live kernel process
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize("bad_args", [
+    "1" + "0" * 5001,                       # huge int literal -> ValueError (int_max_str_digits)
+    "[" * 100000 + "]" * 100000,            # deeply-nested JSON -> RecursionError
+])
+def test_root_loop_survives_unparseable_tool_args(monkeypatch, bad_args):
+    """#H13/#H14: tool-args that raise a NON-JSONDecodeError on json.loads (a huge
+    integer literal -> ValueError; deeply-nested JSON -> RecursionError) must coerce
+    to {} and exhaust GRACEFULLY (PLMTaskFailure), not escape PLM.__call__ as a raw
+    exception that aborts the task. A fake REPL keeps this in-process."""
+    import asyncio
+    from plm.plm import PLM, PLMMetaParameters, PLMTaskFailure
+
+    class _FakeRepl:
+        kernel_epoch = 0
+        def __init__(self, **kw): pass
+        def execute_cell(self, code, _seed, _delta):
+            return {"type": "result", "stdout": "", "stderr": ""}
+        def close(self): pass
+
+    monkeypatch.setattr("plm.plm.PythonReplSession", _FakeRepl)
+
+    class _BadArgsBackend:
+        model = "stub"
+        def __init__(self): self.calls = 0
+        async def generate(self, messages=None, tools=None, **kw):
+            self.calls += 1
+            return {
+                "content": "",
+                "tool_calls": [{"id": f"t{self.calls}", "type": "function",
+                                "function": {"name": "python", "arguments": bad_args}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    backend = _BadArgsBackend()
+    plm = PLM(model_backend=backend, metaparams=PLMMetaParameters(system_prompt="s"),
+              max_turns=2, return_budget=0)
+    with pytest.raises(PLMTaskFailure):                  # graceful, NOT raw ValueError/RecursionError
+        asyncio.run(plm([{"role": "user", "content": "go"}]))
+    assert backend.calls >= 1
+
+
+def test_int_guard_c_survives_repl_g_rebind():
+    """#H9: a cell rebinding the bare `_repl_g` __main__ name must NOT make Guard C
+    restore into a decoy dict — it re-derives the REAL globals from a trusted
+    builtins, so an in-cell hijack of an immutable default is still reverted."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        # Hijack natural_llm via subscript (Guard A skips ast.Subscript) AND rebind
+        # the loop's `_repl_g` to a decoy, in the SAME cell.
+        s.execute_cell("globals()['natural_llm'] = 'HIJACKED'\n_repl_g = {}\n")
+        r = s.execute_cell(
+            "print(_PLM_POLICIES['natural_llm'] is natural_llm, 'natural_llm' in list_policies())")
+        assert r["stdout"].strip() == "True True", r     # restored to the real proxy (not 'HIJACKED')
+    finally:
+        s.close()
+
+
+def test_int_post_exec_classify_ignores_cell_builtins_fake():
+    """#H10: the post-exec terminal classifier uses a FRESHLY re-imported builtins,
+    so a cell rebinding `_builtins` to a fake whose `.type` lies (to mask its own
+    exception as a silent RETURN) cannot hide the real error."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        cell = (
+            "import builtins as _rb\n"
+            "class _R(BaseException): pass\n"
+            "_R.__name__ = '_REPLReturn'\n"                              # fake exc type named as a RETURN
+            "class _Fake:\n"
+            "    def __getattr__(self, n): return getattr(_rb, n)\n"     # proxy everything real...
+            "    def type(self, x): return _R if isinstance(x, BaseException) else _rb.type(x)\n"  # ...but lie
+            "_builtins = _Fake()\n"
+            "raise ZeroDivisionError('real-error')\n"
+        )
+        r = s.execute_cell(cell)
+        assert r.get("type") != "return", r              # NOT masked into a silent RETURN
+        assert "ZeroDivisionError" in r["stderr"] and "real-error" in r["stderr"], r
+        r2 = s.execute_cell("print('alive')")
+        assert r2["stdout"].strip() == "alive", r2       # kernel still healthy
+    finally:
+        s.close()
+
+
+def test_int_class_policy_survives_respawn_and_deleted_stays_deleted():
+    """#H11/#H12: a hard respawn must (a) keep an authored CLASS policy alive (via
+    source-rebuild — it can't pickle by value), (b) keep an authored function
+    policy, and (c) keep a deleted mutable default deleted. Previously a single
+    unpicklable class policy sank the WHOLE registry snapshot, losing everything and
+    resurrecting the deleted default."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        s.execute_cell(
+            "@policy\nclass MyVerifier:\n    def __call__(self, messages):\n        return 'CLASS-OK'\n")
+        s.execute_cell("@policy\ndef helper(x):\n    return x * 2\n")
+        s.execute_cell("delete_policy('base_verifier')")
+        s.execute_cell("import os as _o\n_o._exit(0)")    # hard kill -> respawn + rehydrate
+        r = s.execute_cell(
+            "import sys; g = sys.modules['__main__'].__dict__\n"
+            "print(MyVerifier()(['m']), helper(5), "
+            "'base_verifier' not in _PLM_POLICIES, 'base_verifier' not in g, "
+            "'natural_llm' in _PLM_POLICIES)\n"
+        )
+        # class survives (CLASS-OK) + function survives (10) + deleted stays gone + immutable kept
+        assert r["stdout"].strip() == "CLASS-OK 10 True True True", r
+    finally:
+        s.close()

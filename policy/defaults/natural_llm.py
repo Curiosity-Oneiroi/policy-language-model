@@ -16,7 +16,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         # Constraint-validated structured output (recommended pattern):
         class Sum(Constraint):
             value: int
-        result = natural_llm("Compute 2+2 as JSON {value: int}", constraint=Sum)
+        result = natural_llm("Compute 2+2", constraint=Sum)
         # -> Sum(value=4)   (a validated Constraint instance)
         # access the structured value: result.value -> 4
 
@@ -32,9 +32,6 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         # Retry budget (defaults to 5):
         result = natural_llm(msgs, constraint=Sum, return_budget=3)
 
-        # Voluntarily lower the LLM-recursion-depth budget for this sub-task:
-        result = natural_llm(msgs, depth=1)
-
         # Backend kwargs (temperature, top_p, etc.):
         result = natural_llm(msgs, generate_kwargs={"temperature": 0.0})
 
@@ -46,18 +43,13 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         constraint=None: optional Constraint CLASS (not instance). When
             set, MUST be JSON-schema-expressible — a structural
             Pydantic-class Constraint or a composite of such via `& | ^ ~`.
-            Factory/predicate Constraints (built via `Constraint.of(...)`
+            Factory/predicate Constraints (built via `Constraint.field(...)`
             carrying Python AfterValidator predicates) are REJECTED upfront
             with TypeError because the model has no way to read Python
             predicates from a schema — retrying would be pure waste.
             For predicate validation use `react_llm(..., constraint=C)`,
             which runs the model's python code and can re-validate.
 
-        depth=None: voluntary LLM-recursion-depth cap. None = inherit
-            current scope. An integer clamps the budget to
-            min(depth, current) for this call. CAN ONLY LOWER, never raise
-            above the sealed ceiling (depth=999 at root=2 is silently
-            clamped to 2).
 
         return_budget=5: how many retries on ConstraintViolation. Total
             generates = 1 + return_budget when constraint is set.
@@ -67,9 +59,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
             ...). With a constraint set, natural_llm hard-sets
             `response_format = {"type": "json_schema", "json_schema":
             {"name": "answer", "schema": constraint.json_schema()}}` so
-            the model knows what JSON to produce. Pass an explicit
-            response_format in `generate_kwargs` to override (setdefault
-            preserves caller intent).
+            the model knows what JSON to produce.
 
     Returns:
 
@@ -100,6 +90,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
     """
     import json
     from plm.policy.defaults._llm_infra import _make_backend, llm_call, check_depth_or_raise
+    from plm.constraint.base import _contains_factory
     generate_kwargs = {} if generate_kwargs is None else generate_kwargs
 
     def _norm(m):
@@ -116,50 +107,85 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
             check_depth_or_raise()                         # policy owns the depth gate
             return (backend.generate(msgs, **generate_kwargs).get("content") or "")
 
-        # Constraint shape check: must be schema-expressible. Factory constraints
-        # carry predicate callables that the model can't read, so retry is
-        # pointless. Composites (allOf/anyOf/oneOf/not) are accepted — they're
-        # already merged into a single JSON schema by `json_schema()`.
-        if getattr(constraint, "_constraint_is_factory", False):
+        # Shape guard: `constraint` must actually be a Constraint (class or
+        # composite). Otherwise json_schema()/validate() below would raise a raw
+        # AttributeError; fail fast with a clear message instead (#R4-5).
+        if not callable(getattr(constraint, "json_schema", None)):
             raise TypeError(
-                f"natural_llm: constraint {getattr(constraint, '__name__', repr(constraint))!r} "
-                f"is not just a JSON schema, it's a little complex — it carries "
-                f"predicate/AfterValidator callables (built via Constraint.of(...)) "
-                f"that the language model has no way to read from a schema. "
-                f"natural_llm requires a structural Constraint (Pydantic-class) "
-                f"or a composite of such (`&` / `|` / `^` / `~`), whose "
-                f"json_schema() is a complete spec the model can follow. "
-                f"For predicate validation, use `react_llm(..., constraint=C)` "
-                f"— the ReAct loop lets the model see the violation in the tool "
-                f"result and self-correct."
+                "natural_llm: `constraint` must be a Constraint class or composite "
+                f"(it needs json_schema()/validate()); got {constraint!r}"
             )
 
-        # HARD-SET the schema on response_format. NO try/except — if json_schema()
-        # fails on a non-factory constraint, that's a real bug we want surfaced
-        # (the LLM has nothing to converge on without the schema, so silently
-        # retrying would be busy-work).
+        # Constraint shape check: must be schema-expressible. Factory constraints
+        # carry predicate/coercer callables the model can't read, so retry is
+        # pointless. `_contains_factory` walks composites (`&`/`|`/`^`/`~`) too, so
+        # a factory HIDDEN inside a composite (e.g. StructA & Constraint.field(...))
+        # is rejected as well — not just a directly-factory constraint. A purely
+        # structural constraint, or a composite of structural ones, passes.
+        if _contains_factory(constraint):
+            raise TypeError(
+                f"natural_llm: constraint {getattr(constraint, '__name__', repr(constraint))!r} "
+                f"carries predicate/AfterValidator callables (built via "
+                f"Constraint.field(...), possibly inside a `&`/`|`/`^`/`~` composite) "
+                f"that the language model has no way to read from a JSON schema, "
+                f"so single-shot generation would retry to exhaustion. natural_llm "
+                f"requires a structural Constraint (Pydantic-class) or a composite "
+                f"of purely structural ones, whose json_schema() is a complete spec "
+                f"the model can follow. For predicate validation use "
+                f"`react_llm(..., constraint=C)` — the ReAct loop lets the model see "
+                f"the violation in the tool result and self-correct."
+            )
+
+        # HARD-SET the schema on response_format — the constraint defines the output,
+        # so it ALWAYS wins (we do NOT let a caller-passed response_format override it).
+        # NO try/except — if json_schema() fails on a non-factory constraint, that's a
+        # real bug we want surfaced (the LLM has nothing to converge on without the
+        # schema, so silently retrying would be busy-work).
         schema = constraint.json_schema()
         gk = dict(generate_kwargs)
-        gk.setdefault("response_format",
-                      {"type": "json_schema",
-                       "json_schema": {"name": "answer", "schema": schema}})
+        gk["response_format"] = {"type": "json_schema",
+                                 "json_schema": {"name": "answer", "schema": schema}}
 
-        from plm.constraint import ConstraintViolation
+        
+        from plm._react_helper import _coerce_budget, _safe_describe, _strip_md_fence
         last_err = None
-        for _ in range(1 + max(0, return_budget)):
+        # `return_budget` is model-controlled; coerce None/non-int/negative -> a
+        # sane non-negative int (no raw TypeError at the range bound; see #18).
+        rb = _coerce_budget(return_budget, 5)
+        for _ in range(1 + rb):
             check_depth_or_raise()
             content = backend.generate(msgs, **gk).get("content") or ""
             try:
-                value = json.loads(content)
+                # Strip a structural ```json ... ``` fence first. response_format is
+                # hard-set to json_schema (so OpenAI/vLLM structured outputs return
+                # clean JSON and this is a no-op), but a caller-overridden
+                # response_format or a non-strict endpoint can still fence the
+                # reply — without this, a fenced-but-correct answer would fail
+                # json.loads, validate as a raw string, and burn the whole retry
+                # budget. _strip_md_fence is structural-only, so it never
+                # touches unfenced JSON.
+                value = json.loads(_strip_md_fence(content))
             except Exception:
                 value = content
             try:
                 return constraint.validate(value)
-            except ConstraintViolation as e:
+            except Exception as e:                         # ConstraintViolation OR any other
+                # validator error (a struct's @model_validator raising a raw
+                # KeyError/TypeError that pydantic does NOT wrap). Treat ANY
+                # validation failure as a retry — surface the last one if the
+                # budget is exhausted — instead of letting it abort the call.
                 last_err = e
                 msgs = msgs + [
                     {"role": "assistant", "content": content},
-                    {"role": "user", "content": constraint.describe()
+                    {"role": "user", "content": _safe_describe(constraint)
                      + "\n\nYour previous answer failed validation: " + str(e)},
                 ]
-        raise last_err                                     # budget exhausted -> surface the last violation
+        # Budget exhausted: ALWAYS surface a clear budget-exhaustion
+        # ConstraintViolation to the CALLER (PLM / a policy / a function),
+        # chaining the last error so its detail is preserved. Constraint.validate()
+        # now always raises ConstraintViolation (#R4-2), so there is no raw error to
+        # special-case — we add the exhaustion context uniformly (#5).
+        raise ConstraintViolation(
+            f"natural_llm: budget exhausted ({1 + rb} attempts); last validation "
+            f"error {type(last_err).__name__}: {last_err}"
+        ) from last_err

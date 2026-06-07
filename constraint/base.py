@@ -2,15 +2,48 @@
 
 PLM authors constraints two ways:
 
-  Pattern 1 — Structural (subclass):
+  Pattern 1 — Structural (subclass): an object SHAPE with named fields.
       class HypothesisReduction(Constraint):
           facts: list[str]
           ambiguities: list[str]
           hypotheses: dict[str, list[str]]
+      # per-field value rules → Constraint.field(...) (below); cross-field
+      # invariants → @model_validator(mode="after").
 
-  Pattern 2 — One-shot factory:
-      c = Constraint.of(int_range=(0, 9))
-      c = Constraint.of(predicate=is_prime, description="must be prime")
+  Pattern 2 — Value / field rule:  Constraint.field(**kw)
+      The single public authoring entry for a value rule. It works BOTH standalone
+      (validate a bare value, compose with & | ^ ~, pass to a sub-LLM) AND as a
+      struct FIELD, where it embeds FLAT (the field IS the bare value, not a
+      {value:..} wrapper) while remaining a real Constraint (validate / describe /
+      json_schema / & | ^ ~ all work):
+          class Order(Constraint):
+              currency: Constraint.field(coercer=str.upper, one_of=["USD","EUR"])
+              qty:      Constraint.field(int_range=(1, 1000), multiple_of=5)
+
+The Constraint.field(**kw) kwarg surface, by built-in type:
+  numeric : int_range / float_range, int_ge/gt/le/lt (+ float_*), multiple_of,
+            approx=(target,eps), finite=True  (reject nan/inf)
+  member  : one_of=[...], not_one_of=[...]
+  str     : str_pattern, str_length=(lo,hi), not_pattern, not_empty,
+            str_prefix, str_suffix, str_contains
+  list    : list_of=T, list_length=(lo,hi), unique, sorted, monotonic,
+            list_contains=X  (the list must contain X as an element, via `in`)
+  tuple   : tuple_of=(T1,T2,..)  (fixed)  |  tuple_of=T  (homogeneous)
+  set     : set_of=T, frozenset_of=T, set_length, subset_of=[..], superset_of=[..]
+  dict    : dict_of=(K,V), dict_length=(lo,hi)
+  bytes   : bytes_length=(lo,hi)   (a bytearray is accepted but normalized to bytes)
+  complex : abs_range=(lo,hi), real_range=(lo,hi), imag_range=(lo,hi)
+  bool/None: no dedicated kwargs by design — use one_of=[True]/[False] / one_of=[None]
+             (or instance_of=bool); Optional[...] handles nullable struct fields
+  type    : instance_of=T, callable=True, behaves_like=[((args),out),..]
+  named   : kind="email|url|uuid|semver|iso_date|identifier|json|regex|path_exists"
+  custom  : predicate=fn / predicates=[fn,..], coercer=fn / coercers=[fn,..], description="..."
+  (element types T in list_of/set_of/tuple_of/dict_of may themselves be Constraints.)
+
+No finite kwarg set is complete: for relations / aggregates / domain logic
+("sums to 100", "is prime", "compiles") drop to predicate=fn WITH a description=
+(the description is what still steers the model). Compose anything with & | ^ ~;
+~ negates value-tests only (a structural NOT is a @model_validator).
 
 Two kinds of user-supplied functions, with deliberately different contracts:
 
@@ -20,6 +53,17 @@ Two kinds of user-supplied functions, with deliberately different contracts:
     - predicates do NOT transform. If a predicate returns a non-canonical
       value, the wrapper raises a clear error pointing at `coercer=` /
       `coercers=` as the right tool.
+    - the wrapper also catches ANY exception raised by the predicate (not
+      just ValueError — e.g. TypeError from a non-comparable / non-iterable
+      value) and re-raises it as a ValueError reporting the original
+      exception type, so it funnels through pydantic into a
+      ConstraintViolation. Predicates therefore need not be defensive
+      about value shape.
+    - tag a predicate `def` with `@constraint("...")` to give it a description
+      that describe() surfaces — for the single `predicate=` AND for each item
+      of `predicates=[...]`. Untagged predicates collapse to a generic
+      "N predicate(s) checked" count. (Lambdas can't be tagged; use a `def`,
+      or set the whole-constraint `description=` for one blanket phrase.)
 
   Coercer (`coercer=fn` or `coercers=[fn1, fn2, ...]`): *transforms*. Runs
     BEFORE type validation and field constraints.
@@ -27,8 +71,13 @@ Two kinds of user-supplied functions, with deliberately different contracts:
     - return value becomes the new value passed downstream
     - raise ValueError to reject (value can't be coerced)
     - multiple coercers chain in declaration order: fn1's output feeds fn2
+    - tag a coercer `def` with `@constraint("...")` to describe the transform;
+      describe() renders it as "coerced (...)" — deliberately DISTINCT from a
+      predicate's bare phrase — so a reader (and the sub-LLM) can tell input
+      preprocessing apart from a check the value must satisfy. Untagged coercers
+      collapse to a "N coercer(s) applied" count.
 
-Execution order in a single Constraint.of call:
+Execution order in a single Constraint.field call:
   coercer(s)  →  type & Field(...) constraints  →  predicate(s)
 
 Both patterns expose the same API on the class:
@@ -123,8 +172,9 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
 class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     """Base class for all constraints.
 
-    Subclass for structural constraints (fields + pydantic validators).
-    Or call `Constraint.of(...)` for a one-shot factory-built constraint."""
+    Subclass for structural constraints (fields + pydantic validators), or call
+    `Constraint.field(...)` for a value/field rule — the single public authoring
+    entry for non-structural constraints."""
 
     model_config = pd.ConfigDict(arbitrary_types_allowed=True)
 
@@ -133,7 +183,21 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     # "structural object with fields."
     _constraint_is_factory: ClassVar[bool] = False
 
-    # Original kwargs passed to Constraint.of (for .describe()).
+    # `Constraint.field(...)` marker — a TRANSPARENT factory that embeds FLAT as a
+    # struct field. `_constraint_field_inner_type` is the bare value type (str/int/…)
+    # so `describe()` can show the real field type instead of `_FieldConstraint`.
+    _constraint_is_field: ClassVar[bool] = False
+    _constraint_field_inner_type: ClassVar[Any] = None
+    _constraint_field_annotation: ClassVar[Any] = None   # flat Annotated[type, *meta] for element use
+
+    # Composition markers — set by the `&`/`|`/`^`/`~` wrapper (algebra.py).
+    # Declared ClassVar here (NOT bare `_`-attrs) so they are real, introspectable
+    # class attributes; a bare `_constraint_*` on a pydantic model becomes a
+    # ModelPrivateAttr (instance-only) and reads back as a descriptor on the class.
+    _constraint_is_composite: ClassVar[bool] = False
+    _constraint_children: ClassVar[tuple] = ()
+
+    # Original kwargs passed to the factory builder (for .describe()).
     _constraint_factory_kwargs: ClassVar[Optional[Dict[str, Any]]] = None
 
     # NL description carried verbatim through .describe().
@@ -146,10 +210,68 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
 
     @classmethod
     def of(cls, **kwargs: Any) -> "type[Constraint]":
-        """Build a one-shot Constraint subclass from kwargs.
-
-        See module docstring for the full kwarg surface."""
+        """INTERNAL engine — private to the constraint module. External code uses
+        `Constraint.field(...)` (the public, transparent superset), never `.of`
+        directly. Kept as the shared builder that `.field` / `from_kind` ride on.
+        See the module docstring for the kwarg surface."""
         return _build_factory(**kwargs)
+
+    @classmethod
+    def field(cls, **kwargs: Any) -> Any:
+        """The public authoring entry for a value/field rule. Builds a constraint
+        from the kwarg surface (see the module docstring); the result works BOTH
+        standalone (`.validate` a bare value, compose with `& | ^ ~`, pass to a
+        sub-LLM) AND as a struct FIELD, where it embeds FLAT — the field IS the
+        bare value, carrying the constraints — while remaining a real `Constraint`
+        (`.validate` / `.describe` / `.json_schema` all work):
+
+            class Order(Constraint):
+                currency: Constraint.field(coercer=str.upper, one_of=["USD","EUR"])
+                qty:      Constraint.field(int_range=(1, 1000), multiple_of=5)
+            Order.validate({"currency": "usd", "qty": 10})   # currency -> "USD" (flat)
+        """
+        inner = _build_factory(**kwargs)
+        _vfi = inner.model_fields["value"]
+        # INVARIANT: _flat must carry EVERYTHING enforcement-relevant from inner's
+        # value field, because two code paths must agree — _validate delegates to
+        # inner.validate (the {value:..} model), while _get_core embeds _flat as a
+        # struct member / for model_validate. Today that is annotation + metadata
+        # (Field bounds + Before/After validators); FieldInfo default/alias are
+        # schema-only and not enforcement, so they are intentionally not carried.
+        _flat = (Annotated[tuple([_vfi.annotation, *_vfi.metadata])]
+                 if _vfi.metadata else _vfi.annotation)
+
+        def _get_core(c, source, handler, _ann=_flat):
+            return handler(_ann)                       # embed FLAT (the inner value schema)
+
+        def _validate(c, value, *, context=None, _i=inner):
+            return _i.validate(value, context=context)  # delegate to the proven factory
+
+        def _describe(c, _i=inner):
+            return _i.describe()
+
+        def _json_schema(c, _i=inner):
+            return _i.json_schema()
+
+        ns: Dict[str, Any] = {
+            # pydantic's namespace inspection reads `__module__` when a class-attr
+            # value is itself a type (here `_constraint_field_inner_type`); a
+            # metaclass-constructed class doesn't get it auto-set, so provide it.
+            "__module__": Constraint.__module__,
+            "__get_pydantic_core_schema__": classmethod(_get_core),
+            "validate": classmethod(_validate),
+            "describe": classmethod(_describe),
+            "json_schema": classmethod(_json_schema),
+            "_constraint_is_factory": True,            # so natural_llm/_contains_factory reject it
+            "_constraint_is_field": True,              # so _describe_structural renders it fully
+            "_constraint_field_inner_type": _vfi.annotation,
+            "_constraint_field_annotation": _flat,     # so .field works as a list_of/set_of/.. element
+            # NB: describe()/json_schema() delegate to `inner`, so the facade does
+            # NOT carry _constraint_factory_kwargs / _constraint_description — those
+            # are read only by the BASE describe/json_schema, which the facade shadows.
+            "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
+        }
+        return _ConstraintMeta("_FieldConstraint", (Constraint,), ns)
 
     @classmethod
     def from_kind(cls, name: str) -> "type[Constraint]":
@@ -160,7 +282,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
                 f"available: {sorted(cls.registry)}"
             )
         pred = cls.registry[name]
-        return cls.of(predicate=pred, description=f"kind={name!r}")
+        return cls.field(predicate=pred, description=f"kind={name!r}")
 
     @classmethod
     def exactly_one_of(cls, *fields: str) -> Callable[[type], type]:
@@ -202,7 +324,19 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
                 _DESCRIPTION_ATTR,
                 f"exactly one of {list(field_names)} must be non-None",
             )
-            method_name = f"_exactly_one_of_{'_'.join(field_names)}"
+            # The method name is derived from the field names joined by '_',
+            # which is AMBIGUOUS: exactly_one_of("a_b","c") and
+            # exactly_one_of("a","b_c") both join to "_exactly_one_of_a_b_c".
+            # Each decoration builds a subclass, so a prior decoration's
+            # validator is an attribute of `klass`; reusing the name would
+            # SHADOW it (one rule silently dropped). Bump a suffix until the
+            # name is free so BOTH validators survive.
+            base_method = f"_exactly_one_of_{'_'.join(field_names)}"
+            method_name = base_method
+            _suffix = 1
+            while hasattr(klass, method_name):
+                method_name = f"{base_method}__{_suffix}"
+                _suffix += 1
             wrapped = model_validator(mode="after")(_check)
 
             # Build a NEW class that subclasses the decorated one and includes
@@ -241,6 +375,24 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
                 return cls.model_validate(value, context=context)
         except pd.ValidationError as e:
             raise ConstraintViolation(str(e)) from e
+        except ConstraintViolation:
+            raise                                          # already in-contract; don't double-wrap
+        except Exception as e:
+            # A raw non-ValueError can still escape model_validate even with the
+            # predicate net: a Field constraint on an `Any` base (e.g. `list_length=`
+            # alone) makes pydantic raise TypeError on a non-sized value, and a
+            # coercer can raise anything. Funnel any such failure into the
+            # documented ConstraintViolation contract instead of leaking a raw
+            # exception to a direct `.validate()` caller (#R4-2). Build the message
+            # DEFENSIVELY: a pathological exception's own `__str__` can itself raise
+            # (e.g. a custom validator error whose `__str__` blows up), and an
+            # unguarded f-string interpolation of it would leak THAT raw exception
+            # out of validate(), breaking the contract for the wrapper too (#H8).
+            try:
+                _detail = str(e)
+            except Exception:
+                _detail = "<error message unavailable>"
+            raise ConstraintViolation(f"{type(e).__name__}: {_detail}") from e
 
     # ---- Description ----------------------------------------------------------
 
@@ -265,18 +417,53 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
         schema = cls.model_json_schema()
         if cls._constraint_is_factory:
             # Pydantic wraps the value in a "value" field; flatten for export.
-            value_schema = schema.get("properties", {}).get("value", schema)
+            value_schema = dict(schema.get("properties", {}).get("value", schema))
+            # Preserve the document's `$defs`: when the value annotation references
+            # another model (e.g. instance_of=Model, list_of=Model), the flattened
+            # value schema carries `$ref: #/$defs/Model` but the definitions live
+            # at the top level — drop them and the refs dangle. Carry them along so
+            # the refs still resolve in the exported (now top-level) schema.
+            if "$defs" in schema and "$defs" not in value_schema:
+                value_schema["$defs"] = schema["$defs"]
             # Carry x-description from the factory kwargs + user description.
-            x_desc = cls.describe()
+            # describe() can raise on a pathological constraint; never let that
+            # abort json_schema() — it's called e.g. by natural_llm to build
+            # response_format, OUTSIDE its retry loop. Omit x-desc on failure (#6).
+            try:
+                x_desc = cls.describe()
+            except Exception:
+                x_desc = ""
             if x_desc:
-                value_schema = dict(value_schema)
                 value_schema["x-description"] = x_desc
             return value_schema
         return schema
 
 
+def _contains_factory(constraint: type) -> bool:
+    """True iff `constraint` carries a factory-built node anywhere in its tree —
+    i.e. a Python predicate/coercer that a JSON schema cannot express.
+
+    Walks `&`/`|`/`^`/`~` composites recursively (a composite exposes
+    `_constraint_is_composite` + `_constraint_children`). A struct-only
+    constraint, or an auto-merged struct-only `&` (a real pydantic model, not a
+    composite wrapper), contains no factory node and returns False.
+
+    Used by `natural_llm` to reject constraints it cannot honor: only a complete
+    JSON schema can steer a single-shot model, so a factory hidden inside a
+    composite (e.g. `StructA & Constraint.field(predicate=...)`) must be routed to
+    `react_llm` (which runs the predicate against the model's code) — not silently
+    accepted and retried to exhaustion against a schema that omits the predicate.
+    """
+    if getattr(constraint, "_constraint_is_factory", False):
+        return True
+    if getattr(constraint, "_constraint_is_composite", False):
+        return any(_contains_factory(c)
+                   for c in getattr(constraint, "_constraint_children", ()) or ())
+    return False
+
+
 # ============================================================================
-# Factory — Constraint.of(**kwargs)
+# Factory engine (internal) — _build_factory(**kwargs); public entry is Constraint.field
 # ============================================================================
 
 
@@ -288,7 +475,13 @@ _KNOWN_KWARGS = frozenset(
         "str_pattern", "str_length", "not_pattern", "not_empty",
         "list_of", "dict_of", "list_length", "unique", "sorted", "monotonic",
         "approx", "callable", "behaves_like",
-        "kind", "predicate", "coercer", "coercers", "description",
+        "kind", "predicate", "predicates", "coercer", "coercers", "description",
+        # type-completing additions:
+        "multiple_of", "finite",
+        "tuple_of", "set_of", "frozenset_of", "bytes_length",
+        "str_prefix", "str_suffix", "str_contains",
+        "dict_length", "set_length", "subset_of", "superset_of", "list_contains",
+        "abs_range", "real_range", "imag_range",
     }
 )
 
@@ -299,6 +492,12 @@ def _resolve_elem_type(arg: Any) -> Any:
     constraints actually apply inside list_of / dict_of. Otherwise return arg
     as-is."""
     if isinstance(arg, type) and issubclass(arg, Constraint):
+        if getattr(arg, "_constraint_is_field", False):
+            # A Constraint.field(...) is a TRANSPARENT factory — it has no `value`
+            # field (its schema lives in the core-schema hook), so use the flat
+            # annotation stored at build time. This makes `.field` usable as a
+            # list_of/set_of/dict_of/tuple_of element, matching `.of`.
+            return arg._constraint_field_annotation   # field() always sets this (the flat annotation)
         if getattr(arg, "_constraint_is_factory", False):
             info = arg.model_fields["value"]
             base = info.annotation
@@ -306,7 +505,22 @@ def _resolve_elem_type(arg: Any) -> Any:
             if metadata:
                 return Annotated[(base, *metadata)]  # type: ignore[valid-type]
             return base
-        return arg
+        if getattr(arg, "_constraint_is_composite", False):
+            # A composite (A|B, A&B, ~A, A^B) has NO pydantic fields and a custom
+            # `.validate()`. Returning it bare would make pydantic validate
+            # List[composite]/Dict[..,composite] against the composite's EMPTY
+            # model — rejecting valid scalar elements and accepting garbage. Route
+            # each element through an AfterValidator that runs the composite's own
+            # validate(), so OR/AND/XOR/NOT actually apply per element (#R4-3).
+            # Use a 2-arg validator so pydantic injects ValidationInfo, and thread
+            # the outer `context=` into the child validate() — matching the
+            # top-level composite path and every other `context=context` hand-off.
+            # A 1-arg lambda silently dropped the context, so a context-dependent
+            # @model_validator in a structural child of a COMPOSITE element never
+            # saw it (validate(value, *, context=) is a documented public API). (#R6-1)
+            return Annotated[Any, AfterValidator(
+                lambda v, _info, _c=arg: _c.validate(v, context=_info.context))]
+        return arg          # plain structural subclass: pydantic validates it as a model
     return arg
 
 
@@ -331,7 +545,27 @@ def _wrap_predicate(pred: Callable[[Any], Any]) -> Callable[[Any], Any]:
     pred_name = getattr(pred, "__name__", "<predicate>")
 
     def _wrapped(v: Any) -> Any:
-        result = pred(v)
+        try:
+            result = pred(v)
+        except ValueError:
+            raise                                       # documented reject path: pydantic turns
+                                                        # this into a ConstraintViolation.
+        except Exception as e:
+            # A predicate that raises anything OTHER than ValueError (e.g. a
+            # TypeError because the value is unhashable, not comparable, not
+            # iterable, or just the wrong shape for the check) would otherwise
+            # escape pydantic RAW and bypass the ConstraintViolation contract
+            # (validate() only converts pydantic ValidationError). Treat
+            # "couldn't evaluate this value" as a rejection: re-raise as
+            # ValueError — chained, so the original type/message stays visible —
+            # so it funnels through pydantic into a ConstraintViolation like any
+            # other failure. This is the contract guarantee for the WHOLE class
+            # (sorted=/monotonic=/not_one_of=/kind= registry preds + any user
+            # predicate), not a per-predicate patch.
+            raise ValueError(
+                f"predicate {pred_name!r} could not evaluate the value "
+                f"({type(e).__name__}: {e})"
+            ) from e
         if result is None or result is True or result is v:
             return v
         if result is False:
@@ -344,23 +578,65 @@ def _wrap_predicate(pred: Callable[[Any], Any]) -> Callable[[Any], Any]:
             f"({type(result).__name__}: {result!r}). Predicates must return "
             f"None (or True, or the input value) and raise ValueError to "
             f"reject. For value transformation, use `coercer=fn` / "
-            f"`coercers=[fn1, fn2, ...]` on Constraint.of instead."
+            f"`coercers=[fn1, fn2, ...]` on Constraint.field instead."
         )
     _wrapped.__plm_underlying__ = pred  # type: ignore[attr-defined]
+    return _wrapped
+
+
+def _bounded_predicate(project: Callable[[Any], Any], label: str, lo: Any, hi: Any) -> Callable[[Any], None]:
+    """Build a predicate enforcing `lo <= project(value) <= hi` (a None bound is
+    open). Shared by the len / abs / real / imag bound checks so they don't repeat
+    the None-guarded comparison idiom — the interpret-side analogue of how
+    describe() shares `_range_phrase`. `project` raising (e.g. `.real` on a list)
+    funnels through `_wrap_predicate` into a ConstraintViolation like any other."""
+    def _check(v: Any) -> None:
+        m = project(v)
+        if lo is not None and m < lo:
+            raise ValueError(f"{label} = {m} < {lo}")
+        if hi is not None and m > hi:
+            raise ValueError(f"{label} = {m} > {hi}")
+    return _check
+
+
+def _wrap_coercer(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """Wrap a user coercer (a TRANSFORMING `(value) -> new_value`) so a
+    non-ValueError it raises becomes a ValueError — the coercer counterpart to
+    `_wrap_predicate`. A coercer applied to the wrong-typed value (e.g.
+    `coercer=str.lower` on an int) would otherwise escape pydantic RAW and bypass
+    the ConstraintViolation contract. Unlike a predicate, a coercer RETURNS the
+    transformed value, so we return `fn(v)` unchanged on success (#R4-2)."""
+    fn_name = getattr(fn, "__name__", "<coercer>")
+
+    def _wrapped(v: Any) -> Any:
+        try:
+            return fn(v)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"coercer {fn_name!r} could not transform the value "
+                f"({type(e).__name__}: {e})"
+            ) from e
     return _wrapped
 
 
 _TYPE_KWARG_GROUPS: Dict[str, frozenset] = {
     "int":      frozenset({"int_range", "int_gt", "int_ge", "int_lt", "int_le"}),
     "float":    frozenset({"float_range", "float_gt", "float_ge", "float_lt", "float_le"}),
-    "str":      frozenset({"str_pattern", "str_length"}),
+    "str":      frozenset({"str_pattern", "str_length", "str_prefix", "str_suffix", "str_contains"}),
     # `list_length` applies `min_length`/`max_length` Field constraints which
     # work on both lists and strings — but combining with int/float/dict groups
     # is meaningless (Field would reject), so we route it to the list group.
     # `unique`/`sorted`/`monotonic` install predicates that iterate; they work
-    # on any iterable (including strings) and stay un-grouped.
-    "list":     frozenset({"list_of", "list_length"}),
-    "dict":     frozenset({"dict_of"}),
+    # on any iterable (including strings) and stay un-grouped. `multiple_of`/
+    # `finite` also stay un-grouped (they refine an existing int/float group).
+    "list":     frozenset({"list_of", "list_length", "list_contains"}),
+    "dict":     frozenset({"dict_of", "dict_length"}),
+    "tuple":    frozenset({"tuple_of"}),
+    "set":      frozenset({"set_of", "frozenset_of", "set_length"}),
+    "bytes":    frozenset({"bytes_length"}),
+    "complex":  frozenset({"abs_range", "real_range", "imag_range"}),
     "instance": frozenset({"instance_of"}),
     "literal":  frozenset({"one_of"}),
     "kind":     frozenset({"kind"}),
@@ -376,7 +652,7 @@ def _check_type_compatibility(kwargs: Dict[str, Any]) -> None:
     if len(present) > 1:
         lines = "\n".join(f"  - {group!r}: {kws}" for group, kws in present.items())
         raise ValueError(
-            "Constraint.of: kwargs from multiple type-shifting groups:\n"
+            "Constraint.field: kwargs from multiple type-shifting groups:\n"
             f"{lines}\n"
             "Each constraint targets a single base type — pick one group "
             "(e.g. don't combine `kind` with `int_range`). If you need both "
@@ -384,16 +660,63 @@ def _check_type_compatibility(kwargs: Dict[str, Any]) -> None:
         )
 
 
+_RANGE_KWARGS: Tuple[str, ...] = (
+    "int_range", "float_range", "str_length", "list_length", "set_length",
+    "dict_length", "bytes_length", "abs_range", "real_range", "imag_range",
+)
+
+
+def _check_range_bounds(kwargs: Dict[str, Any]) -> None:
+    """Reject a `(lo, hi)` range kwarg whose `lo > hi` at BUILD time — otherwise the
+    constraint builds fine and silently rejects EVERYTHING (a classic author typo,
+    e.g. `int_range=(10, 1)`). Mirrors the `multiple_of=0` build guard. A `None`
+    bound (open range) is skipped; `lo == hi` (a single value) is allowed."""
+    for _k in _RANGE_KWARGS:
+        v = kwargs.get(_k)
+        if not isinstance(v, (tuple, list)) or len(v) != 2:
+            continue
+        lo, hi = v
+        if lo is None or hi is None:
+            continue
+        try:
+            swapped = lo > hi
+        except TypeError:
+            swapped = False
+        if swapped:
+            raise ValueError(
+                f"Constraint.field: {_k}={tuple(v)!r} has lo > hi — it would reject "
+                f"every value. Did you swap the bounds?"
+            )
+
+
 def _build_factory(**kwargs: Any) -> Type[Constraint]:
     """Build a dynamic factory Constraint subclass from kwargs."""
     unknown = set(kwargs) - _KNOWN_KWARGS
     if unknown:
         raise TypeError(
-            f"Constraint.of: unknown kwargs {sorted(unknown)}; "
+            f"Constraint.field: unknown kwargs {sorted(unknown)}; "
             f"known: {sorted(_KNOWN_KWARGS)}"
         )
 
     _check_type_compatibility(kwargs)
+    _check_range_bounds(kwargs)
+
+    # #7: materialize one-shot iterables BEFORE snapshotting `original_kwargs`.
+    # `_interpret_kwargs` below CONSUMES one_of/not_one_of/coercers/behaves_like
+    # (it list()s / iterates them), so a shallow dict() snapshot would otherwise
+    # capture an EXHAUSTED generator that `describe()` later re-iterates to
+    # garbage (`one of []`) or crashes on (`len()` over coercers). Lists are
+    # re-iterable, so both the live consumption and `describe()` see the full
+    # sequence — and the live path already list()s these, so nothing changes
+    # there. A non-iterable value is left as-is for `_interpret_kwargs` to reject
+    # with its specific message.
+    for _key in ("one_of", "not_one_of", "coercers", "predicates", "behaves_like",
+                 "subset_of", "superset_of"):
+        if kwargs.get(_key) is not None:
+            try:
+                kwargs[_key] = list(kwargs[_key])
+            except TypeError:
+                pass
 
     # Save originals for .describe()
     original_kwargs = dict(kwargs)
@@ -415,7 +738,7 @@ def _build_factory(**kwargs: Any) -> Type[Constraint]:
     # FORWARD order.
     type_ann: Any = base_type
     for coercer in reversed(coercers):
-        type_ann = Annotated[type_ann, BeforeValidator(coercer)]
+        type_ann = Annotated[type_ann, BeforeValidator(_wrap_coercer(coercer))]
     if field_kwargs:
         type_ann = Annotated[type_ann, Field(**field_kwargs)]
     for pred in predicates:
@@ -441,7 +764,7 @@ def _build_factory(**kwargs: Any) -> Type[Constraint]:
 def _interpret_kwargs(
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Dict[str, Any], List[Callable[[Any], None]], List[Callable[[Any], Any]]]:
-    """Translate Constraint.of kwargs into a 4-tuple.
+    """Translate the factory kwarg surface into a 4-tuple.
 
     Returns:
       base_type:    the underlying Python type the value must conform to.
@@ -478,12 +801,12 @@ def _interpret_kwargs(
     _float_strict = {"float_gt", "float_ge", "float_lt", "float_le"} & set(kwargs)
     if "int_range" in kwargs and _int_strict:
         raise ValueError(
-            f"Constraint.of: int_range= cannot be combined with strict bounds "
+            f"Constraint.field: int_range= cannot be combined with strict bounds "
             f"{sorted(_int_strict)}. Pick one form."
         )
     if "float_range" in kwargs and _float_strict:
         raise ValueError(
-            f"Constraint.of: float_range= cannot be combined with strict bounds "
+            f"Constraint.field: float_range= cannot be combined with strict bounds "
             f"{sorted(_float_strict)}. Pick one form."
         )
 
@@ -531,21 +854,34 @@ def _interpret_kwargs(
 
     # --- not_one_of ---
     if "not_one_of" in kwargs:
-        bad = set(kwargs.pop("not_one_of"))
+        seq = kwargs.pop("not_one_of")
+        try:
+            bad = set(seq)                            # hashable members: fast set membership
+        except TypeError:                             # unhashable members (e.g. lists): fall
+            bad = list(seq)                           # back to list membership, mirroring one_of=
 
         def _check_not_one_of(v, _bad=bad):
-            if v in _bad:
-                raise ValueError(f"{v!r} is in the forbidden set {sorted(_bad)}")
+            try:
+                forbidden = v in _bad
+            except TypeError:
+                # An UNHASHABLE value (list/dict) vs a hashable-member SET: it can
+                # never equal a hashable scalar, so it is genuinely NOT forbidden —
+                # but `in set` raises. Fall back to element-wise == (-> False), so
+                # such a value is ALLOWED, matching the unhashable-MEMBERS path
+                # (acceptance must not depend on member hashability) (#R4-4).
+                forbidden = any(v == b for b in _bad)
+            if forbidden:
+                raise ValueError(f"{v!r} is in the forbidden set {list(_bad)!r}")
 
         predicates.append(_check_not_one_of)
 
     # --- str ---
     if "str_pattern" in kwargs:
-        base_type = str
+        base_type = str if base_type is Any else base_type
         field_kwargs["pattern"] = kwargs.pop("str_pattern")
     if "str_length" in kwargs:
         lo, hi = kwargs.pop("str_length")
-        base_type = str
+        base_type = str if base_type is Any else base_type
         if lo is not None:
             field_kwargs["min_length"] = lo
         if hi is not None:
@@ -589,16 +925,25 @@ def _interpret_kwargs(
             field_kwargs["max_length"] = hi
     if "unique" in kwargs and kwargs.pop("unique"):
         def _check_unique(v):
+            # Materialize ONCE (mirrors _check_sorted/_check_monotonic): the set
+            # fast path would otherwise partially consume a one-shot generator
+            # before an unhashable element raises TypeError, and the fallback
+            # would then re-iterate an EXHAUSTED stream and miss the duplicate.
+            try:
+                items = list(v)
+            except TypeError as e:
+                raise ValueError(f"unique=: value is not iterable ({e})") from None
             try:
                 seen = set()
-                for x in v:
+                for x in items:
                     if x in seen:
                         raise ValueError(f"list contains duplicate: {x!r}")
                     seen.add(x)
             except TypeError:
-                # Unhashable elements — fall back to O(n^2) check.
+                # Unhashable elements — fall back to an O(n^2) check over the SAME
+                # materialized `items` (not a re-iterated, possibly-spent `v`).
                 seen_list = []
-                for x in v:
+                for x in items:
                     if x in seen_list:
                         raise ValueError(f"list contains duplicate: {x!r}")
                     seen_list.append(x)
@@ -618,8 +963,18 @@ def _interpret_kwargs(
                 )
 
             def _check_sorted(v, _reverse=reverse):
-                sorted_v = sorted(v, reverse=_reverse)
-                if list(v) != sorted_v:
+                try:
+                    items = list(v)                     # materialize ONCE (also avoids
+                                                        # double-consuming a generator)
+                except TypeError as e:
+                    raise ValueError(f"sorted=: value is not iterable ({e})") from None
+                try:
+                    ordered = sorted(items, reverse=_reverse)
+                except TypeError as e:
+                    raise ValueError(
+                        f"sorted=: items are not mutually comparable ({e})"
+                    ) from None
+                if items != ordered:
                     raise ValueError(
                         f"list not sorted {'desc' if _reverse else 'asc'}"
                     )
@@ -639,12 +994,24 @@ def _interpret_kwargs(
                 )
 
             def _check_monotonic(v, _strict=strict):
-                for i in range(1, len(v)):
-                    a, b = v[i - 1], v[i]
-                    if _strict and not (a < b):
-                        raise ValueError(f"not strictly monotonic at index {i}")
-                    if (not _strict) and not (a <= b):
-                        raise ValueError(f"not monotonic at index {i}")
+                try:
+                    items = list(v)                     # accept any iterable (set has len
+                                                        # but no indexing; generators etc.)
+                except TypeError as e:
+                    raise ValueError(f"monotonic=: value is not iterable ({e})") from None
+                for i in range(1, len(items)):
+                    a, b = items[i - 1], items[i]
+                    try:
+                        ok = (a < b) if _strict else (a <= b)
+                    except TypeError as e:
+                        raise ValueError(
+                            f"monotonic=: items at indices {i - 1}/{i} are not "
+                            f"comparable ({e})"
+                        ) from None
+                    if not ok:
+                        raise ValueError(
+                            f"not {'strictly ' if _strict else ''}monotonic at index {i}"
+                        )
             predicates.append(_check_monotonic)
 
     # --- approx ---
@@ -689,12 +1056,152 @@ def _interpret_kwargs(
                     )
         predicates.append(_check_behaves_like)
 
-    # --- user predicate ---
+    # --- numeric: multiple_of (divisibility) + finite (reject nan/inf) ---
+    if "multiple_of" in kwargs:
+        _mo = kwargs.pop("multiple_of")
+        # multiple_of=0 is nonsensical AND unsafe: int 0 panics pydantic-core's Rust
+        # validator (remainder-by-zero) — a raw panic that escapes validate() — and
+        # float 0.0 silently accepts everything. Reject it at build time.
+        if _mo == 0:
+            raise ValueError("multiple_of= must be a non-zero number")
+        field_kwargs["multiple_of"] = _mo
+        if base_type is Any:
+            base_type = int if isinstance(_mo, int) else float
+    if "finite" in kwargs:
+        if kwargs.pop("finite"):
+            if base_type is Any:
+                base_type = float
+
+            def _check_finite(v):
+                import math as _math
+                try:
+                    ok = _math.isfinite(v)
+                except TypeError:
+                    raise ValueError(f"value of type {type(v).__name__} is not a finite-checkable number")
+                if not ok:
+                    raise ValueError(f"{v!r} is not finite (nan/inf not allowed)")
+            predicates.append(_check_finite)
+
+    # --- tuple / set / frozenset (typed; element type via _resolve_elem_type) ---
+    if "tuple_of" in kwargs:
+        _t = kwargs.pop("tuple_of")
+        if isinstance(_t, tuple):
+            base_type = tuple[tuple(_resolve_elem_type(x) for x in _t)]   # fixed-arity Tuple[T1,T2,..]
+        else:
+            base_type = tuple[_resolve_elem_type(_t), ...]                # homogeneous Tuple[T, ...]
+    if "set_of" in kwargs:
+        base_type = set[_resolve_elem_type(kwargs.pop("set_of"))]         # type: ignore[misc]
+    if "frozenset_of" in kwargs:
+        base_type = frozenset[_resolve_elem_type(kwargs.pop("frozenset_of"))]  # type: ignore[misc]
+
+    # --- bytes length ---
+    if "bytes_length" in kwargs:
+        _lo, _hi = kwargs.pop("bytes_length")
+        base_type = bytes
+        if _lo is not None:
+            field_kwargs["min_length"] = _lo
+        if _hi is not None:
+            field_kwargs["max_length"] = _hi
+
+    # --- string prefix / suffix / contains (predicate forms; regex covers more) ---
+    if "str_prefix" in kwargs:
+        _p = kwargs.pop("str_prefix")
+        base_type = str if base_type is Any else base_type
+
+        def _check_prefix(v, _p=_p):
+            if not (isinstance(v, str) and v.startswith(_p)):
+                raise ValueError(f"{v!r} must start with {_p!r}")
+        predicates.append(_check_prefix)
+    if "str_suffix" in kwargs:
+        _s = kwargs.pop("str_suffix")
+        base_type = str if base_type is Any else base_type
+
+        def _check_suffix(v, _s=_s):
+            if not (isinstance(v, str) and v.endswith(_s)):
+                raise ValueError(f"{v!r} must end with {_s!r}")
+        predicates.append(_check_suffix)
+    if "str_contains" in kwargs:
+        _c = kwargs.pop("str_contains")
+        base_type = str if base_type is Any else base_type
+
+        def _check_contains(v, _c=_c):
+            if not (isinstance(v, str) and _c in v):
+                raise ValueError(f"{v!r} must contain {_c!r}")
+        predicates.append(_check_contains)
+
+    # --- mapping / set size (shared bound-check helper) ---
+    if "dict_length" in kwargs:
+        _lo, _hi = kwargs.pop("dict_length")
+        if base_type is Any:
+            base_type = dict
+        predicates.append(_bounded_predicate(len, "dict size", _lo, _hi))
+    if "set_length" in kwargs:
+        _lo, _hi = kwargs.pop("set_length")
+        if base_type is Any:
+            base_type = set
+        predicates.append(_bounded_predicate(len, "set size", _lo, _hi))
+
+    # --- set relations / membership ---
+    # Element-wise (==) rather than set ops, so UNHASHABLE members AND unhashable
+    # values are tolerated (mirrors not_one_of's #R4-4 spirit) — no eager set()
+    # leaks a raw TypeError out of the factory.
+    if "subset_of" in kwargs:
+        _sub = list(kwargs.pop("subset_of"))
+
+        def _check_subset(v, _sub=_sub):
+            if not all(any(x == m for m in _sub) for x in v):
+                raise ValueError(f"{v!r} is not a subset of {_sub!r}")
+        predicates.append(_check_subset)
+    if "superset_of" in kwargs:
+        _sup = list(kwargs.pop("superset_of"))
+
+        def _check_superset(v, _sup=_sup):
+            if not all(any(m == x for x in v) for m in _sup):
+                raise ValueError(f"{v!r} is not a superset of {_sup!r}")
+        predicates.append(_check_superset)
+    if "list_contains" in kwargs:
+        _x = kwargs.pop("list_contains")
+        if base_type is Any:
+            base_type = list
+
+        def _check_list_contains(v, _x=_x):
+            if _x not in v:
+                raise ValueError(f"value must contain {_x!r}")
+        predicates.append(_check_list_contains)
+
+    # --- complex: magnitude / real / imaginary bounds (shared helper) ---
+    if "abs_range" in kwargs:
+        _lo, _hi = kwargs.pop("abs_range")
+        if base_type is Any:
+            base_type = complex
+        predicates.append(_bounded_predicate(abs, "|z|", _lo, _hi))
+    if "real_range" in kwargs:
+        _lo, _hi = kwargs.pop("real_range")
+        if base_type is Any:
+            base_type = complex
+        predicates.append(_bounded_predicate(lambda v: v.real, "Re", _lo, _hi))
+    if "imag_range" in kwargs:
+        _lo, _hi = kwargs.pop("imag_range")
+        if base_type is Any:
+            base_type = complex
+        predicates.append(_bounded_predicate(lambda v: v.imag, "Im", _lo, _hi))
+
+    # --- user predicates (single + plural) ---
     if "predicate" in kwargs:
         pred = kwargs.pop("predicate")
         if not callable(pred):
             raise TypeError("predicate= must be a callable")
         predicates.append(pred)
+    if "predicates" in kwargs:
+        preds = kwargs.pop("predicates")
+        try:
+            preds_list = list(preds)
+        except TypeError:
+            raise TypeError("predicates= must be an iterable of callables")
+        for pred in preds_list:
+            if not callable(pred):
+                raise TypeError("predicates= contains a non-callable item")
+            predicates.append(pred)
 
     # --- user coercers (single + plural) ---
     if "coercer" in kwargs:
@@ -765,7 +1272,26 @@ _DESCRIBE_RULES: Tuple[Tuple[str, bool, Callable[[Any], str]], ...] = (
     ("callable",    True,  lambda v: "a callable"),
     ("behaves_like",False, lambda v: f"callable behaving as {v}"),
     ("kind",        False, lambda v: f"kind={v!r}"),
-    ("predicate",   False, lambda v: "predicate-checked"),
+    # type-completing additions:
+    ("multiple_of", False, lambda v: f"a multiple of {v}"),
+    ("finite",      True,  lambda v: "finite (not nan/inf)"),
+    ("tuple_of",    False, lambda v: (f"tuple of {[_render_elem(x) for x in v]}"
+                                      if isinstance(v, tuple) else f"tuple of [{_render_elem(v)}, ...]")),
+    ("set_of",      False, lambda v: f"set of [{_render_elem(v)}]"),
+    ("frozenset_of",False, lambda v: f"frozenset of [{_render_elem(v)}]"),
+    ("bytes_length",False, lambda v: _range_phrase("byte length", v[0], v[1], ge=True, le=True)),
+    ("str_prefix",  False, lambda v: f"starts with {v!r}"),
+    ("str_suffix",  False, lambda v: f"ends with {v!r}"),
+    ("str_contains",False, lambda v: f"contains {v!r}"),
+    ("dict_length", False, lambda v: _range_phrase("dict size", v[0], v[1], ge=True, le=True)),
+    ("set_length",  False, lambda v: _range_phrase("set size", v[0], v[1], ge=True, le=True)),
+    ("subset_of",   False, lambda v: f"a subset of {list(v)}"),
+    ("superset_of", False, lambda v: f"a superset of {list(v)}"),
+    ("list_contains",False,lambda v: f"contains {v!r}"),
+    ("abs_range",   False, lambda v: _range_phrase("|z|", v[0], v[1], ge=True, le=True)),
+    ("real_range",  False, lambda v: _range_phrase("Re", v[0], v[1], ge=True, le=True)),
+    ("imag_range",  False, lambda v: _range_phrase("Im", v[0], v[1], ge=True, le=True)),
+    ("predicate",   False, lambda v: get_description(v) or "predicate-checked"),
 )
 
 
@@ -785,10 +1311,30 @@ def _describe_factory(cls: Type[Constraint]) -> str:
             continue
         parts.append(render(v))
 
-    # Coercers — combine single + plural into one count line.
-    n_coercers = (1 if "coercer" in kwargs else 0) + len(kwargs.get("coercers") or [])
-    if n_coercers:
-        parts.append(f"{n_coercers} coercer(s) applied")
+    # Coercers — surface each @constraint("...") description, but rendered as a
+    # TRANSFORM ("coerced (...)") so it reads as input preprocessing, NOT a check
+    # the value must satisfy (predicates render their description BARE). This is the
+    # signal that lets PLM tell coercing apart from testing. Untagged coercers
+    # collapse to a "N coercer(s) applied" count.
+    _coercers = ([kwargs["coercer"]] if "coercer" in kwargs else []) + list(kwargs.get("coercers") or [])
+    if _coercers:
+        _ctagged = [d for c in _coercers if (d := get_description(c)) is not None]
+        parts.extend(f"coerced ({d})" for d in _ctagged)
+        _c_untagged = len(_coercers) - len(_ctagged)
+        if _c_untagged:
+            parts.append(f"{_c_untagged} coercer(s) applied")
+
+    # Predicates plural — surface each predicate's @constraint("...") description
+    # individually (same as the single `predicate=` rule above and the structural
+    # path), and count the UNTAGGED remainder as one "N predicate(s) checked" line.
+    # (Coercers stay a pure count — they transform, they don't assert a property.)
+    _preds_extra = list(kwargs.get("predicates") or [])
+    if _preds_extra:
+        _tagged = [d for p in _preds_extra if (d := get_description(p)) is not None]
+        parts.extend(_tagged)
+        _n_untagged = len(_preds_extra) - len(_tagged)
+        if _n_untagged:
+            parts.append(f"{_n_untagged} predicate(s) checked")
 
     desc = cls._constraint_description
     if desc:
@@ -796,25 +1342,29 @@ def _describe_factory(cls: Type[Constraint]) -> str:
     return ", ".join(parts) if parts else "no constraint"
 
 
-def _describe_structural(cls: Type[Constraint]) -> str:
-    """Render an NL description for a structural Constraint subclass."""
-    lines = [f"Return an object of type {cls.__name__} with fields:"]
-    for name, info in cls.model_fields.items():
-        ann = info.annotation
-        constraints = _field_constraint_summary(info)
-        field_desc = info.description or ""
-        line = f"  - {name} ({_short(ann)})"
-        if constraints:
-            line += f" — {constraints}"
-        if field_desc:
-            line += f": {field_desc}"
-        lines.append(line)
+def _nested_struct(ann: Any) -> Optional[Type["Constraint"]]:
+    """If `ann` (or the inner type of `Optional[...]` / `X | None`) is a STRUCTURAL
+    Constraint subclass — NOT a `.field`/factory or a composite, which describe
+    themselves — return it, else None. Lets describe() recurse into nested object
+    fields. Containers (`List[...]`/`Dict[...]`) are left to their flat rendering."""
+    args = get_args(ann)
+    if args and type(None) in args:                      # Optional[X] / X | None
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            ann = non_none[0]
+    if (isinstance(ann, type) and issubclass(ann, Constraint)
+            and not getattr(ann, "_constraint_is_factory", False)
+            and not getattr(ann, "_constraint_is_composite", False)):
+        return ann
+    return None
 
-    # Collect @constraint-tagged descriptions from validators on the class.
-    # De-duplicated via `seen` so the same description never appears twice,
-    # regardless of whether it was found via dir() or via __pydantic_decorators__.
+
+def _collect_validator_descriptions(cls: Type[Constraint]) -> List[str]:
+    """The `@constraint('...')` descriptions on `cls`'s validators (model + field),
+    de-duplicated — for describe()'s 'Additionally:' block. Found via both `dir(cls)`
+    and `__pydantic_decorators__` (covers either decoration order)."""
     extras: List[str] = []
-    seen: set[str] = set()
+    seen: set = set()
 
     def _add(d: Optional[str]) -> None:
         if d and d not in seen:
@@ -823,19 +1373,82 @@ def _describe_structural(cls: Type[Constraint]) -> str:
 
     for name in dir(cls):
         _add(get_description(getattr(cls, name, None)))
-
     decs = getattr(cls, "__pydantic_decorators__", None)
     if decs is not None:
         for v in list(getattr(decs, "model_validators", {}).values()):
             _add(get_description(v.func))
         for v in list(getattr(decs, "field_validators", {}).values()):
             _add(get_description(v.func))
+    return extras
 
+
+def _struct_body(cls: Type[Constraint], base: int, seen: set) -> List[str]:
+    """Field lines (+ this class's 'Additionally:' block) for `cls`: field lines at
+    indent `base+2`, the 'Additionally:' header at `base`. A field whose type is a
+    nested structural Constraint (not already on the path — `seen` breaks cycles) is
+    expanded inline two spaces deeper."""
+    fpad = " " * (base + 2)
+    pad = " " * base
+    lines: List[str] = []
+    for name, info in cls.model_fields.items():
+        ann = info.annotation
+        field_desc = info.description or ""
+
+        nested = _nested_struct(ann)
+        if nested is not None:
+            head = f"{fpad}- {name} ({nested.__name__})"
+            if nested in seen:                            # cycle — show the type, don't expand
+                if field_desc:
+                    head += f": {field_desc}"
+                lines.append(head)
+                continue
+            if field_desc:
+                head += f" — {field_desc}"
+            lines.append(head + ":")
+            lines.extend(_struct_body(nested, base + 2, seen | {nested}))
+            continue
+
+        if getattr(ann, "_constraint_is_field", False):
+            # A `Constraint.field(...)`: its constraints live inside its core-schema
+            # hook (not on this FieldInfo's metadata), so render the bare value TYPE
+            # plus the field's COMPLETE factory describe (predicate/kind/one_of/...).
+            t = _short(getattr(ann, "_constraint_field_inner_type", None) or ann)
+            summary = ann.describe()
+            line = f"{fpad}- {name} ({t})"
+            if summary:
+                line += f" — {summary}"
+            if field_desc:
+                line += f": {field_desc}"
+            lines.append(line)
+            continue
+
+        constraints = _field_constraint_summary(info)
+        line = f"{fpad}- {name} ({_short(ann)})"
+        if constraints:
+            line += f" — {constraints}"
+        if field_desc:
+            line += f": {field_desc}"
+        lines.append(line)
+
+    extras = _collect_validator_descriptions(cls)
     if extras:
+        # Top-level "Additionally:" sits at the header column (base 0); a NESTED
+        # class's sits at its own field column (fpad) so it clearly belongs to that
+        # nested block rather than the enclosing object.
+        a_pad = pad if base == 0 else fpad
         lines.append("")
-        lines.append("Additionally:")
+        lines.append(f"{a_pad}Additionally:")
         for e in extras:
-            lines.append(f"  - {e}")
+            lines.append(f"{a_pad}  - {e}")
+    return lines
+
+
+def _describe_structural(cls: Type[Constraint]) -> str:
+    """Render an NL description for a structural Constraint subclass: a header, one
+    line per field (nested structural fields expanded inline, cycle-guarded), and an
+    'Additionally:' block for cross-field `@constraint`-tagged validators."""
+    lines = [f"Return an object of type {cls.__name__} with fields:"]
+    lines.extend(_struct_body(cls, base=0, seen={cls}))
     return "\n".join(lines)
 
 
@@ -847,6 +1460,15 @@ def _field_constraint_summary(info: pd.fields.FieldInfo) -> str:
             val = getattr(meta, attr, None)
             if val is not None:
                 bits.append(f"{attr}={val!r}")
+        # A struct-&-struct AUTO-MERGE keeps each side's NON-combinable constraints
+        # (patterns, multiple_of, custom validators + their @constraint descriptions)
+        # only inside its merge enforcer, since they can't reduce to a single visible
+        # marker. The enforcer stashes them as NL phrases on its func, so surface them
+        # here — otherwise the model wouldn't be TOLD about them upfront and would
+        # only meet them on a violation. (#H3/#H4 follow-up)
+        extra = getattr(getattr(meta, "func", None), "_plm_extra_desc", None)
+        if extra:
+            bits.extend(extra)
     return ", ".join(bits)
 
 

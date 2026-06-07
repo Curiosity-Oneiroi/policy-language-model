@@ -1,0 +1,38 @@
+[project]
+name = "plm"
+version = "0.1.dev0"
+description = "Policy Language Model (PLM) — self-contained MFH meta-reasoner (model backends ported from AFramework)."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic",
+    "dill",
+    "httpx",
+    "openai",
+    "anthropic",
+    "requests",
+    "typing-extensions",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+# The repo checks out as `policy-language-model/` but the package is imported as
+# `plm` (e.g. `from plm.constraint import Constraint`). setuptools' package-dir
+# remap exposes the flat repo root as the `plm` import name for both wheel and
+# editable (`-e`) installs. AFramework itself is a separate dependency installed
+# into the same venv.
+[tool.setuptools]
+package-dir = { "plm" = "." }
+packages = [
+    "plm",
+    "plm.constraint",
+    "plm.metaparams",
+    "plm.model_backend",
+    "plm.policy",
+    "plm.policy.defaults",
+    "plm.repl",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]

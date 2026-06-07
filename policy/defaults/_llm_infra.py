@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -61,8 +62,8 @@ def _check_blessed_caller(name: str) -> None:
     if caller_code not in _BLESSED_CALLERS:
         raise RuntimeError(
             f"_llm_infra.{name}: callable ONLY from inside the sanctioned LLM "
-            f"policies (natural_llm / react_llm). To call the model, use those "
-            f"policies; do not author your own LLM primitive."
+            f"policies (natural_llm / react_llm / react_llm_verifier). To call "
+            f"the model, use those policies; do not author your own LLM primitive."
         )
 
 
@@ -103,8 +104,10 @@ def check_depth_or_raise() -> None:
 
 def descend():
     """Decrement the LLM-depth budget for the dynamic extent of the agent's
-    act phase. Used by react_llm (and the deferred react_llm_verifier) around
-    their code execution. natural_llm is single-shot (no act phase) and does
+    act phase. Used by react_llm and react_llm_verifier around their act-phase
+    code execution — and, in react_llm_verifier, around the per-round verifier
+    hook, so a verifier's react_llm/natural_llm circuits are accounted depth-1.
+    natural_llm is single-shot (no act phase) and does
     NOT descend — it only checks before its generate calls.
 
     The blessed-caller check fires HERE (function-call time, frame 2 = the
@@ -152,7 +155,7 @@ def llm_call(depth=None):
     return _cm()
 
 
-# AFW backend class-name → module suffix dispatch table.
+# Local model-backend class-name → module suffix (plm.model_backend.*).
 _MOD = {
     "SlateBackend":     "slate_backend",
     "OpenAIBackend":    "openai_backend",
@@ -161,20 +164,49 @@ _MOD = {
 }
 
 
+async def _aclose_backend(be):
+    """Close a backend's underlying HTTP transport after a one-shot `.generate`.
+
+    The ported backends don't agree on the close method: `httpx.AsyncClient`
+    (SlateBackend) exposes `aclose()`, while the `openai`/`anthropic` async
+    clients expose an async `close()` and no `aclose`. The old cleanup only
+    handled `aclose`, so it silently leaked the openai/anthropic transports
+    every call. Handle both spellings (and a sync `close()` for safety): prefer
+    `aclose`, else await/await-or-call `close`. Never let cleanup mask the real
+    result — swallow close-time errors.
+    """
+    # Read the ALREADY-instantiated client from the instance __dict__ — never via
+    # getattr, because OpenAIBackend.client is a @property that CONSTRUCTS a client
+    # on access (so if .generate raised before first use, getattr would build a
+    # throwaway client just to close it). Eager backends store it under "client";
+    # OpenAIBackend's lazy holder is "_client" (None until first use).
+    c = be.__dict__.get("client") or be.__dict__.get("_client")
+    if c is None:
+        return
+    closer = getattr(c, "aclose", None) or getattr(c, "close", None)
+    if closer is None:
+        return
+    try:
+        res = closer()
+        if inspect.isawaitable(res):
+            await res
+    except Exception:
+        pass                                            # transport teardown is best-effort
+
+
 def _make_backend():
-    """Reconstruct the parent PLM's AFramework backend in this kernel from
+    """Reconstruct the parent PLM's model backend in this kernel from
     `_PLM_BACKEND_SPEC` env. Returns a SYNC handle that is a THIN transport
     wrapper — no depth logic inside `.generate()`. The depth check lives in
     the policy bodies (each LLM policy calls `check_depth_or_raise()` before
     its `backend.generate`).
 
-    The sync wrapper builds a fresh AFW backend instance per call via
-    `from_spec(spec, None)`, then calls the UNWRAPPED `.generate` (bypassing
-    the `@resource(...)` decorator) so the kernel doesn't need to initialize
-    AFW's ResourceManager (which lives in the AFW worker process, not here,
-    and would also pull in `redis` as a transitive dep). Fresh client per
-    call sidesteps cross-event-loop httpx reuse bugs (cheap; no network
-    until `.generate`).
+    Builds a fresh backend instance per call via `from_spec(spec, None)` and
+    awaits its async `.generate`. Fresh client per call sidesteps cross-event-
+    loop httpx reuse bugs (cheap; no network until `.generate`). The backends
+    live in `plm.model_backend` — ported from AFramework with the @resource /
+    ResourceManager / registry couplings stripped — so the kernel imports
+    nothing from AFramework.
     """
     _check_blessed_caller("_make_backend")
     raw = os.environ.get("_PLM_BACKEND_SPEC")
@@ -185,36 +217,27 @@ def _make_backend():
         )
     spec = json.loads(raw)
     cls_name = spec["model_backend_class_name"]
-    mod = importlib.import_module("AFramework.model_backend." + _MOD[cls_name])
+    if cls_name not in _MOD:
+        raise RuntimeError(
+            f"_make_backend: unsupported backend {cls_name!r}; "
+            f"known backends: {sorted(_MOD)}."
+        )
+    mod = importlib.import_module("plm.model_backend." + _MOD[cls_name])
     backend_cls = getattr(mod, cls_name)
 
     class _SyncBackend:
-        model = spec.get("model")
-
         def generate(self, messages, tools=None, **kw):
             # NO depth logic here — this is a thin transport. The policy body
             # calls `check_depth_or_raise()` BEFORE each .generate(), so the
-            # backend only handles the AFW round-trip.
-            #
-            # BYPASS @resource: AFW backends decorate `generate` with
-            # @resource(...), which calls get_resource_manager() — a
-            # process-local singleton init'd by the AFW worker, NOT by the
-            # kernel subprocess. Initializing it here would also pull in
-            # `redis` (transitive import in resource_manager). functools.wraps
-            # exposes the unwrapped async fn at `.__wrapped__`; call that
-            # directly. Consistent with "depth lives in the policy, not the
-            # backend" — AFW rate/concurrency stays in the worker; the
-            # kernel-side handle is purely transport.
+            # backend only handles the API round-trip. The local backends carry
+            # no @resource/ResourceManager wrapper (that AFW coupling was
+            # stripped on the port), so we just await `.generate` directly.
             async def _run():
                 be = backend_cls.from_spec(spec, None)
                 try:
-                    raw = type(be).generate
-                    fn = getattr(raw, "__wrapped__", raw)   # bypass @resource if present
-                    return await fn(be, messages, tools=tools, **kw)
+                    return await be.generate(messages, tools=tools, **kw)
                 finally:
-                    c = getattr(be, "client", None)
-                    if c is not None and hasattr(c, "aclose"):
-                        await c.aclose()
+                    await _aclose_backend(be)
             return asyncio.run(_run())
 
     return _SyncBackend()

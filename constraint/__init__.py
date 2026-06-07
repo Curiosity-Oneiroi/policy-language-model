@@ -10,11 +10,17 @@ Public API
         score: int = Field(ge=0, le=100)
         label: str
 
-    # Pattern 2 — one-shot factory (no class needed):
-    c = Constraint.of(int_range=(0, 9))
-    c = Constraint.of(predicate=is_prime, description="must be prime")
-    c = Constraint.of(coercer=str.lower, str_pattern=r"^[a-z]+$")
-    c = Constraint.of(coercers=[strip_bom, normalize_spaces, str.lower])
+    # Pattern 2 — value/field rule via Constraint.field (the public authoring
+    # entry; works standalone AND embeds FLAT as a struct field):
+    c = Constraint.field(int_range=(0, 9))
+    c = Constraint.field(predicate=is_prime, description="must be prime")
+    c = Constraint.field(coercer=str.lower, str_pattern=r"^[a-z]+$")
+    c = Constraint.field(coercers=[strip_bom, normalize_spaces, str.lower])
+
+    # The full Constraint.field(**kw) kwarg surface — int/float/str/list/tuple/set/
+    # dict/bytes/complex rules (e.g. list_contains=X for list-element membership via
+    # `in`, subset_of/superset_of, multiple_of, kind=...) — is catalogued by type in
+    # the `plm.constraint.base` module docstring.
 
     # Composition (closed under &, |, ~, ^):
     c1 & c2     # both must pass; struct-only pair auto-merges into one model
@@ -49,7 +55,7 @@ contracts so each has one clear meaning:
                                Multiple coercers chain left → right: fn1's
                                output feeds fn2.
 
-Execution order in one `Constraint.of(...)` call:
+Execution order in one `Constraint.field(...)` call:
 
     coercer(s)  →  type & Field(...) constraints  →  predicate(s)
 
@@ -62,7 +68,7 @@ PLM authors typically use one of:
 Built-in `kind=` registry
 =========================
 
-`Constraint.of(kind="semver")`, `kind="url"`, `kind="json"`, `kind="email"`,
+`Constraint.field(kind="semver")`, `kind="url"`, `kind="json"`, `kind="email"`,
 `kind="iso_date"`, `kind="uuid"`, `kind="identifier"`, `kind="regex"`,
 `kind="path_exists"`. PLM can extend at runtime:
 

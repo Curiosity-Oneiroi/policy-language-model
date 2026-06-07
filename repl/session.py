@@ -26,24 +26,68 @@ from .prefix import PREFIX
 
 DEFAULT_PREINSTALL: tuple[str, ...] = ("numpy", "requests", "dill", "pydantic")
 
+# The kernel venv is pinned to Python 3.12 — all PLM code targets 3.12 (uv finds an
+# installed 3.12 or fetches one). Bump here if the target version ever changes.
+DEFAULT_PYTHON: str = "3.12"
+
 _SHUTDOWN_WAIT = 2.0
 _REAP_WAIT = 1.0
 
 
 class _CellTimeout(Exception):
-    """Internal — caught by `execute_cell` to drive SIGINT/SIGKILL escalation."""
+    """Internal — caught by `execute_cell` to drive SIGINT/SIGKILL escalation.
+
+    `partial` is True when the timeout fired AFTER some bytes of the current
+    frame were already pulled off the socket (header or partial body). That
+    means the response stream is now DESYNCED and cannot be safely re-read —
+    the caller must respawn rather than attempt a second read on the same
+    socket (which would misread the leftover bytes as a fresh frame)."""
+
+    def __init__(self, partial: bool = False):
+        super().__init__()
+        self.partial = partial
+
+
+class _FrameDecodeError(Exception):
+    """Internal — a response frame could not be decoded (corrupt length or body,
+    typically because a prior mid-frame timeout left the stream misaligned).
+    Caught by `execute_cell` -> respawn; never allowed to escape uncaught."""
 
 
 def _compute_child_pythonpath() -> str:
-    """Build PYTHONPATH so the kernel child can import `plm.*` and `AFramework.*`."""
-    here = Path(__file__).resolve()
-    # plm/repl/session.py → parents[2] is the repo root.
-    repo_root = here.parents[2]
-    entries = [str(repo_root)]
+    """Build PYTHONPATH so the kernel child can import `plm.*`.
+
+    The child runs in a fresh per-session venv that does NOT install `plm` — it is
+    live project source, not a wheel. So we hand the child the directory that makes
+    `plm` importable in THIS (parent) process, derived from `plm.__path__[0]`.
+
+    This replaces an earlier `Path(__file__).resolve().parents[2]` guess: `resolve()`
+    collapses the `plm` symlink, so that guess landed on a dir not containing the
+    package, and the child only worked when the parent's PYTHONPATH happened to
+    carry the right dir. Deriving from `plm.__path__[0]` (UN-resolved, to preserve
+    the symlinked name) is correct regardless of how the parent obtained the
+    package (symlink, editable, install). The model backends now live under
+    `plm.model_backend` (no AFramework dependency), so only `plm` is needed. The
+    inherited PYTHONPATH is still appended as a fallback.
+    """
+    entries: list[str] = []
+    try:
+        import plm
+        paths = list(getattr(plm, "__path__", []) or [])
+        if paths:
+            entries.append(str(Path(paths[0]).parent))  # the dir that makes `import plm` work
+    except Exception:
+        pass
     existing = os.environ.get("PYTHONPATH", "")
     if existing:
         entries.append(existing)
-    return os.pathsep.join(entries)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for e in entries:
+        if e and e not in seen:
+            seen.add(e)
+            deduped.append(e)
+    return os.pathsep.join(deduped)
 
 
 def _assemble_kernel_script(prefix_text: str) -> str:
@@ -138,6 +182,11 @@ class PythonReplSession:
         self.execution_count = 0
         self.cached_vars_blob: bytes = b""
         self.last_rehydrate_error: str | None = None
+        self._pending_boot_stderr: str | None = None   # soft extra-policy boot warnings (#26)
+        # Bumped on every (re)spawn. A caller streaming incremental state (e.g. the
+        # root loop's `plm_messages` delta) reads this to detect a respawn — whose
+        # fresh kernel has lost any accumulated state — and resync from scratch.
+        self.kernel_epoch: int = 0
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._client_sock: socket.socket | None = None
@@ -160,7 +209,7 @@ class PythonReplSession:
         venv_python_path = venv_dir / "bin" / "python"
         if not venv_python_path.exists():
             shutil.rmtree(venv_dir, ignore_errors=True)
-            _run_uv(["uv", "venv", str(venv_dir)])
+            _run_uv(["uv", "venv", "--python", DEFAULT_PYTHON, str(venv_dir)])
         preinstall_list = [p for p in preinstall if p]
         if preinstall_list:
             _run_uv(["uv", "pip", "install", "--python", str(venv_python_path), *preinstall_list])
@@ -191,9 +240,25 @@ class PythonReplSession:
 
     # ---- public API -------------------------------------------------------
 
-    def execute_cell(self, code: str) -> dict[str, Any]:
+    def execute_cell(
+        self,
+        code: str,
+        seed: dict[str, Any] | None = None,
+        plm_messages_delta: list | None = None,
+    ) -> dict[str, Any]:
         """Run one cell; return an envelope:
             {type: 'result'|'return', return_obj, stdout, stderr}.
+
+        ``seed`` (optional): a ``{name: object}`` dict bound into the kernel's
+        ``__main__`` before this cell runs — a general per-round injection
+        channel. Values must be picklable (the frame is pickled to the kernel).
+
+        ``plm_messages_delta`` (optional): messages to APPEND to the kernel's
+        ``plm_messages`` accumulator before this cell — an additive, O(delta)
+        alternative to re-sending the whole trajectory each round. The root PLM
+        loop uses it to stream its own trajectory; after a respawn (``kernel_epoch``
+        changes) the caller must resend the full trajectory once, since the fresh
+        kernel's accumulator is empty.
 
         RETURN(obj) → type='return', return_obj set.
         On hard timeout or child death: SIGKILL + respawn, REPL state
@@ -206,28 +271,59 @@ class PythonReplSession:
         """
         self.execution_count += 1
 
+        # Snapshot + clear pending diagnostics NOW, before any respawn: the
+        # early-return respawn paths below call _kill_and_respawn -> _spawn_kernel,
+        # which OVERWRITES these fields with the fresh kernel's values. Capturing
+        # first lets us surface the OLD pending once on THIS cell's stderr (on ANY
+        # return path), instead of losing it to the respawn. (#10/#26)
+        _pre = ""
+        if self._pending_boot_stderr is not None:
+            _pre += f"[boot: extra-policy install warning]\n{self._pending_boot_stderr}\n"
+            self._pending_boot_stderr = None
+        if self.last_rehydrate_error is not None:
+            _pre += f"[rehydrate after respawn: {self.last_rehydrate_error}]\n"
+            self.last_rehydrate_error = None
+
         with self._io_lock:
             try:
-                self._write_frame({"type": "code", "code": code})
+                self._write_frame({"type": "code", "code": code, "seed": seed,
+                                   "plm_messages_delta": plm_messages_delta})
                 envelope = self._read_frame_with_timeout(self._cell_timeout)
-            except _CellTimeout:
-                try:
-                    if self._proc is not None:
-                        self._proc.send_signal(signal.SIGINT)
-                    envelope = self._read_frame_with_timeout(self._sigint_grace)
-                except (_CellTimeout, EOFError, BrokenPipeError, struct.error):
+            except _CellTimeout as ct:
+                if ct.partial:
+                    # Timed out MID-FRAME: the response stream is now desynced
+                    # (header/partial body already consumed). A second read would
+                    # misread the leftover bytes as a new frame -> garbage that
+                    # could even decode wrong. Don't retry on this socket; respawn
+                    # directly (prior state is preserved via the cached snapshot).
                     self._kill_and_respawn()
                     return {
                         "type": "result", "return_obj": None,
                         "stdout": "",
-                        "stderr": f"[child timed out after {self._cell_timeout}s; prior state preserved]\n",
+                        "stderr": _pre + f"[child timed out after {self._cell_timeout}s; prior state preserved]\n",
                     }
-            except (EOFError, BrokenPipeError, struct.error):
+                # Clean frame boundary (nothing of the next frame consumed yet):
+                # try a graceful SIGINT so the SESSION can survive — the kernel
+                # catches it and writes a clean interrupted-result frame, which we
+                # read cleanly. Any timeout / desync / decode failure on the grace
+                # read -> respawn.
+                try:
+                    if self._proc is not None:
+                        self._proc.send_signal(signal.SIGINT)
+                    envelope = self._read_frame_with_timeout(self._sigint_grace)
+                except (_CellTimeout, _FrameDecodeError, EOFError, BrokenPipeError, struct.error):
+                    self._kill_and_respawn()
+                    return {
+                        "type": "result", "return_obj": None,
+                        "stdout": "",
+                        "stderr": _pre + f"[child timed out after {self._cell_timeout}s; prior state preserved]\n",
+                    }
+            except (_FrameDecodeError, EOFError, BrokenPipeError, struct.error):
                 self._kill_and_respawn()
                 return {
                     "type": "result", "return_obj": None,
                     "stdout": "",
-                    "stderr": "[child exited without writing payload; prior state preserved]\n",
+                    "stderr": _pre + "[child exited or desynced without a valid payload; prior state preserved]\n",
                 }
 
             if envelope.get("type") == "boot_error":
@@ -235,7 +331,7 @@ class PythonReplSession:
                 return {
                     "type": "result", "return_obj": None,
                     "stdout": "",
-                    "stderr": f"[kernel boot_error]\n{envelope.get('traceback', '')}",
+                    "stderr": _pre + f"[kernel boot_error]\n{envelope.get('traceback', '')}",
                 }
 
         etype = envelope.get("type") or "result"
@@ -243,11 +339,9 @@ class PythonReplSession:
         self.cached_vars_blob = envelope.get("vars_blob") or b""
 
         return_obj: Any = None
-        stderr_text = envelope.get("stderr") or ""
-        # Surface any pending rehydrate error exactly once.
-        if self.last_rehydrate_error is not None:
-            stderr_text = f"[rehydrate after respawn: {self.last_rehydrate_error}]\n" + stderr_text
-            self.last_rehydrate_error = None
+        # `_pre` carries any pending boot/rehydrate diagnostics captured at the
+        # top (surfaced once, on whatever path we return through).
+        stderr_text = _pre + (envelope.get("stderr") or "")
         if etype == "return":
             blob = envelope.get("return_blob")
             if blob is None:
@@ -279,13 +373,23 @@ class PythonReplSession:
                     self._write_frame({"type": "shutdown"})
 
             if self._proc is not None:
+                reaped = False
                 try:
                     self._proc.wait(timeout=_SHUTDOWN_WAIT)
+                    reaped = True
                 except subprocess.TimeoutExpired:
                     with suppress(ProcessLookupError, OSError):
                         self._proc.kill()
-                    with suppress(subprocess.TimeoutExpired):
+                    try:
                         self._proc.wait(timeout=_REAP_WAIT)
+                        reaped = True
+                    except subprocess.TimeoutExpired:
+                        pass                              # genuinely stuck — keep the box so
+                                                          # the finalizer still attempts a kill
+                if reaped:
+                    # Child reaped: clear the pid box so the GC/atexit finalizer
+                    # never SIGKILLs a now-recycled PID (#R4-6).
+                    self._child_pid_box[0] = None
 
             self._close_pipes()
 
@@ -339,7 +443,22 @@ class PythonReplSession:
         self._resp_r = self._sock_io
         self._child_pid_box[0] = self._proc.pid
 
-        envelope = self._read_frame_with_timeout(30.0)
+        def _handshake_read(stage):
+            # A handshake read must NOT let an internal _CellTimeout/
+            # _FrameDecodeError sentinel escape across this public boundary, nor
+            # leak the just-spawned child. On ANY read failure: kill the child,
+            # then raise a clean PLM-process error (#14).
+            try:
+                return self._read_frame_with_timeout(30.0)
+            except (_CellTimeout, _FrameDecodeError, EOFError, BrokenPipeError, struct.error) as e:
+                self._kill_silently()
+                raise RuntimeError(
+                    f"PLM kernel handshake ({stage}) failed: {type(e).__name__}: {e}. "
+                    f"The kernel did not produce a valid frame within 30s (a hung/slow "
+                    f"boot, a crashed child, or a corrupt handshake)."
+                ) from e
+
+        envelope = _handshake_read("ready")
         etype = envelope.get("type")
         if etype == "boot_error":
             tb = envelope.get("traceback", "<no traceback>")
@@ -348,16 +467,25 @@ class PythonReplSession:
         if etype != "ready":
             self._kill_silently()
             raise RuntimeError(f"PLM kernel handshake: expected 'ready', got {etype!r}")
+        # Soft EXTRA-policy install warnings captured during boot (a DEFAULT that
+        # fails to install is a HARD boot_error above; extras must not brick
+        # boot). Surface them once on the next cell instead of losing them to the
+        # reset boot buffer (#26).
+        self._pending_boot_stderr = (envelope.get("boot_stderr") or "").strip() or None
 
         if self.cached_vars_blob:
             self._write_frame({"type": "rehydrate", "vars_blob": self.cached_vars_blob})
-            envelope = self._read_frame_with_timeout(30.0)
+            envelope = _handshake_read("rehydrate")
             if envelope.get("type") != "ready":
                 self._kill_silently()
                 raise RuntimeError(
                     f"PLM kernel rehydrate: expected 'ready', got {envelope.get('type')!r}"
                 )
             self.last_rehydrate_error = envelope.get("rehydrate_error")
+
+        # A fresh kernel is now live (its in-kernel accumulators start empty);
+        # mark a new epoch so incremental-state callers know to resync.
+        self.kernel_epoch += 1
 
     def _kill_and_respawn(self) -> None:
         self._kill_silently()
@@ -369,6 +497,10 @@ class PythonReplSession:
                 self._proc.kill()
             with suppress(subprocess.TimeoutExpired):
                 self._proc.wait(timeout=_REAP_WAIT)
+        # This proc is no longer our live child (killed/reaped, or already dead);
+        # clear the pid box so the finalizer can't SIGKILL a recycled PID. The
+        # next _spawn_kernel resets the box to the fresh child's pid (#R4-6).
+        self._child_pid_box[0] = None
         self._close_pipes()
 
     def _close_pipes(self) -> None:
@@ -395,26 +527,44 @@ class PythonReplSession:
         if self._resp_r is None:
             raise EOFError("response socket not open")
 
+        # timeout=None => deadline=None => fully BLOCKING reads: wait forever.
+        # PLM deliberately runs unbounded circuits (a whole sub-agent's worth of
+        # rounds can happen inside one cell), so "no timeout" must NEVER
+        # synthesize a _CellTimeout — it simply blocks until the frame arrives
+        # (or EOF if the child dies). No desync is possible in that mode because
+        # we never bail mid-frame.
         deadline = None if timeout is None else time.monotonic() + timeout
         resp_fd = self._resp_r.fileno()
+        consumed = 0    # bytes of THIS frame already pulled off the socket
 
         def _read_exact(n: int) -> bytes:
+            nonlocal consumed
             buf = b""
             while len(buf) < n:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise _CellTimeout()
+                        raise _CellTimeout(partial=consumed > 0)
                     rlist, _, _ = select.select([resp_fd], [], [], remaining)
                     if not rlist:
-                        raise _CellTimeout()
+                        raise _CellTimeout(partial=consumed > 0)
                 chunk = self._resp_r.read(n - len(buf))
                 if not chunk:
                     raise EOFError("response socket closed mid-frame")
                 buf += chunk
+                consumed += len(chunk)
             return buf
 
         hdr = _read_exact(4)
         (n,) = struct.unpack(">I", hdr)
         body = _read_exact(n)
-        return pickle.loads(body)
+        try:
+            return pickle.loads(body)
+        except Exception as e:
+            # A corrupt body (e.g. the stream was misaligned by a prior
+            # mid-frame timeout) must NOT escape as an arbitrary unpickling
+            # error — surface it as a decode error the caller turns into a
+            # respawn.
+            raise _FrameDecodeError(
+                f"frame decode failed: {type(e).__name__}: {e}"
+            ) from e

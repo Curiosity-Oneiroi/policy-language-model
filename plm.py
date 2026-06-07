@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Type
 
-from AFramework.model_backend import ModelBackend
+from plm.model_backend import ModelBackend
 from plm._react_helper import (
     _build_last_round_reminder,
     _format_repl_output,
@@ -14,6 +14,7 @@ from plm._react_helper import (
     _track_model_call,
     _validate_return_against_constraint,
     clone_messages,
+    public_trajectory,
 )
 from plm.constraint import Constraint
 from plm.metaparams import get_system_prompt
@@ -47,6 +48,17 @@ class PLMTaskFailure(RuntimeError):
 class PLMMetaParameters:
     system_prompt: str
     extra_policies: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        ep = self.extra_policies
+        if ep is not None and not (
+            isinstance(ep, dict)
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in ep.items())
+        ):
+            raise TypeError(
+                "PLMMetaParameters.extra_policies must be a dict[str, str] "
+                "(policy name -> @policy source) or None"
+            )
 
 
 class PLM:
@@ -83,10 +95,13 @@ class PLM:
 
         Returns:
             {
-                "answer":        final answer (Constraint-validated value if constraint set, else str/Any),
-                "full_content":  str rendering of the answer,
-                "messages":      final trajectory (system prompt + all rounds),
-                "metrics":       {"main_turns", "model_calls", "tool_calls", "total_tokens"}
+                "answer":   EXACTLY the value PLM passed to RETURN(...) — the
+                            Constraint-validated/coerced value when a constraint was
+                            set, else whatever object the model returned. (PLM and
+                            its sub-policies always finalize via RETURN, so the
+                            terminal assistant text is never the answer.)
+                "messages": final trajectory (system prompt + all rounds),
+                "metrics":  {"main_turns", "model_calls", "tool_calls", "total_tokens"}
             }
         """
         
@@ -102,7 +117,13 @@ class PLM:
             "model_backend_class_name": type(mb).__name__,
             "model": getattr(mb, "model", None),
         }
-        for attr in ("api_key", "base_url", "max_context_length"):
+
+        # `use_responses_api` round-trips an EXPLICIT API-style override to the
+        # kernel sub-LLM. OpenAIBackend.from_spec already reads the key; without it
+        # here, an explicit `use_responses_api=` set against the model-name
+        # auto-detection silently flips in-kernel. The hasattr guard no-ops it for
+        # the other backends (they lack the attr). (#R6-5)
+        for attr in ("api_key", "base_url", "max_context_length", "use_responses_api"):
             if hasattr(mb, attr):
                 spec[attr] = getattr(mb, attr)
         repl_env["_PLM_BACKEND_SPEC"] = json.dumps(spec)
@@ -110,8 +131,8 @@ class PLM:
         if getattr(self.metaparams, "extra_policies", None):
             repl_env["_PLM_EXTRA_POLICIES"] = json.dumps(self.metaparams.extra_policies)
 
-        # Append the chosen backend's runtime deps so the kernel's per-session
-        # uv venv can `import AFramework.model_backend.<x>` successfully.
+        # Append the chosen backend's runtime SDK dep so the kernel's per-session
+        # uv venv can `import plm.model_backend.<x>` and call it successfully.
         backend_deps = _BACKEND_DEPS.get(type(mb).__name__, ())
         extra_packages = (
             tuple(self.pip_install_packages.split()) if self.pip_install_packages.strip() else ()
@@ -149,11 +170,12 @@ class PLM:
         constraint_is_set = constraint is not None
         _DONE = object()
         terminal_answer: Any = _DONE
-        last_answer: Any = ""
-        last_full_content: str = ""
         reasoning: Optional[str] = None
 
         total_rounds_budget = self.max_turns + self.return_budget
+
+        seeded_count = 0
+        seeded_epoch: Optional[int] = None
 
         # ---- React loop ------------------------------------------------------
         try:
@@ -178,8 +200,6 @@ class PLM:
 
                 content = response.get("content", "") or ""
                 reasoning = response.get("reasoning")
-                last_answer = content
-                last_full_content = content
                 plm_ctx["main_turns"] = plm_ctx.get("main_turns", 0) + 1
 
                 tool_calls = response.get("tool_calls") or []
@@ -188,7 +208,7 @@ class PLM:
                     "role": "assistant",
                     "content": content,
                     "reasoning": reasoning,
-                    "tool_calls": tool_calls or None,
+                    "tool_calls": (tool_calls[:1] or None),
                     "_timestamp": time.time(),
                 })
 
@@ -207,16 +227,51 @@ class PLM:
                 elif isinstance(raw_args, str):
                     try:
                         targs = json.loads(raw_args)
-                    except json.JSONDecodeError:
-                        targs = {}
+                    except Exception:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": f"error: invalid JSON arguments for tool {tname!r}",
+                        })
+                        metrics["tool_calls"].append({
+                            "tool_name": tname, "tool_status": "code_arg_invalid",
+                            "tool_result": f"error: invalid JSON arguments for tool {tname!r}",
+                        })
+                        continue
                 else:
-                    targs = {}
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": f"error: invalid arguments for tool {tname!r}",
+                    })
+                    metrics["tool_calls"].append({
+                        "tool_name": tname, "tool_status": "code_arg_invalid",
+                        "tool_result": f"error: invalid arguments for tool {tname!r}",
+                    })
+                    continue
+                
 
                 if tname != "python":
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "content": f"error: tool {tname!r} not supported (only `python`)",
+                    })
+                    metrics["tool_calls"].append({
+                        "tool_name": tname, "tool_status": "code_arg_invalid",
+                        "tool_result": f"error: tool {tname!r} not supported (only `python`)",
+                    })
+                    continue
+
+                if not isinstance(targs, dict):
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": f"error: arguments for tool {tname!r} must be a JSON object",
+                    })
+                    metrics["tool_calls"].append({
+                        "tool_name": tname, "tool_status": "code_arg_invalid",
+                        "tool_result": f"error: arguments for tool {tname!r} must be a JSON object",
                     })
                     continue
 
@@ -235,7 +290,15 @@ class PLM:
                     })
                     continue
 
-                exec_result = await asyncio.to_thread(repl.execute_cell, code)
+                if repl.kernel_epoch != seeded_epoch:
+                    seeded_count = 0
+                    seeded_epoch = repl.kernel_epoch
+                delta = public_trajectory(messages[seeded_count:])
+                seeded_count = len(messages)
+                
+                exec_result = await asyncio.to_thread(
+                    repl.execute_cell, code, None, delta
+                )
                 etype = exec_result.get("type", "result")
 
                 if etype == "return":
@@ -262,26 +325,12 @@ class PLM:
                             "tool_result": out[:500],
                         })
                     else:
-                        parsed = parsed_or_err
-                        terminal_answer = parsed
-                        last_answer = parsed
-                        last_full_content = (
-                            parsed.model_dump_json()
-                            if hasattr(parsed, "model_dump_json")
-                            else (str(parsed) if parsed is not None else "")
-                        )
+                        terminal_answer = parsed_or_err
                         out = _format_repl_output(exec_result)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
                             "content": out + "\n[PLM] RETURN accepted; task terminating.",
-                        })
-                        messages.append({
-                            "role": "assistant",
-                            "content": last_full_content,
-                            "tool_calls": None,
-                            "_timestamp": time.time(),
-                            "_structured": constraint_is_set,
                         })
                         metrics["tool_calls"].append({
                             "tool_name": tname, "tool_status": "return_valid",
@@ -318,9 +367,7 @@ class PLM:
         metrics["main_turns"] = plm_ctx.get("main_turns", 0)
 
         return {
-            "answer": last_answer,
-            "full_content": last_full_content,
-            "reasoning": reasoning,
+            "answer": terminal_answer,     # exactly the value PLM passed to RETURN(...)
             "messages": messages,
             "metrics": metrics,
         }
@@ -339,7 +386,9 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", required=True, help="The user prompt for PLM to solve")
     args = parser.parse_args()
 
-    from AFramework.model_backend import OpenAIBackend, VLLMBackend, SlateBackend
+    from plm.model_backend.openai_backend import OpenAIBackend
+    from plm.model_backend.vllm_backend import VLLMBackend
+    from plm.model_backend.slate_backend import SlateBackend
     backend_cls = {"openai": OpenAIBackend, "vllm": VLLMBackend, "slate": SlateBackend}[args.backend]
     backend = backend_cls(model=args.model, base_url=args.base_url, api_key=args.api_key)
     metaparams = PLMMetaParameters(system_prompt=get_system_prompt())
@@ -348,7 +397,7 @@ if __name__ == "__main__":
     async def _main():
         result = await plm([{"role": "user", "content": args.prompt}])
         print("---- ANSWER ----")
-        print(result["full_content"])
+        print(result["answer"])
         print("\n---- METRICS ----")
         print(json.dumps(result["metrics"], indent=2, default=str))
 

@@ -53,13 +53,16 @@ def constraint(description: str) -> Callable[[_F], _F]:
     """
 
     def deco(fn_or_obj: _F) -> _F:
-        # If we're wrapping a pydantic descriptor proxy, attach to its
-        # underlying function so the attribute survives pydantic's
-        # decorator unwrapping during class construction.
+        # Attach the description to the DEEPEST plain function — the object pydantic
+        # keeps as `Decorator.func` (the classmethod's `__func__` for a validator).
+        # Walking both `.wrapped` (pydantic descriptor proxy) and `.__func__`
+        # (classmethod/staticmethod/bound method) makes it land in the right place
+        # regardless of decoration order — including `@constraint` placed OUTSIDE a
+        # `@field_validator` + `@classmethod` stack, where the older single-level
+        # unwrap missed it.
         target = fn_or_obj
-        wrapped = getattr(fn_or_obj, "wrapped", None)
-        if wrapped is not None and callable(wrapped):
-            target = wrapped  # type: ignore[assignment]
+        for layer in _descend(fn_or_obj):
+            target = layer
         try:
             setattr(target, _DESCRIPTION_ATTR, description)
         except (AttributeError, TypeError):
@@ -69,17 +72,26 @@ def constraint(description: str) -> Callable[[_F], _F]:
     return deco
 
 
-def get_description(fn_or_obj) -> str | None:
-    """Read back the `@constraint(...)` description, if any. Returns None
-    when the object has no attached description.
+def _descend(obj):
+    """Yield `obj` and each layer beneath it — a pydantic descriptor proxy's
+    `.wrapped`, then a classmethod/staticmethod/bound-method's `.__func__` — down
+    to the underlying plain function. Cycle-guarded by object id."""
+    seen: set = set()
+    while obj is not None and id(obj) not in seen:
+        seen.add(id(obj))
+        yield obj
+        obj = getattr(obj, "wrapped", None) or getattr(obj, "__func__", None)
 
-    Checks the object itself first, then `obj.wrapped` (pydantic descriptor
-    proxy case) — so it works regardless of decoration order or whether
-    pydantic has unwrapped the function yet."""
-    direct = getattr(fn_or_obj, _DESCRIPTION_ATTR, None)
-    if direct is not None:
-        return direct
-    wrapped = getattr(fn_or_obj, "wrapped", None)
-    if wrapped is not None:
-        return getattr(wrapped, _DESCRIPTION_ATTR, None)
+
+def get_description(fn_or_obj) -> str | None:
+    """Read back the `@constraint(...)` description, if any (else None).
+
+    Descends through `.wrapped` (pydantic descriptor proxy) and `.__func__`
+    (classmethod/staticmethod/bound method), checking each layer — so it finds the
+    description no matter which layer it was attached to or whether pydantic has
+    unwrapped the function yet. Order-independent, matching `@constraint`."""
+    for layer in _descend(fn_or_obj):
+        d = getattr(layer, _DESCRIPTION_ATTR, None)
+        if d is not None:
+            return d
     return None

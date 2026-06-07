@@ -109,17 +109,41 @@ def _compute_edit(src: str, old: str, new: str, replace_all: bool):
     return ns if ns != src else None
 
 
+# The FULL set of line boundaries `str.splitlines()` breaks on — checking only
+# '\n'/'\r' in the newline guards below would mis-handle a line that ends in one
+# of the others (e.g. \v in a string literal, \u2028 in a comment): the guard
+# would wrongly append a spurious '\n' right after the existing separator (#11).
+_LINE_BOUNDARIES = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"  # full str.splitlines() set
+
+
 def _compute_insert(src: str, after_line: int, content: str):
     """New source after inserting `content` after `after_line` lines, or None."""
-    if not content or after_line < 0:                 # after_line is a 0-based count
-        return None
+    if (not content or not isinstance(after_line, int) or isinstance(after_line, bool)
+            or after_line < 0):                       # after_line: a 0-based int count;
+        return None                                   # non-int -> no-op, not a raw TypeError
     L = src.splitlines(keepends=True)
-    return "".join(L[:after_line]) + content + "".join(L[after_line:])
+    before = "".join(L[:after_line])
+    tail = "".join(L[after_line:])
+    # If the prefix doesn't already END on a line boundary (e.g. inserting after
+    # the final line of a source whose last line has no trailing newline), add one
+    # so `content` starts on its own line instead of being glued onto that line.
+    if before and before[-1] not in _LINE_BOUNDARIES:
+        before += "\n"
+    # Symmetric guard on the OTHER side: for a mid-source insert (there ARE
+    # following lines) where `content` doesn't end on a boundary, add one so
+    # `content` isn't glued onto the first following line.
+    if tail and content and content[-1] not in _LINE_BOUNDARIES:
+        content += "\n"
+    return before + content + tail
 
 
 def _compute_delete(src: str, start: int, end):
     """New source after deleting 1-based lines [start, end], or None for a no-op."""
+    if not isinstance(start, int) or isinstance(start, bool):   # non-int -> no-op,
+        return None                                              # not a raw slice TypeError
     end = start if end is None else end
+    if not isinstance(end, int) or isinstance(end, bool):
+        return None
     if start < 1 or start > end:                       # lines are 1-based; start=0 invalid
         return None                                    # (negative slicing would duplicate)
     L = src.splitlines(keepends=True)

@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import asyncio
 import sys
 import types
 
@@ -49,6 +50,8 @@ from plm.policy.proxy import (
 from plm.policy.registry import (
     _UNDUPLICABLE_POLICIES,
     _install_policy_source,
+    _seal,
+    _unsealed,
 )
 
 
@@ -59,7 +62,8 @@ def _clear_registry() -> None:
     main = sys.modules["__main__"].__dict__
     for n in list(_PLM_POLICIES):
         main.pop(n, None)
-    _PLM_POLICIES.clear()
+    with _unsealed():                 # harness reset: the store retains defaults while sealed
+        _PLM_POLICIES.clear()
     _IMMUTABLE_POLICIES.clear()
     _UNDUPLICABLE_POLICIES.clear()
 
@@ -98,17 +102,24 @@ def _install_defaults() -> None:
     install, mark immutable + un-duplicable, then bless code objects.
 
     Note: in-process tests don't go through PREFIX, so we have to make
-    `policy` AND `RETURN` (which react_llm reads from __main__ to plumb into
-    its restricted exec_globals) available in __main__ BEFORE invoking
-    `_install_policy_source`."""
+    `policy`, `RETURN` (which react_llm reads from __main__ to plumb into its
+    restricted exec_globals), and `exec_ns` (a PREFIX-injected repl global that
+    base_verifier reaches AMBIENTLY, like `react_llm`) available in __main__
+    BEFORE invoking `_install_policy_source`."""
+    from plm.repl.exec_ns import exec_ns
+    from plm.constraint import Constraint, ConstraintViolation
     main = sys.modules["__main__"].__dict__
     main.setdefault("policy", policy)
     main.setdefault("RETURN", _test_RETURN)
+    main.setdefault("exec_ns", exec_ns)
+    # constraint surface is prefix-injected in the real kernel (when pydantic present);
+    # in-process tests don't run the prefix, so seed what base_verifier reaches ambiently.
+    main.setdefault("Constraint", Constraint)
+    main.setdefault("ConstraintViolation", ConstraintViolation)
     for name, src in iter_default_policies():
         _install_policy_source(src, "<policy-bootstrap-" + name + ">")
     for name in UNDUPLICABLE_DEFAULTS:
-        _IMMUTABLE_POLICIES.add(name)
-        _UNDUPLICABLE_POLICIES.add(name)
+        _seal(name)             # sets the intrinsic _p_immutable flag + the name-sets
     _bless_llm_callers()
 
 
@@ -285,10 +296,12 @@ def test_6_check_depth_or_raise_boundary():
     blessed()
 
 
-def test_6b_resource_bypass_uses_wrapped():
-    """`_make_backend` invokes `type(be).generate.__wrapped__(be, ...)` to skip
-    the @resource decorator — the kernel doesn't init ResourceManager."""
-    rm_init_calls = []
+def test_6b_make_backend_calls_generate_directly():
+    """`_make_backend` builds the backend from `plm.model_backend.<x>` via
+    `from_spec` and awaits its PLAIN async `.generate` directly — the ported
+    backends carry no @resource/ResourceManager wrapper (that AFW coupling was
+    stripped), so there is no `__wrapped__` to unwrap."""
+    calls = []
 
     class FakeBackend:
         model = "fake-model"
@@ -297,25 +310,17 @@ def test_6b_resource_bypass_uses_wrapped():
         def from_spec(spec, worker_context):
             return FakeBackend()
 
-        # `generate` is the @resource-wrapped form (would call get_resource_manager).
         async def generate(self, messages, tools=None, **kw):
-            rm_init_calls.append("UNWRAPPED-CALLED")
-            return {"content": "BYPASSED"}
+            calls.append(tuple(m["role"] for m in messages))
+            return {"content": "OK"}
 
-        # `__wrapped__` exposes the inner, ResourceManager-free implementation.
-        async def _unwrapped(self, messages, tools=None, **kw):
-            return {"content": "BYPASSED"}
-
-    FakeBackend.generate.__wrapped__ = FakeBackend._unwrapped
-
-    # Patch the dispatch table + spec so _make_backend resolves to FakeBackend.
     import os
     os.environ["_PLM_BACKEND_SPEC"] = (
         '{"model_backend_class_name": "FakeBackend", "model": "fake-model"}'
     )
-    fake_mod = types.ModuleType("AFramework.model_backend.fake_backend")
+    fake_mod = types.ModuleType("plm.model_backend.fake_backend")
     fake_mod.FakeBackend = FakeBackend
-    sys.modules["AFramework.model_backend.fake_backend"] = fake_mod
+    sys.modules["plm.model_backend.fake_backend"] = fake_mod
     _llm_infra._MOD["FakeBackend"] = "fake_backend"
     try:
         def blessed():
@@ -323,12 +328,81 @@ def test_6b_resource_bypass_uses_wrapped():
             return be.generate(messages=[{"role": "user", "content": "hi"}])
         _bless_caller(blessed)
         result = blessed()
-        assert result == {"content": "BYPASSED"}
-        # The wrapped (RM-calling) path was NOT invoked.
-        assert "UNWRAPPED-CALLED" not in rm_init_calls
+        assert result == {"content": "OK"}
+        assert calls == [("user",)]                  # plain .generate ran once
     finally:
         del _llm_infra._MOD["FakeBackend"]
         del os.environ["_PLM_BACKEND_SPEC"]
+        sys.modules.pop("plm.model_backend.fake_backend", None)
+
+
+def test_6c_aclose_backend_handles_all_close_spellings():
+    """`_aclose_backend` (C27) closes the backend's transport regardless of how
+    the client spells close: `aclose()` (httpx — SlateBackend), async `close()`
+    (openai/anthropic, which have NO `aclose`), or a sync `close()`. A missing
+    client / missing closer is a no-op, and close-time errors are swallowed so
+    cleanup never masks the real generate result."""
+    closed = []
+
+    class AcloseClient:
+        async def aclose(self): closed.append("aclose")
+
+    class AsyncCloseClient:                              # like openai/anthropic
+        async def close(self): closed.append("async-close")
+
+    class SyncCloseClient:
+        def close(self): closed.append("sync-close")
+
+    class RaisingClient:
+        async def aclose(self): raise RuntimeError("boom")
+
+    def be_with(client): return types.SimpleNamespace(client=client)
+
+    async def _drive():
+        await _llm_infra._aclose_backend(be_with(AcloseClient()))
+        await _llm_infra._aclose_backend(be_with(AsyncCloseClient()))
+        await _llm_infra._aclose_backend(be_with(SyncCloseClient()))
+        await _llm_infra._aclose_backend(be_with(None))          # no client -> no-op
+        await _llm_infra._aclose_backend(types.SimpleNamespace())  # no attr -> no-op
+        await _llm_infra._aclose_backend(be_with(object()))      # no closer -> no-op
+        await _llm_infra._aclose_backend(be_with(RaisingClient()))  # error swallowed
+
+    asyncio.run(_drive())
+    assert closed == ["aclose", "async-close", "sync-close"]
+
+
+def test_6d_aclose_backend_does_not_trigger_lazy_client():
+    """#19: when a backend exposes `client` as a lazy @property that constructs
+    the transport on access (OpenAIBackend), `_aclose_backend` must NOT build a
+    throwaway client just to close it — it reads the instance __dict__ instead.
+    An eagerly-stored client is still closed."""
+    constructed = []
+    closed = []
+
+    class LazyBackend:
+        """Mirrors OpenAIBackend: lazy `client` @property over a `_client` holder."""
+        def __init__(self):
+            self._client = None
+        @property
+        def client(self):
+            if self._client is None:
+                constructed.append("BUILT")
+                self._client = type("C", (), {"aclose": staticmethod(lambda: None)})()
+            return self._client
+
+    class EagerBackend:
+        def __init__(self):
+            class C:
+                async def aclose(self_): closed.append("eager-closed")
+            self.client = C()                            # stored in __dict__
+
+    async def _drive():
+        await _llm_infra._aclose_backend(LazyBackend())  # client never used -> must NOT construct
+        await _llm_infra._aclose_backend(EagerBackend())  # eager client -> closed
+
+    asyncio.run(_drive())
+    assert constructed == [], "lazy client property was triggered during cleanup"
+    assert closed == ["eager-closed"]
 
 
 # ============================ Section: natural_llm ============================
@@ -398,17 +472,17 @@ def test_10_natural_llm_budget_exhausted(defaults_installed, stub_backend):
 
 
 def test_10b_natural_llm_rejects_factory_constraint(defaults_installed, stub_backend):
-    """A Constraint.of(...) factory constraint carries Python predicates the
-    model can't read; natural_llm refuses upfront with a TypeError naming the
-    'not just a JSON schema' issue. No backend call is made."""
+    """A Constraint.field(...) factory constraint carries Python predicates the
+    model can't read; natural_llm refuses upfront with a TypeError. No backend
+    call is made."""
     from plm.constraint import Constraint
 
     # Build a factory constraint with a predicate (this sets _constraint_is_factory=True).
-    PositiveInt = Constraint.of(predicate=lambda v: v > 0, int_gt=0)
+    PositiveInt = Constraint.field(predicate=lambda v: v > 0, int_gt=0)
     assert getattr(PositiveInt, "_constraint_is_factory", False) is True
 
     nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(TypeError, match="not just a JSON schema"):
+    with pytest.raises(TypeError, match="predicate/AfterValidator"):
         nl("give me a positive int", constraint=PositiveInt)
     # No generate happened — the rejection is upfront.
     assert len(stub_backend.calls) == 0
@@ -417,7 +491,7 @@ def test_10b_natural_llm_rejects_factory_constraint(defaults_installed, stub_bac
 def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backend):
     """When a (non-factory) constraint is set, natural_llm always sends a
     `response_format` carrying the schema to the backend — no silent-skip
-    fallback. The caller can still override via generate_kwargs."""
+    fallback, and it is NOT overridable (the constraint defines the output)."""
     from plm.constraint import Constraint
 
     class IntC(Constraint):
@@ -472,7 +546,87 @@ def test_10d_natural_llm_composite_constraint_works(defaults_installed, stub_bac
     assert "allOf" in schema_str or "name" in schema_str
 
 
+def test_10e_natural_llm_retries_on_non_violation_error(defaults_installed, stub_backend):
+    """#8: a struct @model_validator raising a RAW non-ValueError (KeyError) must
+    be treated as a retry, not abort the call — the model gets another turn and a
+    later good answer is accepted."""
+    from pydantic import model_validator
+    from plm.constraint import Constraint
+
+    class C(Constraint):
+        v: int = 0
+        @model_validator(mode="after")
+        def _chk(self):
+            if self.v == 0:
+                raise KeyError("v missing")          # RAW non-ValueError; pydantic won't wrap it
+            return self
+
+    stub_backend.script = [make_text('{"v": 0}'), make_text('{"v": 5}')]
+    nl = _PLM_POLICIES["natural_llm"]
+    out = nl("?", constraint=C, return_budget=3)
+    assert out.v == 5
+    assert len(stub_backend.calls) == 2              # retried after the KeyError (didn't abort)
+
+
+def test_10f_natural_llm_budget_none_uses_default(defaults_installed, stub_backend):
+    """#18: a None / non-int return_budget is coerced to the default instead of
+    raising a raw TypeError at the range bound."""
+    from plm.constraint import Constraint
+
+    class IntC(Constraint):
+        value: int
+
+    stub_backend.script = [make_text('{"value": 7}')]
+    nl = _PLM_POLICIES["natural_llm"]
+    assert nl("?", constraint=IntC, return_budget=None).value == 7   # no TypeError
+
+
+def test_10g_natural_llm_strips_fenced_json(defaults_installed, stub_backend):
+    """#9: a ```json-fenced reply parses on the FIRST try (no retry-budget burn);
+    _strip_code_fences is structural-only so plain JSON is untouched."""
+    from plm.constraint import Constraint
+
+    class IntC(Constraint):
+        value: int
+
+    stub_backend.script = [make_text('```json\n{"value": 7}\n```')]
+    nl = _PLM_POLICIES["natural_llm"]
+    out = nl("?", constraint=IntC)
+    assert out.value == 7
+    assert len(stub_backend.calls) == 1            # parsed on first try; no retry
+
+
+def test_10h_natural_llm_exhaustion_raises_constraint_violation(defaults_installed, stub_backend):
+    """#5: on budget exhaustion the caller (PLM / a policy / a function) gets a
+    ConstraintViolation — even when the underlying validator raised a raw
+    non-ValueError — not a bare KeyError. Honors the documented Raises contract."""
+    from pydantic import model_validator
+    from plm.constraint import Constraint, ConstraintViolation
+
+    class C(Constraint):
+        v: int = 0
+        @model_validator(mode="after")
+        def _chk(self):
+            raise KeyError("always")               # raw non-ValueError; pydantic won't wrap it
+
+    stub_backend.script = [make_text('{"v": 1}') for _ in range(10)]
+    nl = _PLM_POLICIES["natural_llm"]
+    with pytest.raises(ConstraintViolation) as ei:
+        nl("?", constraint=C, return_budget=2)
+    msg = str(ei.value)
+    assert "budget exhausted" in msg and "KeyError" in msg   # clear, wrapped, not a raw KeyError
+
+
 # ============================ Section: react_llm ============================
+
+
+def test_11z_react_llm_budget_coerced_no_typeerror(defaults_installed, stub_backend):
+    """#22/#18: model-controlled max_turns/return_budget are coerced — None ->
+    default, negative -> 0 — so `range(max_turns + return_budget)` neither raises
+    a raw TypeError (None + int) nor goes negative."""
+    stub_backend.script = [make_python_call("RETURN(42)")]
+    rl = _PLM_POLICIES["react_llm"]
+    assert rl("?", max_turns=None, return_budget=-3) == 42   # None->8, -3->0; runs cleanly
 
 
 def test_11_react_llm_python_call_executes(defaults_installed, stub_backend):
@@ -645,6 +799,30 @@ def test_12e_kwargs_splat_binds_direct_local_names(defaults_installed, stub_back
     rl = _PLM_POLICIES["react_llm"]
     out = rl("?", kwargs={"x": 7, "label": "foo"})
     assert out == (7, "foo", {"x": 7, "label": "foo"})
+
+
+def test_12g_defined_function_sees_injected_and_sibling_names(defaults_installed, stub_backend):
+    """#2: the sub-agent's repl is ONE namespace (globals == locals, like PLM's
+    kernel `__main__`), so a `def`/`class` the model writes resolves injected
+    names (kwargs/objects), sibling helpers, AND itself (recursion) — not just
+    top-level code. Under the old split globals/locals these all NameError'd."""
+    code = (
+        "def use_kwarg():\n"
+        "    return x + 1\n"                  # injected kwarg, INSIDE a def
+        "def use_object():\n"
+        "    return objects[0]\n"             # injected objects channel, INSIDE a def
+        "def fact(n):\n"
+        "    return 1 if n <= 1 else n * fact(n - 1)\n"   # recursion: fact must see ITSELF
+        "def via_sibling():\n"
+        "    return use_kwarg() + fact(3)\n"  # one helper calling another helper
+        "class C:\n"
+        "    val = use_kwarg()\n"             # class body resolving an injected name
+        "RETURN((use_kwarg(), use_object(), fact(5), via_sibling(), C.val))"
+    )
+    stub_backend.script = [make_python_call(code)]
+    rl = _PLM_POLICIES["react_llm"]
+    out = rl("?", kwargs={"x": 10}, objects=["OBJ"])
+    assert out == (11, "OBJ", 120, 17, 11)   # 11; "OBJ"; 5!=120; 11+fact(3)=11+6=17; C.val=11
 
 
 def test_12f_kwargs_reserved_RETURN_raises(defaults_installed, stub_backend):
@@ -874,6 +1052,15 @@ def test_19_redecoration_is_no_op(defaults_installed):
     # Same proxy object, unchanged
     assert _PLM_POLICIES["natural_llm"] is nl_before
     assert nl_before._p_version == v0
+
+
+def test_19b_duplicate_unknown_name_is_gentle_refusal(defaults_installed, capsys):
+    """#21: duplicate_policy on an UNREGISTERED name returns None + a note (its
+    documented no-raise contract), not a raw KeyError."""
+    capsys.readouterr()
+    result = duplicate_policy("does_not_exist", "whatever")
+    assert result is None
+    assert "[policy] duplicate:" in capsys.readouterr().err
 
 
 def test_20_duplicate_mutable_creates_independent_copy(defaults_installed):
@@ -1195,3 +1382,429 @@ def test_37_parallel_propagates_contextvars(defaults_installed):
     results = blessed()
     # AGENT_DEPTH=2; after one descend → 1
     assert results == [1, 1]
+
+
+# ===================== Section: react_llm_verifier =========================
+# The trajectory control axis: react_llm + an optional `verifier` callable run
+# after each NON-terminal round (wrapped in descend()), mutating msgs in place.
+
+
+def test_rlv_verifier_runs_between_rounds(defaults_installed, stub_backend):
+    """Verifier runs after a non-terminal round, sees that round's full tick,
+    and its in-place mutation reaches the NEXT generate."""
+    seen_lens = []
+
+    def vf(msgs):
+        seen_lens.append(len(msgs))
+        msgs.append({"role": "user", "content": "SENTINEL_INJECT"})
+
+    stub_backend.script = [make_text("thinking"), make_python_call("RETURN(1)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    out = rlv("go", verifier=vf)
+    assert out == 1
+    # Only the round-0 (text-only, non-terminal) round triggers the verifier;
+    # at that point msgs == [user(go), assistant(thinking)].
+    assert seen_lens == [2]
+    # The injected sentinel is visible to the round-1 generate.
+    assert any("SENTINEL_INJECT" in (m.get("content") or "")
+               for m in stub_backend.calls[1]["messages"])
+
+
+def test_rlv_verifier_not_called_on_terminal_round(defaults_installed, stub_backend):
+    """A successful RETURN short-circuits — the verifier never runs on it."""
+    calls_n = []
+    stub_backend.script = [make_python_call("RETURN(1)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    out = rlv("go", verifier=lambda msgs: calls_n.append(1))
+    assert out == 1
+    assert calls_n == []
+
+
+def test_rlv_verifier_runs_after_tool_rounds(defaults_installed, stub_backend):
+    """The verifier also runs after a tool round, and sees that round's tool
+    message (the complete tick)."""
+    seen_tool = []
+
+    def vf(msgs):
+        for m in msgs:
+            if m.get("role") == "tool":
+                seen_tool.append(m.get("content") or "")
+
+    stub_backend.script = [make_python_call("print('XYZ')"), make_python_call("RETURN(2)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    out = rlv("go", verifier=vf)
+    assert out == 2
+    assert any("XYZ" in c for c in seen_tool)
+
+
+def test_rlv_verifier_none_is_react_llm_parity(defaults_installed, stub_backend):
+    """verifier=None ⇒ behaves like react_llm (terminates on RETURN)."""
+    stub_backend.script = [make_python_call("RETURN(42)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    assert rlv("go", verifier=None) == 42
+
+
+def test_rlv_accepts_policy_as_verifier(defaults_installed, stub_backend):
+    """A POLICY (base_verifier) is accepted as the verifier and is callable
+    via its proxy. Here its gate finds no error trigger → no-op, no inner LLM."""
+    stub_backend.script = [make_text("hello"), make_python_call("RETURN(9)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    bv = _PLM_POLICIES["base_verifier"]
+    assert rlv("go", verifier=bv) == 9
+
+
+def test_rlv_verifier_runs_one_level_below(defaults_installed, stub_backend):
+    """The descend() wrap puts the verifier ONE level below react_llm_verifier:
+    at AGENT_DEPTH=2 the verifier sees remaining==1, so any circuit it spawns is
+    capped at depth-1."""
+    seen = []
+    stub_backend.script = [make_text("t"), make_python_call("RETURN(1)")]
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    out = rlv("go", verifier=lambda msgs: seen.append(_llm_infra._remaining()))
+    assert out == 1
+    assert seen == [1]                          # root 2 − 1 (verifier's own descend)
+
+
+def test_rlv_immutable_unduplicable_blessed(defaults_installed, stub_backend):
+    """react_llm_verifier is sealed immutable + un-duplicable, and its body is
+    blessed (a scripted call runs the descend()/llm_call gated helpers)."""
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    assert "react_llm_verifier" in _IMMUTABLE_POLICIES
+    assert "react_llm_verifier" in _UNDUPLICABLE_POLICIES
+    v0 = rlv._p_version
+    rewrite_policy("react_llm_verifier", "def react_llm_verifier(messages):\n    return 'evil'\n")
+    assert rlv._p_version == v0                 # immutable → rewrite no-ops
+    assert duplicate_policy("react_llm_verifier", "rlv_copy") is None
+    stub_backend.script = [make_python_call("RETURN(123)")]
+    assert rlv("go") == 123                      # blessed: gated helpers run
+
+
+# ===================== Section: base_verifier (mutable) =====================
+
+
+def test_base_verifier_mutable_and_duplicable(defaults_installed):
+    """base_verifier is a default policy but intentionally NOT sealed: it is
+    mutable (rewrite bumps version) and duplicable."""
+    assert "base_verifier" in _PLM_POLICIES
+    assert "base_verifier" not in _IMMUTABLE_POLICIES
+    assert "base_verifier" not in _UNDUPLICABLE_POLICIES
+    dup = duplicate_policy("base_verifier", "bv_copy")
+    assert dup is not None and "bv_copy" in _PLM_POLICIES
+    bv = _PLM_POLICIES["base_verifier"]
+    v0 = bv._p_version
+    rewrite_policy("base_verifier", "def base_verifier(messages):\n    return None\n")
+    assert bv._p_version == v0 + 1
+
+
+def test_base_verifier_gate_no_trigger_is_noop(defaults_installed, stub_backend):
+    """No error in the trajectory → the gate returns False → no mutation, no
+    LLM call."""
+    bv = _PLM_POLICIES["base_verifier"]
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    before = [dict(m) for m in msgs]
+    bv(msgs)
+    assert msgs == before
+    assert stub_backend.calls == []             # gate short-circuited before any circuit
+
+
+def test_base_verifier_gate_trigger_runs_circuit(defaults_installed, stub_backend):
+    """An error in the latest tool message trips the gate; the depth-1 circuit runs,
+    its note is surfaced on a model-visible turn to STEER, and recorded on the private
+    `verifier` channel (the gate's marker)."""
+    bv = _PLM_POLICIES["base_verifier"]
+    stub_backend.script = [
+        make_python_call("RETURN('please recompute')"),   # _verify note circuit
+        make_python_call("RETURN('')"),                   # _verify_propose_approve: no edit
+    ]
+    msgs = [
+        {"role": "user", "content": "do x"},
+        {"role": "assistant", "content": "", "tool_calls": None},
+        {"role": "tool", "tool_call_id": "t",
+         "content": "stderr:\nTraceback (most recent call last):\nValueError: boom"},
+    ]
+    bv(msgs)
+    # the visible STEER (model sees it)
+    assert any((m.get("content") or "").startswith("[verifier]")
+               and "please recompute" in (m.get("content") or "") for m in msgs)
+    # the private verifier-channel MARKER (invisible to the model; the gate's signal)
+    assert any(m.get("role") == "verifier" and "please recompute" in (m.get("content") or "")
+               for m in msgs)
+    # the gate now sees that marker and won't re-fire on the SAME error (no new tool error)
+    before = [dict(m) for m in msgs]
+    bv(msgs)
+    assert msgs == before
+
+
+def test_base_verifier_integration_via_react_llm_verifier(defaults_installed, stub_backend):
+    """End-to-end: react_llm_verifier(verifier=base_verifier). Round 0 errors →
+    base_verifier's gate fires → its depth-1 circuit returns a note that is
+    injected into the OUTER trajectory and seen by the next outer generate."""
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    bv = _PLM_POLICIES["base_verifier"]
+    stub_backend.script = [
+        make_python_call("1/0"),                        # outer round 0 → traceback in tool msg
+        make_python_call("RETURN('recompute note')"),   # inner _verify note circuit
+        make_python_call("RETURN('')"),                 # inner _verify_propose_approve: no edit
+        make_python_call("RETURN('done')"),             # outer round 1
+    ]
+    out = rlv("solve", verifier=bv)
+    assert out == "done"
+    # The outer round-1 generate (4th backend call) saw the injected verifier note.
+    assert any("[verifier] recompute note" in (m.get("content") or "")
+               for m in stub_backend.calls[3]["messages"])
+
+
+def test_base_verifier_propose_approve_applies_edit_on_true(defaults_installed, stub_backend):
+    """PROPOSE -> APPROVE: react_llm #1 RETURNs python that edits `trajectory`,
+    react_llm #2 RETURNs True, and the verifier execs it → the LIVE trajectory is
+    edited. (No note this round: the note circuit RETURNs '')."""
+    bv = _PLM_POLICIES["base_verifier"]
+    edit = "trajectory.append({'role': 'user', 'content': 'EDITED'})"
+    stub_backend.script = [
+        make_python_call("RETURN('')"),                # _verify note circuit: no note
+        make_python_call(f"RETURN({edit!r})"),         # propose: the edit code
+        make_python_call("RETURN(True)"),              # approve: yes
+    ]
+    msgs = [
+        {"role": "user", "content": "do x"},
+        {"role": "tool", "tool_call_id": "t", "content": "Traceback: boom"},
+    ]
+    bv(msgs)
+    assert any("EDITED" in (m.get("content") or "") for m in msgs)      # approved code ran
+
+
+def test_base_verifier_propose_approve_skips_edit_on_false(defaults_installed, stub_backend):
+    """Same proposal, but react_llm #2 RETURNs False → the verifier does NOT exec the
+    code; the trajectory is unchanged by the edit."""
+    bv = _PLM_POLICIES["base_verifier"]
+    edit = "trajectory.append({'role': 'user', 'content': 'EDITED'})"
+    stub_backend.script = [
+        make_python_call("RETURN('')"),
+        make_python_call(f"RETURN({edit!r})"),
+        make_python_call("RETURN(False)"),             # approve: no
+    ]
+    msgs = [
+        {"role": "user", "content": "do x"},
+        {"role": "tool", "tool_call_id": "t", "content": "Traceback: boom"},
+    ]
+    bv(msgs)
+    assert not any("EDITED" in (m.get("content") or "") for m in msgs)  # rejected -> not applied
+
+
+def test_exec_ns_core_runner():
+    """exec_ns (the shared REPL runner): runs code in a namespace (mutating it in
+    place), captures stdout, captures an exception's traceback (does NOT raise), and
+    dispatches the REPL RETURN sentinel (matched by name) through `on_return`."""
+    from plm.repl.exec_ns import exec_ns
+
+    # mutates ns + captures stdout; no RETURN -> (term, val) == (None, None)
+    ns = {"x": 0}
+    out, term, val = exec_ns("x = x + 5\nprint('hi', x)", ns)
+    assert ns["x"] == 5 and "hi 5" in out and term is None and val is None
+
+    # an exception is CAPTURED into the output, not raised
+    out, term, _ = exec_ns("1/0", {})
+    assert "ZeroDivisionError" in out and term is None
+
+    # the RETURN sentinel (matched by __name__) is finalized via on_return
+    class _REPLReturn(BaseException):
+        def __init__(self, value): self.value = value
+    ns = {"_REPLReturn": _REPLReturn}
+    assert exec_ns("raise _REPLReturn(42)", ns)[1:] == ("return", 42)             # default
+    assert exec_ns("raise _REPLReturn(7)", ns, on_return=lambda v: (None, v * 2))[1:] == (None, 14)
+
+
+# ============== Section: single-store immutability seal (finding #1) ==============
+# Default policies carry an intrinsic `_p_immutable` flag; the single registry
+# (_PolicyStore) refuses to replace/remove a default entry while sealed. These
+# lock in the closed bypasses (rename-collision, subscript poison/del/pop/update,
+# clear) while confirming normal/mutable policies are unaffected.
+
+
+def test_seal_subscript_poison_refused(defaults_installed):
+    """`_PLM_POLICIES['natural_llm'] = evil` is refused; the default is intact."""
+    nl0 = _PLM_POLICIES["natural_llm"]
+    _PLM_POLICIES["natural_llm"] = "EVIL"
+    assert _PLM_POLICIES["natural_llm"] is nl0
+    _PLM_POLICIES.update({"natural_llm": "EVIL2"})       # update() routed through the guard
+    assert _PLM_POLICIES["natural_llm"] is nl0
+
+
+def test_seal_subscript_del_and_pop_refused(defaults_installed):
+    """`del`/`pop` of a default registry entry is refused; it stays present."""
+    nl0 = _PLM_POLICIES["natural_llm"]
+    del _PLM_POLICIES["natural_llm"]
+    assert _PLM_POLICIES.get("natural_llm") is nl0
+    returned = _PLM_POLICIES.pop("natural_llm")
+    assert returned is nl0 and _PLM_POLICIES.get("natural_llm") is nl0
+
+
+def test_seal_clear_retains_defaults_but_drops_mutables(defaults_installed):
+    """A sealed clear() keeps defaults (anti wipe-then-poison) but drops mutables."""
+    @policy
+    def keep_me():
+        return 1
+    assert "keep_me" in _PLM_POLICIES
+    _PLM_POLICIES.clear()                                # sealed: defaults retained
+    assert "natural_llm" in _PLM_POLICIES and "react_llm" in _PLM_POLICIES
+    assert "keep_me" not in _PLM_POLICIES
+
+
+def test_seal_rename_collision_refused(defaults_installed):
+    """A mutable policy cannot rename ONTO a default's name (the C01 bypass)."""
+    @policy
+    def tmppol():
+        return 1
+    nl0 = _PLM_POLICIES["natural_llm"]
+    rewrite_policy("tmppol", "def natural_llm():\n    return 'HIJACKED'\n")
+    assert _PLM_POLICIES["natural_llm"] is nl0           # default untouched
+    assert "def natural_llm" in nl0._p_source and "HIJACKED" not in nl0._p_source
+    assert _PLM_POLICIES["tmppol"]._p_name == "tmppol"   # rename refused -> tmppol unchanged
+
+
+def test_seal_legit_rename_to_fresh_name_still_works(defaults_installed):
+    """A rename to a genuinely fresh name is unaffected by the guard."""
+    @policy
+    def foo_src():
+        return 1
+    rewrite_policy("foo_src", "def bar_dst():\n    return 9\n")
+    assert "bar_dst" in _PLM_POLICIES and "foo_src" not in _PLM_POLICIES
+    assert _PLM_POLICIES["bar_dst"]() == 9
+
+
+def test_seal_setattr_freezes_inner_name_and_flag(defaults_installed):
+    """A sealed proxy freezes _inner / _p_name / _p_immutable."""
+    nl = _PLM_POLICIES["natural_llm"]
+    with pytest.raises(TypeError):
+        nl._inner = (lambda *a, **k: "evil")
+    with pytest.raises(TypeError):
+        nl._p_name = "x"
+    with pytest.raises(TypeError):
+        nl._p_immutable = False                          # cannot un-seal
+
+
+def test_seal_mutable_policies_unaffected(defaults_installed):
+    """Normal/mutable policies still edit, rename, duplicate, and remove."""
+    @policy
+    def m_pol():
+        return 1
+    m_pol._rewrite("def m_pol():\n    return 5\n")        # in-place edit
+    assert _PLM_POLICIES["m_pol"]() == 5
+    dup = duplicate_policy("m_pol", "m_pol2")            # duplicate
+    assert dup is not None and "m_pol2" in _PLM_POLICIES
+    _PLM_POLICIES["m_pol"]._remove()                     # remove
+    assert "m_pol" not in _PLM_POLICIES
+
+
+def test_react_llm_records_only_first_tool_call(defaults_installed, stub_backend):
+    """When a round returns multiple tool_calls, only the executed first call is
+    recorded (one assistant tool_call + one tool result) — no unanswered ids."""
+    def _two_calls(code_a, code_b):
+        return {"content": "", "reasoning": None, "tool_calls": [
+            {"id": "a", "type": "function",
+             "function": {"name": "python", "arguments": json.dumps({"code": code_a})}},
+            {"id": "b", "type": "function",
+             "function": {"name": "python", "arguments": json.dumps({"code": code_b})}},
+        ]}
+    stub_backend.script = [_two_calls("print('A')", "print('B')"), make_python_call("RETURN(1)")]
+    rl = _PLM_POLICIES["react_llm"]
+    assert rl("go") == 1
+    msgs = stub_backend.calls[-1]["messages"]            # round-1 generate sees round-0 history
+    asst = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert asst and len(asst[0]["tool_calls"]) == 1      # only the first call recorded
+    assert len([m for m in msgs if m.get("role") == "tool"]) == 1  # exactly one tool result
+
+
+# ============== Section: validator robustness + verifier fixes ==============
+
+
+def test_validate_helper_surfaces_non_cv_error():
+    """A NON-ConstraintViolation from constraint.validate (e.g. a buggy predicate
+    that raises TypeError) is surfaced as (False, msg), not raised — so a root
+    RETURN can't abort the whole task on a validator bug (finding #4)."""
+    from plm._react_helper import _validate_return_against_constraint
+    from plm.constraint import Constraint
+
+    def _boom(v):
+        raise TypeError("boom")                          # not a ValueError -> not a ConstraintViolation
+    C = Constraint.field(predicate=_boom)
+    ok, msg = _validate_return_against_constraint(123, C)
+    assert ok is False and ("boom" in msg or "TypeError" in msg)
+
+
+def test_natural_llm_rejects_composite_hiding_factory(defaults_installed, stub_backend):
+    """natural_llm rejects a factory hidden inside a composite (finding #5), before
+    any generate — not just a directly-factory constraint."""
+    from plm.constraint import Constraint
+
+    class HasName(Constraint):
+        name: str
+    Pred = Constraint.field(predicate=lambda v: None)    # a factory (Python predicate)
+    nl = _PLM_POLICIES["natural_llm"]
+    with pytest.raises(TypeError):
+        nl("make a person", constraint=(HasName & Pred))
+    assert stub_backend.calls == []                      # rejected before any generate
+    # a purely-structural composite is still accepted (reaches generate)
+    class HasAge(Constraint):
+        age: int
+    stub_backend.script = [make_text('{"name":"a","age":1}')]
+    nl("make a person", constraint=(HasName & HasAge))
+    assert len(stub_backend.calls) == 1
+
+
+def test_base_verifier_passes_trajectory_copy(defaults_installed, stub_backend):
+    """U04: the verification circuit gets a COPY of the trajectory; mutating it
+    cannot corrupt the agent's real messages."""
+    bv = _PLM_POLICIES["base_verifier"]
+    stub_backend.script = [make_python_call("trajectory.clear()\nRETURN('note')")]
+    msgs = [
+        {"role": "user", "content": "do x"},
+        {"role": "tool", "content": "stderr:\nTraceback (most recent call last):\nValueError: boom"},
+    ]
+    bv(msgs)
+    assert any(m.get("content") == "do x" for m in msgs)          # NOT cleared (copy was passed)
+    assert any((m.get("content") or "").startswith("[verifier]") for m in msgs)
+
+
+def test_base_verifier_no_refire_on_stale_error(defaults_installed, stub_backend):
+    """U33: a single error triggers exactly one verification; later rounds with no
+    NEW error (the verifier note is now the latest signal) do not re-fire."""
+    bv = _PLM_POLICIES["base_verifier"]
+    stub_backend.script = [
+        make_python_call("RETURN('note1')"),   # _verify note circuit (fires once)
+        make_python_call("RETURN('')"),         # _verify_propose_approve: no edit
+    ]
+    msgs = [
+        {"role": "user", "content": "x"},
+        {"role": "tool", "content": "stderr: Traceback ValueError"},
+    ]
+    bv(msgs)                                              # fires once -> appends [verifier] note1
+    after_first = len(stub_backend.calls)
+    bv(msgs)                                              # stale error -> must NOT re-fire
+    n_notes = sum(1 for m in msgs if (m.get("content") or "").startswith("[verifier]"))
+    assert n_notes == 1                                  # one steer note, not two
+    assert len(stub_backend.calls) == after_first        # second call made NO new backend calls
+
+
+def test_react_exec_linecache_distinct_per_round(defaults_installed, stub_backend):
+    """#9: per-round linecache slots key off the monotonic round counter, so two
+    rounds entering with the SAME ns length don't collide. A len(ns)-based key
+    would collapse both to one slot (dropping a round's traceback source)."""
+    import linecache
+    for k in [k for k in linecache.cache if k.startswith("<react-")]:
+        del linecache.cache[k]
+    # both rounds enter with ns unchanged (round 0 is a no-op) -> identical len(ns)
+    stub_backend.script = [make_python_call("pass"), make_python_call("RETURN(7)")]
+    rl = _PLM_POLICIES["react_llm"]
+    assert rl("?") == 7
+    react_keys = [k for k in linecache.cache if k.startswith("<react-")]
+    assert len(react_keys) >= 2, react_keys     # distinct per-round slots; no collision
+
+
+def test_natural_llm_rejects_non_constraint(defaults_installed, stub_backend):
+    """#R4-5: a non-Constraint `constraint` fails fast with a clear TypeError,
+    not a raw AttributeError from json_schema()."""
+    nl = _PLM_POLICIES["natural_llm"]
+    for bad in (5, "x", {"a": 1}):
+        with pytest.raises(TypeError):
+            nl("?", constraint=bad)

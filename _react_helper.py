@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -16,51 +17,110 @@ def clone_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return copy.deepcopy(messages)
 
 
+def public_trajectory(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deep copy of the root trajectory for seeding ``plm_messages`` in the REPL.
+
+    Keeps the real conversation fields (``role``, ``content``, ``reasoning``,
+    ``tool_calls``, ``tool_call_id``) and drops internal harness bookkeeping keys
+    (anything starting with ``_`` — e.g. ``_timestamp``, ``_plm_meta``,
+    ``_structured``). The result is what PLM sees as its own trajectory inside a
+    cell: the full messages, including tool calls and tool results.
+
+    A deep copy so the kernel-side ``plm_messages`` is independent of the
+    parent's live ``messages`` (the loop's source of truth); a cell mutating
+    ``plm_messages`` cannot corrupt the real trajectory, and the parent simply
+    re-seeds a fresh snapshot next round.
+    """
+    return [
+        {k: copy.deepcopy(v) for k, v in m.items() if not k.startswith("_")}
+        for m in messages
+    ]
+
+
 # ---------- python tool-arg sanitization -----------------------------------
 
 _PYTHON_FENCE_LANGS = frozenset({"python", "py", "python3", "py3", ""})
 
+# A bare fence-opener line: ``` (or more), an optional single language token, and
+# nothing else. A bare fence-closer line: ``` (or more) and nothing else. Both are
+# matched against an already-stripped line, so leading/trailing whitespace is gone.
+_FENCE_OPEN_RE = re.compile(r"`{3,}\s*([A-Za-z0-9_+.\-]*)\s*")
+_FENCE_CLOSE_RE = re.compile(r"`{3,}\s*")
+
 
 def _strip_code_fences(code: str) -> str:
-    """Tolerate models that wrap the ``code`` tool-arg in markdown fences.
+    """Unwrap a markdown code fence — but ONLY when the ENTIRE arg is one fenced
+    block.
 
-    Smaller / less-tool-trained models sometimes emit ``"```python\\n...\\n```"``
-    as the ``code`` argument instead of bare source. ``compile()`` would then
-    fail with a ``SyntaxError`` and the model burns a round to learn what we
-    could have stripped here.
+    Smaller / less-tool-trained models sometimes send the ``code`` tool-arg as
+    ``"```python\\n...\\n```"`` (or ``"```\\n...\\n```"``) instead of bare source;
+    we unwrap that. CRUCIALLY we never touch backticks that merely appear *inside*
+    the source (docstrings, string literals, comments): the arg is treated as
+    fence-wrapped only when its FIRST non-blank line is a bare fence opener (```
+    optionally + one language token) AND its LAST non-blank line is a bare closing
+    fence. Anything else is returned UNCHANGED.
+
+    (The earlier implementation searched for the first ``` *anywhere* and sliced to
+    the next one, which silently executed a wrong fragment — or raised a misleading
+    SyntaxError — for valid Python that contained ``` in a string/docstring/comment.
+    Returning the source untouched in the ambiguous cases is strictly safer: a
+    genuinely malformed arg simply fails to compile and the model corrects it,
+    rather than running code it never wrote.)
 
     Returns bare Python source. Raises :class:`SyntaxError` with an actionable
-    message if the fence carries an explicit non-Python language tag.
+    message only when it IS a fence wrapper whose opener carries a non-Python tag.
     """
-    
-    code = code.strip()
-    if "```" not in code:
-        return code
 
-    lines = code.splitlines()
-    while len(lines) >= 2 and lines[0].strip() == "```" and lines[-1].strip() == "```":
-        lines.pop(0)
-        lines.pop()
-    code = "\n".join(lines).strip()
-    if "```" not in code:
-        return code
+    stripped = code.strip()
+    if "```" not in stripped:
+        return stripped
 
-    fence_start = code.find("```")
-    lang_line, separator, remainder = code[fence_start + 3:].partition("\n")
-    if not separator:
-        return code
+    lines = stripped.splitlines()
+    nonblank = [i for i, ln in enumerate(lines) if ln.strip()]
+    if len(nonblank) < 2:                                 # need an opener AND a closer line
+        return stripped
+    first_i, last_i = nonblank[0], nonblank[-1]
 
-    lang = (lang_line.strip().split(maxsplit=1)[0] if lang_line.strip() else "").lower()
+    opener = _FENCE_OPEN_RE.fullmatch(lines[first_i].strip())
+    closer = _FENCE_CLOSE_RE.fullmatch(lines[last_i].strip())
+    if not (opener and closer and first_i < last_i):
+        return stripped                                   # `` ``` `` is embedded, not a wrapper -> leave it
+
+    lang = (opener.group(1) or "").lower()
     if lang not in _PYTHON_FENCE_LANGS:
         raise SyntaxError(
             f"`code` tool-arg wrapped in ```{lang} fence. "
             f"Pass bare Python source as the `code` argument, not {lang}."
         )
+    # Strictly the lines BETWEEN the opener and closer; trim only surrounding
+    # blank lines (never inner indentation).
+    return "\n".join(lines[first_i + 1:last_i]).strip("\n")
 
-    block_end = remainder.find("```")
-    if block_end == -1:
-        return remainder.strip()
-    return remainder[:block_end].strip()
+
+def _strip_md_fence(text: str) -> str:
+    """Language-AGNOSTIC structural fence unwrap for parsing fenced model OUTPUT
+    (e.g. a ```json ... ``` reply), as opposed to `_strip_code_fences`, which is
+    specific to the Python `code` tool-arg and deliberately RAISES on a
+    non-Python language tag.
+
+    Unwraps only when `text`'s first non-blank line is a bare fence opener (```
+    optionally + one language token) AND its last non-blank line is a bare closing
+    fence — returning the inner body. Otherwise returns `text` UNCHANGED. NEVER
+    raises, so unfenced JSON (or anything else) passes straight through.
+    """
+    stripped = text.strip()
+    if "```" not in stripped:
+        return text
+    lines = stripped.splitlines()
+    nonblank = [i for i, ln in enumerate(lines) if ln.strip()]
+    if len(nonblank) < 2:                                 # need an opener AND a closer line
+        return text
+    first_i, last_i = nonblank[0], nonblank[-1]
+    opener = _FENCE_OPEN_RE.fullmatch(lines[first_i].strip())
+    closer = _FENCE_CLOSE_RE.fullmatch(lines[last_i].strip())
+    if not (opener and closer and first_i < last_i):
+        return text                                       # embedded ```, not a wrapper -> leave it
+    return "\n".join(lines[first_i + 1:last_i]).strip("\n")
 
 
 # ---------- REPL output rendering ------------------------------------------
@@ -114,6 +174,52 @@ def _format_repl_output(result: Dict[str, Any], max_section_chars: int = 8192) -
     return "\n".join(parts) if parts else "(no output)"
 
 
+def _render_answer(parsed: Any) -> str:
+    """Render an accepted RETURN value to text for the transcript.
+
+    This is PURELY COSMETIC — the real answer object is kept separately by the
+    caller — so it MUST NOT raise. A successful, constraint-validated RETURN can
+    carry a value whose `model_dump_json()` (pydantic serialization edge) or
+    `str()`/`__str__` raises; without this guard that display failure would
+    abort an already-finished task and lose a correct result. On any failure we
+    fall back to a safe placeholder naming the type.
+    """
+    try:
+        if hasattr(parsed, "model_dump_json"):
+            return parsed.model_dump_json()
+        return str(parsed) if parsed is not None else ""
+    except Exception:
+        return f"<unserializable answer: {type(parsed).__name__}>"
+
+
+def _safe_describe(constraint: Any) -> str:
+    """`constraint.describe()` for an error/prompt string, but NEVER raising.
+
+    describe() can itself raise (e.g. a factory built from an exhausted one-shot
+    iterable — see the one_of/coercers describe bug — or `instance_of=<class with
+    a throwing __repr__/__name__>`). It is called from runtime paths whose only
+    job is to FORMAT an error or a reminder; a failure there must not escape and
+    abort the task (the never-escape contract, #6). Fall back to a placeholder."""
+    try:
+        return constraint.describe()
+    except Exception:
+        return "<constraint description unavailable>"
+
+
+def _coerce_budget(value: Any, default: int) -> int:
+    """Coerce a model-supplied budget arg (`max_turns` / `return_budget`) to a
+    non-negative int.
+
+    The sub-LLM policies (natural_llm / react_llm / react_llm_verifier) take
+    these from kwargs the MODEL controls in a cell. A `None` / non-int value
+    would otherwise raise a raw `TypeError` at the `range(...)` bound, and a
+    negative value would silently yield zero rounds. Normalize: `None` or any
+    non-int (incl. bool) -> `default`; a negative int -> 0 (clamped)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return max(0, value)
+
+
 # ---------- per-call usage tracking ----------------------------------------
 
 def _track_model_call(
@@ -147,17 +253,34 @@ def _track_model_call(
 
 # ---------- RETURN contract ------------------------------------------------
 
+def _format_unexpected_validate_error(
+    constraint: Type[Constraint],
+    err: BaseException,
+) -> str:
+    """Format a NON-ConstraintViolation error raised by ``constraint.validate``
+    (a buggy/edge predicate, a wrong-typed value, etc.) for re-injection so the
+    model can adjust the RETURN value — instead of the error escaping the React
+    loop and aborting the whole task."""
+
+    return (
+        f"RETURN value could not be validated — the output constraint's validator "
+        f"raised {type(err).__name__}: {err}\n\n"
+        f"Required: {_safe_describe(constraint)}\n\n"
+        f"Fix the object passed to RETURN(...) (it may be the wrong type/shape)."
+    )
+
+
 def _format_constraint_error(
     constraint: Type[Constraint],
     err: ConstraintViolation,
 ) -> str:
     """Format a Constraint violation for re-injection into a python tool
     result's stderr so the model sees what to fix on the next round."""
-    
+
     return (
         f"RETURN value failed the configured output constraint:\n"
         f"{err}\n\n"
-        f"Required: {constraint.describe()}\n\n"
+        f"Required: {_safe_describe(constraint)}\n\n"
         f"Fix the object passed to RETURN(...)."
     )
 
@@ -173,7 +296,7 @@ def _build_last_round_reminder(
             f"output constraint. You MUST conclude the task by calling "
             f"`RETURN(obj)` in a python cell, where obj satisfies the "
             f"constraint:\n"
-            f"      {constraint.describe()}\n"
+            f"      {_safe_describe(constraint)}\n"
             f"If RETURN is not called successfully, the task fails."
         )
     else:
@@ -205,11 +328,14 @@ def _validate_return_against_constraint(
       instance for a structural Constraint, or the (possibly coerced) scalar
       for a factory Constraint. That value is the terminal answer.
     - ``constraint`` set, value does NOT satisfy it → ``(False, error_text)``
-      where ``error_text`` is ``_format_constraint_error(constraint, cv)``,
       which the caller appends to the python tool result's stderr so the model
-      sees what to fix next round.
-
-    Any non-``ConstraintViolation`` exception from ``validate`` propagates.
+      sees what to fix next round. This covers BOTH a ``ConstraintViolation``
+      (formatted via ``_format_constraint_error``) AND any OTHER exception from
+      ``validate`` (a buggy/edge predicate, a wrong-typed value; formatted via
+      ``_format_unexpected_validate_error``). A validator error must never escape
+      the React loop and abort the whole task — it is surfaced for retry instead.
+      Only ``BaseException`` non-``Exception`` control-flow (KeyboardInterrupt,
+      SystemExit, the RETURN sentinel) is left to propagate.
     """
     if constraint is None:
         return True, raw_return_value
@@ -217,4 +343,6 @@ def _validate_return_against_constraint(
         validated = constraint.validate(raw_return_value)
     except ConstraintViolation as cv:
         return False, _format_constraint_error(constraint, cv)
+    except Exception as e:
+        return False, _format_unexpected_validate_error(constraint, e)
     return True, validated

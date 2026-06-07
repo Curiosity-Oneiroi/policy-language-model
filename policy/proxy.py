@@ -13,18 +13,28 @@ message (no `warnings` dedup, no clobberable filter, no `proxy.py:line` noise).
 
 Phase 2 extensions:
 
-* **Immutability seal**: `_rewrite` / `_rewrite_class_policy` / `_remove` /
-  `_class_remove` early-return with a `_policy_note(... immutable; duplicate
-  it ...)` when the name ∈ `_IMMUTABLE_POLICIES`. `_FunctionPolicy.__setattr__`
-  additionally blocks `_inner` and `_p_name` writes on immutable proxies —
-  tight scope keeps `functools.update_wrapper` and dill rehydration working.
+* **Immutability seal**: a DEFAULT policy carries an intrinsic `_p_immutable`
+  flag (set once by `registry._seal`). `_rewrite` / `_rewrite_class_policy` /
+  `_remove` / `_class_remove` early-return with a `_policy_note(... immutable;
+  duplicate it ...)` when that flag is True, and `_rewrite`/`_rewrite_class_policy`
+  also refuse a RENAME whose target name is already a policy or a kernel-internal
+  name (no clobbering a default via a rename collision). `_FunctionPolicy.__setattr__`
+  additionally freezes `_inner`, `_p_name`, and the `_p_immutable` flag itself on a
+  sealed proxy — tight scope keeps `functools.update_wrapper` and dill rehydration
+  working (the flag is the last `_p_*` slot, so it flips True only after the others
+  restore). The single registry (`registry._PolicyStore`) backstops all of this by
+  refusing to replace/remove a default-valued entry while sealed.
 
-* **Policy-call depth cap** (`POLICY_CALL_DEPTH_CAP = 1000`): a `ContextVar`
-  + `_policy_call(name)` context manager bound at EVERY `@policy` boundary
+* **Policy-call depth cap** (`POLICY_CALL_DEPTH_CAP`): a `ContextVar` +
+  `_policy_call(name)` context manager bound at EVERY `@policy` boundary
   (function via `_FunctionPolicy.__call__`, class via the wrap installed in
-  `_attach_class_policy_metadata`). Raises `RecursionError` at the cap — a
-  runaway-loop backstop well below CPython's default stack limit, distinct
-  from `_LLM_DEPTH` (which bounds LLM-agent recursion specifically).
+  `_attach_class_policy_metadata`). It increments ONCE per @policy call — so it
+  is a UNIFORM logical-depth bound (a function policy costs 2 native frames, a
+  class policy more, a plain fn 1; the counter ignores that and counts each call
+  as 1). The kernel raises `sys.setrecursionlimit` so Python's uneven native
+  frame limit doesn't pre-empt this counter, and the cap sits below CPython's
+  hard C-recursion guard so the clear message fires first. Distinct from
+  `_LLM_DEPTH` (which bounds sub-LLM-agent recursion specifically).
 
 * **`_duplicate`/`_class_duplicate`** thin wrappers calling
   `duplicate_policy(name, new_name)`.
@@ -37,6 +47,7 @@ import functools
 import inspect
 import linecache
 import sys
+import types
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -48,7 +59,6 @@ from .edits import (
     _strip_policy_decorator,
 )
 from .registry import (
-    _IMMUTABLE_POLICIES,
     _PLM_POLICIES,
     _main,
 )
@@ -63,9 +73,19 @@ def _policy_note(msg: str) -> None:
 
 # --- policy-call depth cap (Phase 2) -----------------------------------------
 
-POLICY_CALL_DEPTH_CAP: int = 1000              # generous for legitimate recursion;
-                                               # well below CPython's default
-                                               # sys.getrecursionlimit() (1000+).
+# UNIFORM recursion bound: counts each @policy boundary as 1 — a function policy
+# (proxy __call__ + body = 2 native frames) and a class policy alike — so the
+# limit is on LOGICAL @policy depth, not on Python's uneven native frame count.
+# The kernel raises sys.setrecursionlimit (see repl/prefix.py) so the native
+# frame limit no longer pre-empts this counter; the cap sits BELOW CPython's hard
+# C-recursion guard (which caps @policy dispatch at a few thousand regardless of
+# setrecursionlimit) so THIS deterministic, clearer message fires first. Distinct
+# from _LLM_DEPTH (which bounds sub-LLM-agent recursion specifically).
+# 3000 sits comfortably under CPython's hard C-recursion guard (~3331 @policy calls
+# when measured on 3.13; we target 3.12, where it is in the same ballpark). On any
+# version/platform whose C-guard is lower, the native RecursionError fires first
+# instead (still safe, just without the friendlier message).
+POLICY_CALL_DEPTH_CAP: int = 3000
 _POLICY_CALL_DEPTH: ContextVar[int] = ContextVar(
     "_POLICY_CALL_DEPTH", default=0
 )
@@ -74,11 +94,12 @@ _POLICY_CALL_DEPTH: ContextVar[int] = ContextVar(
 @contextmanager
 def _policy_call(name: str):
     """Increment `_POLICY_CALL_DEPTH` at every @policy boundary; raise
-    `RecursionError` at `POLICY_CALL_DEPTH_CAP`. Bounds PLM-authored code
-    recursion expressed through @policy calls (any chain whose cumulative
-    @policy-boundary crossings exceed 1000). Plain Python recursion inside
-    a single policy body is bounded by Python's own stack limit — this cap
-    is specifically the @policy-boundary count.
+    `RecursionError` at `POLICY_CALL_DEPTH_CAP`. This is a UNIFORM bound — each
+    @policy call counts as 1 (function or class policy alike), regardless of how
+    many native Python frames it actually spends — so PLM-authored recursion is
+    bounded by logical @policy depth, not by Python's uneven per-call frame cost.
+    Plain (non-@policy) Python recursion is bounded separately by the kernel's
+    sys.setrecursionlimit.
     """
     d = _POLICY_CALL_DEPTH.get()
     if d >= POLICY_CALL_DEPTH_CAP:
@@ -97,7 +118,7 @@ def _policy_call(name: str):
 
 class _FunctionPolicy:
     __slots__ = ("_inner", "_p_source", "_p_version", "_p_filename",
-                 "_p_name", "__dict__")     # __dict__ -> functools.update_wrapper
+                 "_p_name", "_p_immutable", "__dict__")     # __dict__ -> functools.update_wrapper
 
     def __init__(self, fn, source, filename):
         self._inner = fn
@@ -105,25 +126,25 @@ class _FunctionPolicy:
         self._p_version = 0
         self._p_filename = filename          # stable "<policy-{name}>" for linecache
         self._p_name = fn.__name__           # canonical name; survives rename
+        self._p_immutable = False            # a "default policy" iff True; set only by _seal()
         functools.update_wrapper(self, fn)
 
     def __setattr__(self, name, value):
-        # Tight seal: block only `_inner` (swap-the-body) and `_p_name`
-        # (rename-then-swap bypass) on immutable proxies. Other attrs
-        # (`_p_source`, `_p_version`, `_p_filename`, __dict__, update_wrapper
-        # writes) pass through — they affect introspection only, not the
-        # actual callable. The `getattr` default of None means writes during
-        # __init__ (where `_p_name` is set 5th, BEFORE update_wrapper) pass
-        # because the current `_p_name` is still unset. Dill rehydration
-        # similarly sees `_p_name` unset until its slot is restored (slots
-        # iterate in declaration order; `_p_name` lands near the end).
-        if name in ("_inner", "_p_name"):
-            current_name = getattr(self, "_p_name", None)
-            if current_name in _IMMUTABLE_POLICIES:
+        # Seal: once this proxy is a DEFAULT policy (`_p_immutable` True), freeze
+        # the body (`_inner`), the canonical name (`_p_name`), and the flag itself
+        # (no un-sealing) — so a default can't be hot-swapped, renamed, or
+        # un-sealed. Immutability is INTRINSIC to the object, not a name-set
+        # lookup. Writes during __init__ / dill-restore pass because
+        # `_p_immutable` is still False/unset then (it is the last `_p_*` slot, so
+        # `_inner`/`_p_name` restore before it flips True). Other attrs
+        # (`_p_source`/`_p_version`/`_p_filename`/__dict__/update_wrapper) are
+        # introspection-only and pass.
+        if getattr(self, "_p_immutable", False):
+            if name in ("_inner", "_p_name") or (name == "_p_immutable" and value is not True):
                 raise TypeError(
-                    f"{current_name!r} is immutable; cannot set {name!r}. "
-                    f"Use `duplicate_policy({current_name!r}, '<new_name>')` "
-                    f"to fork it (refused for un-duplicable LLM defaults)."
+                    f"{getattr(self, '_p_name', '?')!r} is an immutable default policy; "
+                    f"cannot set {name!r}. Use `duplicate_policy("
+                    f"{getattr(self, '_p_name', '?')!r}, '<new_name>')` to fork it."
                 )
         super().__setattr__(name, value)
 
@@ -159,11 +180,12 @@ class _FunctionPolicy:
             self._rewrite(ns)
 
     def _remove(self):
-        # Immutability check: refuse to remove an immutable policy. Other
+        # Immutability check: refuse to remove a default policy. Other
         # paths (`del <name>`, `globals().pop(<name>)`) are handled by
-        # Guard A (pre-reject) and Guard C (restore canonical) — this
-        # catches the explicit `proxy._remove()` call too.
-        if self._p_name in _IMMUTABLE_POLICIES:
+        # Guard A (pre-reject) and Guard C (restore canonical), and the registry
+        # store refuses to pop a default — this catches the explicit
+        # `proxy._remove()` call too.
+        if getattr(self, "_p_immutable", False):
             _policy_note(
                 f"{self._p_name!r} is immutable; cannot remove. "
                 f"It is part of the LLM-default base."
@@ -180,11 +202,11 @@ class _FunctionPolicy:
         return duplicate_policy(self._p_name, new_name)
 
     def _rewrite(self, new_source):
-        # Immutability gate: refuse to rewrite an LLM-default. This also covers
+        # Immutability gate: refuse to rewrite a DEFAULT policy. This also covers
         # `_edit`/`_insert`/`_delete_lines` (they funnel through `_rewrite`)
         # and `@policy` re-decoration of a default (the decorator's
         # same-kind path calls `_rewrite` on the existing proxy).
-        if self._p_name in _IMMUTABLE_POLICIES:
+        if getattr(self, "_p_immutable", False):
             _policy_note(
                 f"{self._p_name!r} is immutable; source unchanged. "
                 f"Use `duplicate_policy({self._p_name!r}, '<new_name>')` "
@@ -206,6 +228,20 @@ class _FunctionPolicy:
                          f"Nest helpers inside the function body; reference REPL globals.")
             return
         new_name = defs[0].name
+        # Rename-collision guard: a rename must not CLOBBER another policy or a
+        # kernel-internal name. Without this, `mutable._rewrite("def natural_llm():
+        # ...")` would take over the immutable default's slot (the gate above only
+        # checks THIS proxy's flag). Editing in place (new_name == old) is fine.
+        if new_name != self._p_name and (
+            new_name in _PLM_POLICIES or new_name in (_main().get("_REPL_INJECTED") or ())
+            or new_name in _main()                       # also: don't silently clobber a plain global
+        ):
+            _policy_note(
+                f"{self._p_name}._rewrite: refusing to rename to {new_name!r} — that name "
+                f"is already a policy, a kernel-internal name, or an existing variable. Edit "
+                f"in place (keep the def name) or rename to a fresh name."
+            )
+            return
         new_filename = f"<policy-{new_name}>"   # filename TRACKS the name -> no stale-slot collision
         cell_globals = _main()                  # re-exec'd fn closes over kernel __main__ (REPL globals)
         ns = {}
@@ -281,6 +317,8 @@ def _rebind_class_cells(v, cls):
 
 def _attach_class_policy_metadata(cls, source, filename):
     cls._p_source, cls._p_version, cls._p_filename = source, 0, filename
+    cls._p_immutable = False             # a "default policy" iff True; set only by _seal()
+                                         # (preserved across rewrites — _p_* keys skip the diff)
     # Attach the edit API as CLASSMETHODS so `Net._rewrite(src)` mirrors
     # `predict._rewrite(src)`. Attach the MODULE-LEVEL functions DIRECTLY (each
     # already takes cls first) — a named module function pickles BY REFERENCE, so
@@ -304,13 +342,22 @@ def _attach_class_policy_metadata(cls, source, filename):
     # (documented irreducible boundary; doesn't bypass the LLM-depth gate
     # because `_make_backend`/`descend`/`llm_call` are blessed-caller-gated
     # regardless of any class-policy wrap).
-    if "__call__" in cls.__dict__:
-        _orig_call = cls.__dict__["__call__"]
+    # Only wrap a PLAIN instance-method __call__ (types.FunctionType). A
+    # @staticmethod/@classmethod __call__ stored in cls.__dict__ is a descriptor
+    # object, not a function: calling it as `_orig_call(self, *a, **k)` would
+    # mis-forward `self` (staticmethod: "takes 0 positional args but 1 given") or
+    # fail outright (classmethod object isn't callable). Such a __call__ ignores
+    # instance state and is degenerate, so skip the depth-wrap — it's safe: the
+    # LLM-depth gate is enforced independently by the blessed-caller checks in
+    # _llm_infra, not by this advisory class-call cap. (#R5-6)
+    _orig_call = cls.__dict__.get("__call__")
+    if isinstance(_orig_call, types.FunctionType):
         @functools.wraps(_orig_call)
         def _wrapped_call(self, *a, **k):
             with _policy_call(type(self).__name__):
                 return _orig_call(self, *a, **k)
-        cls.__call__ = _wrapped_call
+        _wrapped_call._plm_depth_wrapped = True       # OUR marker; the re-wrap path keys on
+        cls.__call__ = _wrapped_call                  # this (NOT __wrapped__) to detect double-wrap
 
 
 def _class_edit(cls, old, new, *, replace_all=False):
@@ -335,7 +382,7 @@ def _class_remove(cls):
     # Immutability check: refuse to remove an immutable class policy. v1 has
     # no immutable class default, but v1.5 may; keep the gate here so adding
     # one later doesn't require touching this method.
-    if cls.__name__ in _IMMUTABLE_POLICIES:
+    if getattr(cls, "_p_immutable", False):
         _policy_note(
             f"{cls.__name__!r} is immutable; cannot remove. "
             f"It is part of the LLM-default base."
@@ -354,8 +401,8 @@ def _class_duplicate(cls, new_name):
 
 
 def _rewrite_class_policy(cls, new_source):
-    # Immutability gate: refuse to rewrite an immutable class policy.
-    if cls.__name__ in _IMMUTABLE_POLICIES:
+    # Immutability gate: refuse to rewrite a DEFAULT class policy.
+    if getattr(cls, "_p_immutable", False):
         _policy_note(
             f"{cls.__name__!r} is immutable; source unchanged. "
             f"Use `duplicate_policy({cls.__name__!r}, '<new_name>')` "
@@ -374,6 +421,19 @@ def _rewrite_class_policy(cls, new_source):
                      f"Nest helpers/attrs inside the class body; reference REPL globals.")
         return
     new_name = tree.body[0].name
+    # Rename-collision guard (mirrors _FunctionPolicy._rewrite): a rename must not
+    # clobber another policy or a kernel-internal name. Edit in place (new_name ==
+    # old) is fine.
+    if new_name != cls.__name__ and (
+        new_name in _PLM_POLICIES or new_name in (_main().get("_REPL_INJECTED") or ())
+        or new_name in _main()                           # also: don't silently clobber a plain global
+    ):
+        _policy_note(
+            f"{cls.__name__}._rewrite: refusing to rename to {new_name!r} — that name "
+            f"is already a policy, a kernel-internal name, or an existing variable. Edit "
+            f"in place or rename to a fresh name."
+        )
+        return
     new_filename = f"<policy-{new_name}>"      # filename tracks name; methods compiled
     ns = {}                                    # under it get the matching co_filename
     try:
@@ -437,15 +497,27 @@ def _rewrite_class_policy(cls, new_source):
     _PLM_POLICIES[new_name] = cls
 
     # If the rewrite re-introduced a fresh `__call__` (user content changed),
-    # re-wrap it with `_policy_call` so the depth cap continues to fire.
-    if "__call__" in cls.__dict__:
-        _inner_call = cls.__dict__["__call__"]
-        if getattr(_inner_call, "__wrapped__", None) is None:
-            @functools.wraps(_inner_call)
-            def _wrapped_call(self, *a, **k):
-                with _policy_call(type(self).__name__):
-                    return _inner_call(self, *a, **k)
-            cls.__call__ = _wrapped_call
+    # re-wrap it with `_policy_call` so the depth cap continues to fire. Gate on
+    # OUR OWN private marker, NOT the generic `__wrapped__`: an LLM-authored
+    # `__call__` decorated with `@functools.wraps`/`@lru_cache`/etc. carries
+    # `__wrapped__` too, so the old `__wrapped__ is None` check skipped wrapping
+    # it — leaving that class policy's `__call__` UNCAPPED (#12). `_plm_depth_wrapped`
+    # is set only by us, so it distinguishes "already wrapped by us" from "user
+    # used a wraps-style decorator".
+    _inner_call = cls.__dict__.get("__call__")
+    # Same guard as the install path: only re-wrap a plain instance-method
+    # __call__, never a staticmethod/classmethod descriptor (#R5-6). The
+    # isinstance check short-circuits before the _plm_depth_wrapped lookup, so a
+    # descriptor is skipped cleanly.
+    if isinstance(_inner_call, types.FunctionType) and not getattr(
+        _inner_call, "_plm_depth_wrapped", False
+    ):
+        @functools.wraps(_inner_call)
+        def _wrapped_call(self, *a, **k):
+            with _policy_call(type(self).__name__):
+                return _inner_call(self, *a, **k)
+        _wrapped_call._plm_depth_wrapped = True
+        cls.__call__ = _wrapped_call
 
 
 def _remove_and_recreate(old_cls, new_cls, new_source):

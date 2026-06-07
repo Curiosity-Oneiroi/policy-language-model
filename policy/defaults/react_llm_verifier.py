@@ -1,25 +1,43 @@
 @policy
-def react_llm(messages, *, args=(), kwargs=None, objects=None,
-              constraint=None, max_turns=8, return_budget=5, depth=None,
-              generate_kwargs=None):
-    """ReAct sub-agent: model + python tool, looped in the SAME REPL.
+def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
+                       constraint=None, max_turns=8, return_budget=5, depth=None,
+                       generate_kwargs=None, verifier=None):
+    """ReAct sub-agent (model + python tool, same REPL) + a per-round VERIFIER
+    hook — the trajectory control axis.
 
-    Terminates ONLY when the model calls `RETURN(value)` inside its
-    python tool. Text-only assistant turns just append-and-continue.
-    The sub-LLM's ambient capabilities are intentionally minimal —
-    `__builtins__` and `RETURN`. Everything else (sub-LLM calls, policy
-    creation, access to other policies, user globals) is a DELIBERATE
-    grant from PLM via `args` / `kwargs` / `objects`.
+    Identical to `react_llm` except for an optional `verifier` callable. After
+    every NON-terminal round (text-only or tool), once that round's messages
+    are complete, the verifier is called with the LIVE `msgs` list and mutates
+    it in place; the (possibly edited) trajectory then drives the next
+    `backend.generate`. A successful `RETURN(value)` short-circuits and the
+    verifier does NOT run on the terminal round. `verifier=None` ⇒ this policy
+    behaves exactly like `react_llm`.
+
+    Terminates ONLY when the model calls `RETURN(value)` inside its python
+    tool. Text-only assistant turns just append-and-continue (and still trigger
+    the verifier). The sub-LLM's ambient capabilities are intentionally minimal
+    — `__builtins__` and `RETURN`. Everything else (sub-LLM calls, policy
+    creation, access to other policies, user globals) is a DELIBERATE grant
+    from PLM via `args` / `kwargs` / `objects`.
 
     Quick examples:
 
         # Simple — model writes code, calls RETURN:
-        answer = react_llm("Compute 7! using python")
+        answer = react_llm_verifier("Compute 7! using python")
         # -> 5040  (whatever the model passed to RETURN)
+
+        # Attach a per-round verifier (the trajectory control axis). The
+        # verifier sees the live messages after each non-terminal round and
+        # mutates them in place. PREFER a verifier POLICY (forkable/editable):
+        react_llm_verifier("solve X step by step", verifier=base_verifier)
+        # or fork + specialize it:
+        #   duplicate_policy("base_verifier", "my_verifier")
+        #   my_verifier._edit(...)            # tailor the prompts / gate / checks
+        #   react_llm_verifier("solve X", verifier=my_verifier)
 
         # Pass named data; the model uses each kwarg key as a DIRECT
         # local name (no `kwargs["a"]` subscripting needed):
-        result = react_llm(
+        result = react_llm_verifier(
             "Add the two numbers and RETURN the sum",
             kwargs={"a": 3, "b": 5},
         )
@@ -27,7 +45,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
 
         # Grant policy-authoring (the @policy decorator) by name:
         from plm.policy import policy
-        result = react_llm(
+        result = react_llm_verifier(
             "Author a doubler policy named `doubler` and use it on input.",
             kwargs={"policy": policy, "input": 7},
         )
@@ -37,7 +55,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         #   RETURN(doubler(input))   -> 14
 
         # Grant nested-LLM access:
-        result = react_llm(
+        result = react_llm_verifier(
             "Decompose into a sub-question and call natural_llm on it.",
             kwargs={"natural_llm": natural_llm},
         )
@@ -48,11 +66,11 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         # the tool result and the loop continues):
         class Answer(Constraint):
             value: int
-        result = react_llm("Compute fact(7)", constraint=Answer)
+        result = react_llm_verifier("Compute fact(7)", constraint=Answer)
         # Model writes: `RETURN({"value": 5040})` -> Answer(value=5040)
 
         # Voluntarily lower the depth budget for this sub-task:
-        react_llm(msg, depth=1)
+        react_llm_verifier(msg, depth=1)
 
     Parameters:
 
@@ -111,6 +129,22 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             top_p, response_format, ...) forwarded to each
             `backend.generate(...)`.
 
+        verifier=None: optional callable `verifier(messages) -> None`,
+            invoked after EACH non-terminal round with the LIVE `msgs`
+            list. It MUTATES `msgs` in place (inject a correction / doubt,
+            edit a turn, ...); its return value is IGNORED. A successful
+            RETURN short-circuits first, so the verifier never runs on the
+            terminal round. `None` ⇒ behaves exactly like `react_llm`.
+            PREFER a verifier POLICY (e.g. `base_verifier` or a duplicate)
+            over a bare function — a policy is source-editable via the M
+            layer, forkable with `duplicate_policy`, and reusable. Whether
+            the verifier GATES itself (a should_run check) or verifies every
+            round is the verifier's OWN choice; gating is a good pattern (see
+            `base_verifier`) but optional. The verifier runs in trusted
+            policy scope (NOT the sub-LLM's restricted exec), wrapped in its
+            own `descend()` so the depth guard caps any circuit it spawns at
+            depth-1 (root=2). Exceptions propagate (fail-loud).
+
     Returns:
 
         Whatever the model passed to `RETURN(value)`, validated by
@@ -131,6 +165,21 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         - LLMDepthExceeded: the depth budget is at 0 before a generate.
         - UserWarning (emitted, not raised): kwargs has identifier-invalid
           or Python-keyword keys.
+        - Anything the `verifier` raises propagates out (fail-loud; the
+          verifier is trusted PLM code).
+
+    The verifier hook (trajectory control axis):
+
+        `react_llm` exposes the input (messages) and output (constraint)
+        axes; `react_llm_verifier` adds the TRAJECTORY axis. After each
+        non-terminal round the verifier reads/edits the running `msgs`, and
+        the (possibly changed) trajectory drives the next generate. This is
+        how PLM steers a sub-agent mid-run: inject doubt, force an
+        independent re-derivation, prune a branch. The verifier call is
+        wrapped in `descend()`, so the existing depth guard accounts it one
+        level below this policy — any react_llm/natural_llm circuit it builds
+        is capped at depth-1 (root=2) and respects the global budget. See
+        `base_verifier` for the reference template.
 
     What is ambient inside the sub-LLM's exec scope?
 
@@ -154,6 +203,8 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
           dict (globals == locals, like PLM's kernel `__main__`) preseeded
           with args/kwargs/objects + each kwarg key as a direct name, and
           isolated from kernel main.
+        - After each NON-terminal round (text-only or tool), the verifier
+          (if any) runs inside its own `with descend():` on the live `msgs`.
         - Containment: `tmp = 5` lands in `ns` (contained). `@policy def
           helper(): ...` (when policy is granted via kwargs) goes
           through the decorator's normal path; the decorator re-execs
@@ -204,13 +255,13 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     for _k in kwargs:
         if not isinstance(_k, str):
             raise TypeError(
-                f"react_llm: kwargs keys must be strings, got "
+                f"react_llm_verifier: kwargs keys must be strings, got "
                 f"{type(_k).__name__} ({_k!r})."
             )
     _bad_reserved = _RESERVED_KWARG_NAMES & set(kwargs)
     if _bad_reserved:
         raise ValueError(
-            f"react_llm: kwargs keys {sorted(_bad_reserved)} are reserved — "
+            f"react_llm_verifier: kwargs keys {sorted(_bad_reserved)} are reserved — "
             f"they would shadow the ambient termination primitive (`RETURN`) "
             f"or `__builtins__` in the model's exec scope. Rename them."
         )
@@ -220,7 +271,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     ]
     if _bad_idents:
         warnings.warn(
-            f"react_llm: kwargs keys {sorted(_bad_idents)} are not valid "
+            f"react_llm_verifier: kwargs keys {sorted(_bad_idents)} are not valid "
             f"Python identifiers (or are Python keywords); they will only "
             f"be reachable via `kwargs[<key>]`, not as direct local names.",
             UserWarning,
@@ -316,9 +367,9 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     # `parallel`, `natural_llm`, `react_llm`, or the root agent's variables. Its
     # world is only its own repl. Every other capability must be a DELIBERATE
     # grant from PLM via the args/kwargs/objects channels, e.g.:
-    #     react_llm(msg, kwargs={"policy": policy})            # grant policy-authoring
-    #     react_llm(msg, kwargs={"natural_llm": natural_llm})  # grant a sub-LLM
-    #     react_llm(msg, kwargs={"call": some_user_policy})    # grant a specific tool
+    #     react_llm_verifier(msg, kwargs={"policy": policy})            # grant policy-authoring
+    #     react_llm_verifier(msg, kwargs={"natural_llm": natural_llm})  # grant a sub-LLM
+    #     react_llm_verifier(msg, kwargs={"call": some_user_policy})    # grant a specific tool
     # so the sub-LLM's capability surface is entirely engineered by PLM.
     #
     # Seeding order: builtins + RETURN (base), then kwargs splat as direct names,
@@ -358,63 +409,77 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
                          # storing extra calls leaves their ids unanswered.
                          "tool_calls": (tool_calls[:1] or None)})
 
-            if not tool_calls:
-                # Text-only turn: append assistant message above and continue.
-                # react_llm only terminates on RETURN(value) inside the python
-                # tool. The model sees its own text-turn in history next round.
-                continue
+            if tool_calls:
+                # --- model emitted a tool call: verify it's `python`, then parse/exec/RETURN ---
+                tc = tool_calls[0]
+                tname = tc.get("function", {}).get("name")
+                if tname != "python":
+                    # react_llm_verifier only offers the python tool. A backend that calls
+                    # anything else gets a clear error back (its id IS answered, so history
+                    # stays well-formed) — but DON'T `continue`: this is a non-terminal
+                    # round, so it must fall through to the verifier hook below. Mirrors the
+                    # root loop's guard (plm.py) rather than silently exec'ing "".
+                    msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                 "content": f"error: tool {tname!r} not supported (only `python`)"})
+                else:
+                    args_raw = tc.get("function", {}).get("arguments") or "{}"
+                    try:
+                        targs = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                        if not isinstance(targs, dict):
+                            targs = {}
+                    except Exception:
+                        # Any parse failure -> {} (not just JSONDecodeError): a huge
+                        # integer literal raises ValueError (int_max_str_digits) and
+                        # deeply-nested JSON raises RecursionError, neither a
+                        # JSONDecodeError (#H13/#H14).
+                        targs = {}
+                    code = targs.get("code", "")
 
-            # --- model emitted a tool call: verify it's `python`, parse, exec, handle RETURN ---
-            tc = tool_calls[0]
-            tname = tc.get("function", {}).get("name")
-            if tname != "python":
-                # react_llm only offers the python tool. A backend that calls
-                # anything else gets a clear error back (its id IS answered, so
-                # history stays well-formed) and another round — mirroring the
-                # root loop's guard (plm.py) rather than silently exec'ing "".
-                msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
-                             "content": f"error: tool {tname!r} not supported (only `python`)"})
-                continue
-            args_raw = tc.get("function", {}).get("arguments") or "{}"
-            try:
-                targs = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                if not isinstance(targs, dict):
-                    targs = {}
-            except Exception:
-                # Any parse failure -> {} (not just JSONDecodeError): a huge integer
-                # literal raises ValueError (int_max_str_digits) and deeply-nested
-                # JSON raises RecursionError, neither a JSONDecodeError (#H13/#H14).
-                targs = {}
-            code = targs.get("code", "")
+                    out, term, val = "(no output)", None, None  # defensive init
+                    # `_exec` (= exec_ns) CAPTURES the cell's stdout AND any error together
+                    # and returns them in `out`: a print-then-error cell surfaces BOTH (stdout
+                    # THEN traceback), never just the error, and exec_ns NEVER raises for the
+                    # cell's own code. So this try/except is an ORCHESTRATION safety net
+                    # (fence-strip / `descend` / the `_exec` call), NOT for cell errors —
+                    # cell stdout is never lost.
+                    try:
+                        code = _strip_code_fences(code)
+                        with descend():                     # decrement for the act phase ONLY
+                            out, term, val = _exec(code, ns, _round)
+                    except SyntaxError as e:
+                        out = f"stderr:\n{e}"
+                    except Exception as e:                  # any other failure -> stderr back to the model
+                        out = f"stderr:\n{type(e).__name__}: {e}"
 
-            out, term, val = "(no output)", None, None  # defensive init
-            # `_exec` (= exec_ns) CAPTURES the cell's stdout AND any error together and
-            # returns them in `out`: a print-then-error cell surfaces BOTH (stdout THEN
-            # traceback), never just the error, and exec_ns NEVER raises for the cell's
-            # own code. So this try/except is an ORCHESTRATION safety net (fence-strip /
-            # `descend` / the `_exec` call), NOT for cell errors — cell stdout is never lost.
-            try:
-                code = _strip_code_fences(code)
-                with descend():                         # decrement for the act phase ONLY
-                    out, term, val = _exec(code, ns, _round)
-            except SyntaxError as e:
-                out = f"stderr:\n{e}"
-            except Exception as e:                      # any other failure -> stderr back to the model
-                out = f"stderr:\n{type(e).__name__}: {e}"
+                    msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": out})
+                    if term == "return":                    # RETURN(value) succeeded (constraint passed
+                        return val                          # or there was no constraint) — done; NO verifier.
+            # else: text-only turn — the assistant message is already appended; the
+            # model sees its own text-turn next round. Either way this round did NOT
+            # terminate, so the verifier runs below.
 
-            msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": out})
-            if term == "return":                        # RETURN(value) succeeded (constraint passed
-                return val                              # or there was no constraint) — done.
+            # --- per-round VERIFIER hook (the trajectory control axis) ---
+            # Runs after EVERY non-terminal round (text-only or tool), once this
+            # round's messages are complete, BEFORE the next generate. A successful
+            # RETURN above already returned, so the verifier never runs on the
+            # terminal round. Wrapped in `descend()` so the depth guard accounts the
+            # verifier ONE level below react_llm_verifier — any react_llm/natural_llm
+            # circuit it builds is then capped at depth-1 (root=2) and respects the
+            # global budget. The verifier mutates `msgs` in place; its return value
+            # is ignored. Exceptions propagate (fail-loud; the verifier is trusted).
+            if verifier is not None:
+                with descend():
+                    verifier(msgs)
 
         # --- budget exhausted: model never produced an accepted RETURN(value) ---
         if constraint is None:
             raise RuntimeError(
-                "react_llm: budget exhausted; model never called RETURN(value). "
-                "react_llm terminates only on RETURN(value); text-only assistant "
+                "react_llm_verifier: budget exhausted; model never called RETURN(value). "
+                "react_llm_verifier terminates only on RETURN(value); text-only assistant "
                 "turns are not finalizations.")
         
         raise ConstraintViolation(
-            "react_llm: budget exhausted; model never produced a RETURN(value) "
+            "react_llm_verifier: budget exhausted; model never produced a RETURN(value) "
             "that satisfied the constraint. Each rejected attempt's violation "
             "was returned to the model via the tool result; see the conversation "
             "history for details.")
