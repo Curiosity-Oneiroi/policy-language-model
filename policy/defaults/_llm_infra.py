@@ -79,7 +79,10 @@ def _root_depth() -> int:
     """Read the kernel-subprocess root depth from `AGENT_DEPTH` (set by parent
     PLM at session start). Fail-closed: any parse failure or missing var means
     root=0, which makes every LLM call refuse — a misconfigured kernel cannot
-    silently grant a budget."""
+    silently grant a budget. In the KERNEL this is read ONCE at boot to seed
+    `_LLM_DEPTH` (PREFIX), so a cell can't poison the ceiling by reassigning the
+    env var; the live read here remains the fallback for unseeded
+    (e.g. in-process test) contexts where `_LLM_DEPTH` is None."""
     try:
         return int(os.environ.get("AGENT_DEPTH", "0"))
     except Exception:
@@ -180,7 +183,8 @@ async def _aclose_backend(be):
     # on access (so if .generate raised before first use, getattr would build a
     # throwaway client just to close it). Eager backends store it under "client";
     # OpenAIBackend's lazy holder is "_client" (None until first use).
-    c = be.__dict__.get("client") or be.__dict__.get("_client")
+    _d = getattr(be, "__dict__", None) or {}      # __slots__ backend has no __dict__:
+    c = _d.get("client") or _d.get("_client")     # treat as "no cached client", don't AttributeError
     if c is None:
         return
     closer = getattr(c, "aclose", None) or getattr(c, "close", None)

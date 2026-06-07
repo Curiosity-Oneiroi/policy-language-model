@@ -618,13 +618,17 @@ def test_int_liveness(repl):
 def test_int_injected_helpers_protected(repl):
     """Kernel-injected NON-policy helpers (exec_ns, parallel, policy ops) are restored
     if a cell rebinds OR deletes them — granted helpers can't be clobbered for the next
-    cell, the same protection immutable policies get. (`plm_messages`, a reseeded list,
-    is deliberately NOT in the protected set, so live trajectory state is untouched.)"""
-    r0 = repl.execute_cell("exec_ns = 5\ndel parallel\nplm_messages.append('keep-me')")
+    cell, the same protection immutable policies get. (`plm_messages` is NOT in the
+    protected callable set; it is instead reseeded from the trajectory accumulator each
+    cell — see test_int_plm_messages_seed_channel.)"""
+    r0 = repl.execute_cell("exec_ns = 5\ndel parallel")    # clobber + delete callable helpers
     assert "reverted" in r0["stderr"], r0                  # the guard noted the revert
-    r = repl.execute_cell(
-        "print(callable(exec_ns), callable(parallel), 'keep-me' in plm_messages)")
-    assert r["stdout"].strip() == "True True True", r      # helpers restored; list NOT wiped
+    r = repl.execute_cell("print(callable(exec_ns), callable(parallel))")
+    assert r["stdout"].strip() == "True True", r           # both restored next cell
+    # K-F7: a cell mutating `plm_messages` does NOT persist (reseeded from the accumulator)
+    repl.execute_cell("plm_messages.append('stray')")
+    r2 = repl.execute_cell("print('stray' in plm_messages)")
+    assert r2["stdout"].strip() == "False", r2
 
 
 def test_int_constraint_surface_ambient_with_pydantic():
@@ -649,6 +653,57 @@ def test_int_constraint_surface_ambient_with_pydantic():
             "print('AMBIENT_OK' if ok else 'AMBIENT_FAIL')"
         )
         assert r["stdout"].strip() == "AMBIENT_OK", r
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_constraints_survive():
+    """D5 fix — CALL-built constraints survive a hard respawn. A Constraint.field(...)
+    and a composite (A & B) are rebuilt from their snapshot RECIPES; a structural
+    subclass survives by value. All three validate (accept + reject) correctly after the
+    crash. Needs a pydantic kernel (the constraint surface)."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=15.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        # Constraint is AMBIENT in cells. A field + composite (recipes) AND a STRUCTURAL
+        # class with a default, a Field bound, and a validator (reconstructed from fields).
+        s.execute_cell(
+            "from pydantic import Field, model_validator\n"
+            "field_c = Constraint.field(instance_of=int, predicate=lambda x: x > 100)\n"
+            "comp_c = Constraint.field(instance_of=int) & "
+            "Constraint.field(instance_of=int, predicate=lambda x: x > 0)\n"
+            "class StructC(Constraint):\n"
+            "    name: str = 'anon'\n"
+            "    n: int = Field(ge=0)\n"
+            "    @model_validator(mode='after')\n"
+            "    def _chk(self):\n"
+            "        if self.name == 'BAD':\n"
+            "            raise ValueError('bad')\n"
+            "        return self\n")
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")  # hard crash -> respawn + rehydrate
+        assert s.kernel_epoch > ep, "expected a respawn"
+        # all three survived and validate the GOOD values (StructC keeps its 'anon' default)
+        r = s.execute_cell(
+            "print(field_c.validate(200), comp_c.validate(5), StructC.validate({'n': 3}).name)")
+        assert r["stdout"].strip() == "200 5 anon", r
+        # ... and all REJECT bad ones — predicates, operators, the Field bound, AND the validator
+        r2 = s.execute_cell(
+            "def _rej(c, v):\n"
+            "    try:\n"
+            "        c.validate(v); return False\n"
+            "    except Exception:\n"
+            "        return True\n"
+            "print(_rej(field_c, 5), _rej(comp_c, -1), "
+            "_rej(StructC, {'n': -1}), _rej(StructC, {'name': 'BAD', 'n': 0}))")
+        assert r2["stdout"].strip() == "True True True True", r2
     finally:
         s.close()
 
@@ -1144,6 +1199,52 @@ def test_int_extra_policy_failure_soft_and_surfaced():
         r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
         assert "booted True" in r["stdout"], r          # defaults present; broken extra didn't brick boot
         assert "boot: extra-policy install warning" in r["stderr"], r   # surfaced once (#26)
+    finally:
+        s.close()
+
+
+def test_d3_extra_colliding_with_sealed_default_rejected():
+    """D3: an extra policy named like a SEALED default (react_llm/...) is REJECTED at
+    boot — it can't re-decorate the default BEFORE the seal loop and get sealed as
+    operator code. The collision is surfaced and the canonical default body is kept."""
+    import json
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    bad = {"react_llm": "@policy\ndef react_llm(*a, **k):\n    return 'HIJACKED'\n"}
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
+                              env={"_PLM_EXTRA_POLICIES": json.dumps(bad)})
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r = s.execute_cell("print('HIJACK' in read_policy('react_llm'))")
+        assert r["stdout"].strip() == "False", r        # the extra's body did NOT replace the default
+        assert "collides with a sealed default" in r["stderr"], r   # rejection surfaced
+    finally:
+        s.close()
+
+
+def test_sec3_agent_depth_env_poison_ignored():
+    """WF Sec#3: the root depth is seeded ONCE at boot, so a cell reassigning
+    os.environ['AGENT_DEPTH'] mid-session can't raise the depth ceiling."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
+                              env={"AGENT_DEPTH": "2"})
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r = s.execute_cell(
+            "import os\n"
+            "from plm.policy.defaults import _llm_infra\n"
+            "os.environ['AGENT_DEPTH'] = '999'\n"        # try to poison the ceiling
+            "print(_llm_infra._remaining())")
+        assert r["stdout"].strip() == "2", r            # still the boot value, NOT 999
     finally:
         s.close()
 

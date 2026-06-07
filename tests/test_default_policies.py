@@ -261,7 +261,7 @@ def test_4_make_backend_raises_without_spec(monkeypatch):
         blessed_caller()
 
 
-def test_5_descend_increments_and_restores():
+def test_5_descend_decrements_and_restores():
     """descend() decrements _LLM_DEPTH for its dynamic extent, restores
     symmetrically on normal exit AND on exception."""
     def blessed():
@@ -643,6 +643,62 @@ def test_11_react_llm_python_call_executes(defaults_installed, stub_backend):
     msgs = stub_backend.calls[-1]["messages"]
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
     assert any("hello world" in (m.get("content") or "") for m in tool_msgs)
+
+
+def test_react_llm_malformed_shapes_dont_crash(defaults_installed, stub_backend):
+    """Batch 4: malformed backend responses / tool_calls are handled defensively —
+    react_llm answers with a clear error and takes another round instead of crashing
+    (R-F1..R-F5), then RETURNs normally."""
+    import json
+    rl = _PLM_POLICIES["react_llm"]
+
+    # R-F4 (non-dict resp) then R-F3 (tool_calls returned as a bare dict, not a list).
+    stub_backend.script = [
+        "not a dict",
+        {"content": "", "tool_calls": {"id": "x", "type": "function",
+            "function": {"name": "python",
+                         "arguments": json.dumps({"code": "RETURN('via-dict-tc')"})}}},
+    ]
+    assert rl("go") == "via-dict-tc"
+
+    # R-F1 (tc is a string) / R-F2 (function is None) / R-F5 (code is non-string),
+    # each survived with a clear error + retry, then a clean RETURN.
+    stub_backend.script = [
+        {"content": "", "tool_calls": ["not-a-dict"]},
+        {"content": "", "tool_calls": [{"id": "a", "function": None}]},
+        {"content": "", "tool_calls": [{"id": "b", "function":
+            {"name": "python", "arguments": json.dumps({"code": 42})}}]},
+        make_python_call("RETURN('ok')"),
+    ]
+    assert rl("go2") == "ok"
+
+
+def test_react_deepcopy_caller_messages_not_mutated(defaults_installed, stub_backend):
+    """Batch 4 (R-F6): a verifier mutating `msgs` in place does NOT corrupt the
+    caller's own message dicts — _norm deep-copies the input."""
+    stub_backend.script = [make_text("thinking"), make_python_call("RETURN('done')")]
+    caller_msgs = [{"role": "user", "content": "original"}]
+
+    def _mutator(msgs):
+        for m in msgs:
+            if m.get("content") == "original":
+                m["content"] = "HIJACKED"
+
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    assert rlv(caller_msgs, verifier=_mutator) == "done"
+    assert caller_msgs[0]["content"] == "original"     # caller's dict untouched
+
+
+def test_react_llm_verifier_depth1_with_verifier_hard_errors(defaults_installed, stub_backend):
+    """Batch 6 (D2): a verifier needs depth >= 2 (it runs one level below + composes
+    depth-1 circuits). react_llm_verifier(..., verifier=..., depth=1) raises a clear
+    LLMDepthExceeded UP FRONT (no backend call) instead of crashing mid-loop. Without a
+    verifier, depth=1 is fine."""
+    rlv = _PLM_POLICIES["react_llm_verifier"]
+    stub_backend.script = [make_python_call("RETURN('x')")]
+    with pytest.raises(_llm_infra.LLMDepthExceeded):
+        rlv("go", verifier=lambda m: None, depth=1)        # raised before any generate()
+    assert rlv("go", depth=1) == "x"                       # no verifier -> depth-1 is valid; script intact
 
 
 def test_12_react_llm_ns_contained(defaults_installed, stub_backend):
@@ -1384,6 +1440,48 @@ def test_37_parallel_propagates_contextvars(defaults_installed):
     assert results == [1, 1]
 
 
+def test_parallel_collect_all_and_guards():
+    """parallel() is COLLECT-ALL + ISOLATED: a failing task's EXCEPTION lands in its
+    result slot (parallel() itself never raises for a task error) and the OTHER tasks
+    still run to completion, in input order. Plus: no ~300s artificial hang (K-F4
+    structural fix — it waits only for the actual slowest task); survives
+    max_workers=inf (Corr#5); refuses to run inside a running loop with a clear error
+    and no leaked coroutine (K-F3)."""
+    import asyncio
+    import time
+    from plm.repl.parallel import parallel
+
+    def _boom():
+        raise ValueError("boom")
+
+    # Collect-all: the error is RETURNED in its slot; the siblings ran and produced values.
+    results = parallel(_boom, lambda: 42, lambda: None)
+    assert isinstance(results[0], ValueError) and str(results[0]) == "boom"
+    assert results[1] == 42                       # a sibling ordered AFTER the error still ran
+    assert results[2] is None                     # a task that returns nothing -> None slot
+
+    # Isolation + no artificial hang: an error and a (briefly) slow task are BOTH collected,
+    # and parallel returns shortly after the slow one — nowhere near the old 300s join.
+    def _slow():
+        time.sleep(0.3)
+        return "slow"
+
+    t0 = time.monotonic()
+    r = parallel(_boom, _slow)
+    assert time.monotonic() - t0 < 30.0, "parallel() hung well past the slowest task"
+    assert isinstance(r[0], ValueError) and r[1] == "slow"
+
+    # Corr#5: inf / overflow max_workers falls back to default (no OverflowError).
+    assert parallel(lambda: 7, max_workers=float("inf")) == [7]
+
+    # K-F3: from inside a running loop -> clear RuntimeError, no un-awaited coroutine.
+    async def _inside():
+        parallel(lambda: 1)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_inside())
+
+
 # ===================== Section: react_llm_verifier =========================
 # The trajectory control axis: react_llm + an optional `verifier` callable run
 # after each NON-terminal round (wrapped in descend()), mutating msgs in place.
@@ -1573,6 +1671,21 @@ def test_base_verifier_propose_approve_applies_edit_on_true(defaults_installed, 
     assert any("EDITED" in (m.get("content") or "") for m in msgs)      # approved code ran
 
 
+def test_base_verifier_gate_marks_once_and_check_failure_isolated(defaults_installed, stub_backend):
+    """Batch 5: a check that RAISES (here: react_llm budget exhausted, no script) does NOT
+    abort the agent (D-A6), and the gate records a verifier marker UNCONDITIONALLY so it
+    won't re-fire on the same stale error next round (Corr#2)."""
+    bv = _PLM_POLICIES["base_verifier"]
+    stub_backend.script = []           # circuits get only empty turns -> exhaust budget -> raise
+    msgs = [{"role": "user", "content": "do x"},
+            {"role": "tool", "tool_call_id": "t", "content": "stderr:\nboom"}]
+    bv(msgs)                           # D-A6: the RuntimeError out of _verify is swallowed (no raise)
+    assert msgs[-1].get("role") == "verifier"      # Corr#2: round marked even though no check produced output
+    n = len(msgs)
+    bv(msgs)                           # Corr#2: gate now sees the marker first -> no-op
+    assert len(msgs) == n
+
+
 def test_base_verifier_propose_approve_skips_edit_on_false(defaults_installed, stub_backend):
     """Same proposal, but react_llm #2 RETURNs False → the verifier does NOT exec the
     code; the trajectory is unchanged by the edit."""
@@ -1614,6 +1727,56 @@ def test_exec_ns_core_runner():
     assert exec_ns("raise _REPLReturn(7)", ns, on_return=lambda v: (None, v * 2))[1:] == (None, 14)
 
 
+def test_d1_sealed_namespace_blocks_kernel_reach_but_RETURN_identical():
+    """D1: the sealed sub-LLM ns closes the one-liner escapes (Hole A: no `__import__`
+    in builtins; Hole B: `RETURN.__globals__` is minimal, not kernel __main__) WHILE
+    `RETURN(value)` terminates IDENTICALLY (raises `_REPLReturn(value)`, matched by name)."""
+    from plm.repl.exec_ns import exec_ns, safe_builtins, make_sealed_return, _REPLReturn
+
+    sb = safe_builtins()
+    # Hole A: the door-openers are gone; ordinary builtins (and class machinery) remain.
+    for n in ("__import__", "eval", "exec", "compile", "open"):
+        assert n not in sb, f"{n} must be curated out of the sealed builtins"
+    for n in ("print", "len", "range", "dict", "list", "__build_class__"):
+        assert n in sb, f"{n} must still be available"
+
+    RET = make_sealed_return(sb)
+    # RETURN behaves IDENTICALLY: raises _REPLReturn(value), matched by name, .value set.
+    with pytest.raises(_REPLReturn) as ei:
+        RET(42)
+    assert ei.value.value == 42 and type(ei.value).__name__ == "_REPLReturn"
+
+    # Hole B: RETURN.__globals__ does NOT leak the kernel __main__ / policies / gate.
+    g = RET.__globals__
+    assert "_PLM_POLICIES" not in g and "natural_llm" not in g and "_LLM_DEPTH" not in g
+    assert "__import__" not in g["__builtins__"]
+
+    # exec_ns terminates on the sealed RETURN exactly like the kernel sentinel:
+    assert exec_ns("RETURN(7)", {"__builtins__": sb, "RETURN": RET})[1:] == ("return", 7)
+    # ... and `import os` in the sealed ns fails cleanly (no __import__ -> captured, no RETURN):
+    out, term, _ = exec_ns("import os\nRETURN('escaped')", {"__builtins__": sb, "RETURN": RET})
+    assert term is None and "Error" in out
+
+
+def test_exec_ns_traceback_rebind_proof_and_interrupts_propagate():
+    """Batch 2: exec_ns captures the traceback even when the code rebinds `sys.stderr`
+    (K-F1 — written straight to the buffer), strips its own exec frame (K-F6), and
+    RE-RAISES KeyboardInterrupt/SystemExit/GeneratorExit instead of swallowing them
+    (K-F9/R-F7)."""
+    from plm.repl.exec_ns import exec_ns
+
+    # K-F1: a cell rebinding sys.stderr can't make the traceback vanish.
+    out, term, _ = exec_ns("import sys, io\nsys.stderr = io.StringIO()\n1/0", {})
+    assert "ZeroDivisionError" in out and term is None
+    # K-F6: the exec_ns frame is stripped (model sees only its own <slot> source).
+    assert "exec(compile(" not in out and ", in exec_ns" not in out
+    # K-F9/R-F7: control exceptions PROPAGATE (so a Ctrl-C / deliberate exit interrupts).
+    with pytest.raises(SystemExit):
+        exec_ns("raise SystemExit(3)", {})
+    with pytest.raises(KeyboardInterrupt):
+        exec_ns("raise KeyboardInterrupt", {})
+
+
 # ============== Section: single-store immutability seal (finding #1) ==============
 # Default policies carry an intrinsic `_p_immutable` flag; the single registry
 # (_PolicyStore) refuses to replace/remove a default entry while sealed. These
@@ -1631,12 +1794,61 @@ def test_seal_subscript_poison_refused(defaults_installed):
 
 
 def test_seal_subscript_del_and_pop_refused(defaults_installed):
-    """`del`/`pop` of a default registry entry is refused; it stays present."""
+    """`del`/`pop` of a default registry entry is refused; it stays present. pop no
+    longer silently returns the live value (P-F4): without a default it raises KeyError,
+    with a default it returns the default — never removing the protected entry."""
     nl0 = _PLM_POLICIES["natural_llm"]
     del _PLM_POLICIES["natural_llm"]
     assert _PLM_POLICIES.get("natural_llm") is nl0
-    returned = _PLM_POLICIES.pop("natural_llm")
-    assert returned is nl0 and _PLM_POLICIES.get("natural_llm") is nl0
+    sentinel = object()
+    assert _PLM_POLICIES.pop("natural_llm", sentinel) is sentinel       # default returned, key kept
+    with pytest.raises(KeyError):
+        _PLM_POLICIES.pop("natural_llm")                                # no default -> KeyError, key kept
+    assert _PLM_POLICIES.get("natural_llm") is nl0
+
+
+def test_pf2_sealed_proxy_introspection_frozen(defaults_installed):
+    """P-F2: a sealed default freezes _p_source/_p_version/_p_filename too, so
+    read_policy/getsource/repr can't be made to lie while _inner runs the real body."""
+    nl = _PLM_POLICIES["natural_llm"]
+    for attr in ("_inner", "_p_name", "_p_source", "_p_version", "_p_filename"):
+        with pytest.raises(TypeError):
+            setattr(nl, attr, "hacked")
+
+
+def test_pf6_guard_a_rejects_exotic_binding_forms():
+    """P-F6: Guard A's pre-exec audit also flags walrus / except-as / match-capture /
+    3.12 type-alias that would rebind a registered policy name (Guard C reverts them
+    post-cell regardless; this is the friendly fail-loud)."""
+    from plm.policy.guard import _audit_cell
+    names = {"react_llm"}
+    assert _audit_cell("(react_llm := 1)", names)                                   # walrus
+    assert _audit_cell("try:\n    pass\nexcept Exception as react_llm:\n    pass", names)  # except-as
+    assert _audit_cell("match x:\n    case react_llm:\n        pass", names)         # match capture
+    assert _audit_cell("type react_llm = int", names)                               # 3.12 type alias
+    assert _audit_cell("def f():\n    (react_llm := 1)", names) is None             # nested scope: not flagged
+    assert _audit_cell("(other := 1)", names) is None                               # unrelated name: fine
+
+
+def test_d7_async_generator_policy_warns(defaults_installed, capsys):
+    """D7: @policy warns (a [policy] note to stderr) on an async/generator def — the repl
+    is SYNCHRONOUS, so such policies aren't covered by the recursion-depth cap."""
+    @policy
+    def gen_pol():
+        yield 1
+    err = capsys.readouterr().err
+    assert "synchronous" in err.lower() and "gen_pol" in err
+
+
+def test_da7_natural_llm_input_and_response_validation(defaults_installed, stub_backend):
+    """D-A7: natural_llm rejects a non-iterable `messages` with a clear TypeError (before
+    any backend call) and survives a non-dict backend response (-> '') instead of
+    crashing with an AttributeError."""
+    nl = _PLM_POLICIES["natural_llm"]
+    with pytest.raises(TypeError):
+        nl(42)                                          # non-iterable messages
+    stub_backend.script = ["not a dict"]                # non-dict backend response
+    assert nl("hi") == ""
 
 
 def test_seal_clear_retains_defaults_but_drops_mutables(defaults_installed):

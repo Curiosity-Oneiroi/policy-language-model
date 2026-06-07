@@ -130,17 +130,19 @@ class _FunctionPolicy:
         functools.update_wrapper(self, fn)
 
     def __setattr__(self, name, value):
-        # Seal: once this proxy is a DEFAULT policy (`_p_immutable` True), freeze
-        # the body (`_inner`), the canonical name (`_p_name`), and the flag itself
-        # (no un-sealing) — so a default can't be hot-swapped, renamed, or
-        # un-sealed. Immutability is INTRINSIC to the object, not a name-set
-        # lookup. Writes during __init__ / dill-restore pass because
-        # `_p_immutable` is still False/unset then (it is the last `_p_*` slot, so
-        # `_inner`/`_p_name` restore before it flips True). Other attrs
-        # (`_p_source`/`_p_version`/`_p_filename`/__dict__/update_wrapper) are
-        # introspection-only and pass.
+        # Seal: once this proxy is a DEFAULT policy (`_p_immutable` True), freeze the
+        # body (`_inner`), the canonical name (`_p_name`), the introspection surface
+        # (`_p_source`/`_p_version`/`_p_filename` — so `read_policy`/`getsource`/`repr` of
+        # an immutable default can't be made to LIE while `_inner` still runs the real
+        # body, P-F2), and the flag itself (no un-sealing) — a default can't be
+        # hot-swapped, renamed, mis-reported, or un-sealed. Immutability is INTRINSIC to
+        # the object, not a name-set lookup. Writes during __init__ / dill-restore pass
+        # because `_p_immutable` is still False/unset then (it is the LAST `_p_*` slot, so
+        # the others restore before it flips True). `__dict__`/update_wrapper metadata
+        # still passes.
         if getattr(self, "_p_immutable", False):
-            if name in ("_inner", "_p_name") or (name == "_p_immutable" and value is not True):
+            if name in ("_inner", "_p_name", "_p_source", "_p_version", "_p_filename") \
+                    or (name == "_p_immutable" and value is not True):
                 raise TypeError(
                     f"{getattr(self, '_p_name', '?')!r} is an immutable default policy; "
                     f"cannot set {name!r}. Use `duplicate_policy("
@@ -194,6 +196,7 @@ class _FunctionPolicy:
         g = _main()                          # kernel __main__ (where @policy injected)
         g.pop(self._p_name, None)
         _PLM_POLICIES.pop(self._p_name, None)
+        linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot (P-F9)
 
     def _duplicate(self, new_name):
         """Fork this policy under `new_name`. Returns the new mutable copy,

@@ -16,6 +16,15 @@ KERNEL_BOOTSTRAP = r'''
 import builtins as _builtins
 import os as _repl_os, struct as _repl_struct, pickle as _repl_pickle, socket as _repl_socket
 
+# Parent-death detector (Linux): if the parent dies abruptly, deliver SIGTERM so this
+# kernel doesn't linger ORPHANED mid-cell — start_new_session put us in our own session,
+# so we wouldn't otherwise be reaped with the parent. Best-effort. (S-F16)
+try:
+    import ctypes as _repl_ctypes, signal as _repl_signal
+    _repl_ctypes.CDLL(None).prctl(1, _repl_signal.SIGTERM)   # PR_SET_PDEATHSIG=1
+except Exception:
+    pass
+
 _repl_sock = _repl_socket.socket(_repl_socket.AF_UNIX, _repl_socket.SOCK_STREAM)
 _repl_sock.connect(_repl_os.environ["_REPL_SOCK_PATH"])
 _repl_sock_io = _repl_sock.makefile("rwb", buffering=0)
@@ -106,6 +115,10 @@ while True:
             # value — e.g. class policies) BEFORE globals().update so it never leaks
             # into __main__; it's re-installed from source after the reconcile (#H11).
             _repl_pol_sources = _repl_restored.pop("_PLM_POLICY_SOURCES", None) or {}
+            # CALL-built constraints (Constraint.field / & | ^ ~) that couldn't dill-pickle
+            # were snapshotted as RECIPES — popped here so they don't reach globals().update;
+            # replayed back into __main__ after the reconcile (mirrors the policy-source path).
+            _repl_constraint_recipes = _repl_restored.pop("_CONSTRAINT_RECIPES", None) or {}
 
             # === Phase 2: subscript-poisoning closure ===
             # Discard the snapshot's copies of immutable LLM defaults and keep
@@ -197,8 +210,25 @@ while True:
                     try:
                         _repl_install_src(
                             "@policy\n" + _repl_src, "<policy-rehydrate-" + _repl_pn + ">")
-                    except Exception:
-                        pass
+                    except Exception as _repl_reinstall_exc:
+                        # Surface, don't swallow (K-F5): an authored class policy whose
+                        # body fails to re-exec on respawn must NOT vanish silently.
+                        _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                            "[rehydrate] policy " + _repl_pn + " not replayed: "
+                            + _builtins.repr(_repl_reinstall_exc) + "; ")
+
+            # Replay constraint RECIPES (CALL-built constraints that couldn't dill-pickle)
+            # back into __main__, rebuilding via from_recipe. Best-effort + surfaced like
+            # the policy-source replay above; guarded on the constraint surface.
+            if _repl_constraint_recipes and _repl_constraint_from_recipe is not None:
+                _repl_cg = _builtins.globals()
+                for _repl_cn, _repl_crec in _repl_constraint_recipes.items():
+                    try:
+                        _repl_cg[_repl_cn] = _repl_constraint_from_recipe(_repl_crec)
+                    except Exception as _repl_crec_exc:
+                        _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                            "[rehydrate] constraint " + _repl_cn + " not replayed: "
+                            + _builtins.repr(_repl_crec_exc) + "; ")
 
             _rebuild_linecache_from_policies()
 
@@ -209,7 +239,7 @@ while True:
             # legitimately rehydrates would get correctly blessed here.
             _repl_bless_after()
         except Exception as _repl_rehydrate_exc:
-            _repl_rehydrate_error = _builtins.repr(_repl_rehydrate_exc)
+            _repl_rehydrate_error = (_repl_rehydrate_error or "") + _builtins.repr(_repl_rehydrate_exc)
         _repl_write_frame({"type": "ready", "rehydrate_error": _repl_rehydrate_error})
         continue
 
@@ -232,7 +262,10 @@ while True:
     # into __main__ before exec. Frames without a seed carry None -> nothing
     # bound (existing names untouched).
     for _repl_sname, _repl_sobj in (_repl_req.get("seed") or {}).items():
-        _repl_g[_repl_sname] = _repl_sobj
+        if _repl_sname == "plm_messages":
+            _repl_plm_messages[:] = _repl_sobj          # seeded trajectory REPLACES the accumulator (its source of truth)
+        else:
+            _repl_g[_repl_sname] = _repl_sobj
 
     # `plm_messages` (the root's own trajectory) arrives ADDITIVELY: the parent
     # appends only the messages new since the last cell. We extend a hidden
@@ -243,7 +276,12 @@ while True:
     _repl_pm_delta = _repl_req.get("plm_messages_delta")
     if _repl_pm_delta is not None:
         _repl_plm_messages.extend(_repl_pm_delta)
-        _repl_g["plm_messages"] = _builtins.list(_repl_plm_messages)
+    # Reseed the PUBLIC list from the hidden accumulator EVERY cell. The accumulator is
+    # the single source of truth — fed by the delta channel (additive) and by a
+    # `plm_messages` seed above (replace) — so a seeded/delta'd trajectory persists to
+    # later no-input cells, while a cell mutating the public list (append/clear/reassign)
+    # can't corrupt the accumulation OR persist a stray rebind into the next cell (K-F7).
+    _repl_g["plm_messages"] = _builtins.list(_repl_plm_messages)
 
     # Guard A: reject a static rebind of a registered policy name BEFORE exec.
     # Pass the immutable-names subset so the audit can produce immutable-specific
@@ -304,7 +342,13 @@ while True:
             _repl_terminal_etype = "return"
             _repl_return_value = _repl_builtins.getattr(_repl_exc, "value", None)
         else:
-            _traceback.print_exc()
+            # Write the traceback STRAIGHT to the buffer (a cell rebinding `sys.stderr`
+            # defeats the per-cell redirect, so `print_exc()` could vanish), dropping
+            # THIS exec frame so the model sees only its own source. (K-F1/K-F6)
+            _repl_tb_obj = _repl_exc.__traceback__
+            _repl_stderr_buf.write("".join(_traceback.format_exception(
+                _repl_builtins.type(_repl_exc), _repl_exc,
+                _repl_tb_obj.tb_next if _repl_tb_obj else None)))
 
     # Re-establish a TRUSTED handle to the REAL __main__ globals before Guard C.
     # A cell can rebind the bare `_repl_g` (or `_builtins`) __main__ name during its

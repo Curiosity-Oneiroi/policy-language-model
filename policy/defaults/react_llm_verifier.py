@@ -143,7 +143,11 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             `base_verifier`) but optional. The verifier runs in trusted
             policy scope (NOT the sub-LLM's restricted exec), wrapped in its
             own `descend()` so the depth guard caps any circuit it spawns at
-            depth-1 (root=2). Exceptions propagate (fail-loud).
+            depth-1 (root=2). Because it runs one level below and its circuits
+            are depth-1, a verifier needs depth >= 2: calling WITH a verifier at
+            depth=1 (or any remaining < 2) raises LLMDepthExceeded UP FRONT,
+            before any backend call. Exceptions the verifier raises propagate
+            (fail-loud).
 
     Returns:
 
@@ -162,7 +166,9 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
         - ConstraintViolation: budget exhausted; final RETURN(s) all
           failed validation. The model has seen each failure in the
           conversation history.
-        - LLMDepthExceeded: the depth budget is at 0 before a generate.
+        - LLMDepthExceeded: the depth budget is at 0 before a generate, OR a
+          `verifier` is set with fewer than 2 levels remaining (e.g. depth=1) —
+          the latter is raised UP FRONT, before any backend call.
         - UserWarning (emitted, not raised): kwargs has identifier-invalid
           or Python-keyword keys.
         - Anything the `verifier` raises propagates out (fail-loud; the
@@ -219,12 +225,11 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
           the same path as any other exception, ending up in the tool
           result for the model to see.
     """
-    import sys, json, io, linecache, traceback, keyword, warnings
-    from contextlib import redirect_stdout, redirect_stderr
+    import sys, json, keyword, warnings
     from plm.plm_tools import _tool_python
-    from plm._react_helper import _strip_code_fences, _safe_describe
+    from plm._react_helper import _strip_code_fences
     from plm.policy.defaults._llm_infra import (
-        _make_backend, descend, llm_call, check_depth_or_raise)
+        _make_backend, descend, llm_call, check_depth_or_raise, _remaining, LLMDepthExceeded)
 
     # Resolve None-sentinel mutable defaults (no shared-default footgun).
     kwargs = {} if kwargs is None else kwargs
@@ -281,11 +286,20 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     # ---- nested helpers (NOT policies; local to this call) ----
 
     def _norm(m):
+        # DEEP-copy the message dicts so this policy never mutates the CALLER's own
+        # dicts — react_llm appends new turns, and a verifier mutates `msgs` in
+        # place; either way the caller's `messages` must stay untouched.
+        import copy
         if isinstance(m, str):
             return [{"role": "user", "content": m}]
         if isinstance(m, dict):
-            return [m]
-        return list(m)
+            return [copy.deepcopy(m)]
+        try:
+            return [copy.deepcopy(x) for x in m]
+        except TypeError:
+            raise TypeError(
+                "react_llm_verifier: messages must be a str, a message dict, or an "
+                f"iterable of message dicts; got {type(m).__name__}")
 
     def _exec(code, ns, round_no):
         """Run the model's code in the sub-agent's OWN repl namespace `ns`.
@@ -319,11 +333,11 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
 
         On `_REPLReturn` (model called `RETURN(value)`): validate against
         the closed-over `constraint`. Success -> `term="return"` with the
-        validated value. Failure (ConstraintViolation) -> print the
-        violation through the same stderr path as any other exception,
-        leave `term=None` so the outer loop continues. Any other
-        exception (including `NameError` from a stray `RETURN_LLM(...)`
-        — not defined in v1 PREFIX) prints its traceback to `buf_e`.
+        validated value. Failure -> surface the violation (via the shared
+        constraint formatter) through the captured-stderr path, leave
+        `term=None` so the outer loop continues. Any OTHER cell exception
+        (e.g. a `NameError` from a stray name) is captured by `exec_ns` into
+        the tool result the same way.
         """
         # Delegate the CORE run (namespace exec + captured stdout/stderr + traceback
         # + linecache slot) to `exec_ns` — a repl-injected global (ambient, no import,
@@ -340,13 +354,19 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             try:
                 return "return", constraint.validate(proposed)   # closed-over from outer scope
             except Exception as ce:
-                # ConstraintViolation OR any other validator error (a buggy/edge
-                # predicate, a wrong-typed value): route it through the model's normal
-                # stderr/traceback surface — it lands in the tool result, the model sees
-                # it next turn, and `term` stays None so the loop continues within budget
-                # (never crashes the react loop).
-                sys.stderr.write(_safe_describe(constraint) + "\n")
-                traceback.print_exception(type(ce), ce, ce.__traceback__)
+                # ConstraintViolation OR any other validator error (a buggy/edge predicate,
+                # a wrong-typed value): surface it through the model's normal stderr capture
+                # — it lands in the tool result, the model self-corrects next turn, and
+                # `term` stays None so the loop continues within budget (never crashes the
+                # react loop). Use the SHARED formatter so react's diagnostic matches
+                # natural_llm's clear "RETURN value failed ... Required ... Fix the object"
+                # form rather than a hand-rolled describe()+traceback.
+                from plm._react_helper import (
+                    _format_constraint_error, _format_unexpected_validate_error)
+                if type(ce).__name__ == "ConstraintViolation":
+                    sys.stderr.write(_format_constraint_error(constraint, ce) + "\n")
+                else:
+                    sys.stderr.write(_format_unexpected_validate_error(constraint, ce) + "\n")
                 return None, None
 
         return exec_ns(code, ns, slot=f"react-{id(ns)}-{round_no}", on_return=_on_return)
@@ -376,11 +396,18 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     # then the three meta-channels (which win over any colliding kwarg key).
     # kwargs are validated upstream to exclude `RETURN`/builtins, so those base
     # names are never shadowed.
-    main_g = sys.modules["__main__"].__dict__           # touched ONLY to plumb RETURN; never merged
-    _builtins_mod = sys.modules["builtins"]
+    # SEALED — a containment boundary, NOT just hygiene: `__builtins__` is a CURATED
+    # dict (no __import__/eval/exec/compile/open) and `RETURN` is rebuilt over a minimal
+    # globals dict, so neither `__import__(...)` nor `RETURN.__globals__` reaches the
+    # kernel `__main__` / `_PLM_POLICIES` / the depth + blessed-caller gates. RETURN
+    # BEHAVES IDENTICALLY for the model — it raises `_REPLReturn(value)`, matched by name
+    # by `exec_ns`/`_exec`. (The deliberate `().__class__...__subclasses__()` walk stays
+    # reachable — see exec_ns; true isolation is a subprocess concern.)
+    from plm.repl.exec_ns import safe_builtins, make_sealed_return
+    _safe_b = safe_builtins()
     ns: dict = {
-        "__builtins__": _builtins_mod,                  # print/len/range/dict/list/... work
-        "RETURN":       main_g["RETURN"],               # sole termination primitive
+        "__builtins__": _safe_b,                        # curated: print/len/range/dict/...; no import/eval/exec/open
+        "RETURN":       make_sealed_return(_safe_b),     # termination primitive; __globals__ does NOT leak __main__
         **kwargs,                                       # each kwarg as a direct name
         "args":    args,                                # meta-channels override any collisions
         "kwargs":  kwargs,                              # full dict still available programmatically
@@ -396,13 +423,29 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     return_budget = _coerce_budget(return_budget, 5)
     
     with llm_call(depth):                               # voluntary lowering (no-op if depth=None)
+        check_depth_or_raise()                          # depth gate FIRST (D-A2): a clear LLMDepthExceeded, not a backend-spec error
+        if verifier is not None and _remaining() < 2:
+            # A verifier runs ONE level below (its own descend()) and its checks are
+            # depth-1 circuits, so it needs >= 2 levels of remaining budget. Fail UP
+            # FRONT with a clear error rather than crashing mid-loop when the verifier
+            # hook's descend() hits 0. (D2 — depth=1 + verifier is unsupported.)
+            raise LLMDepthExceeded(
+                f"react_llm_verifier: a verifier needs depth >= 2 (it runs one level "
+                f"below and composes depth-1 circuits), but only {_remaining()} level(s) "
+                f"remain. Call without a verifier, or raise the depth / AGENT_DEPTH.")
         backend = _make_backend()
         for _round in range(max_turns + return_budget):
             check_depth_or_raise()                      # policy owns the depth gate
             resp = backend.generate(msgs, tools=tools, **generate_kwargs)
+            if not isinstance(resp, dict):                  # malformed backend response -> empty turn (R-F4)
+                resp = {}
             content = resp.get("content") or ""
             reasoning = resp.get("reasoning") or ""
             tool_calls = resp.get("tool_calls") or []
+            if isinstance(tool_calls, dict):                # a single call returned bare -> wrap it (R-F3)
+                tool_calls = [tool_calls]
+            elif not isinstance(tool_calls, list):          # any other malformed shape -> none
+                tool_calls = []
             msgs.append({"role": "assistant", "content": content,
                          "reasoning": reasoning,
                          # Record ONLY the executed+answered call (tool_calls[0]);
@@ -412,48 +455,61 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             if tool_calls:
                 # --- model emitted a tool call: verify it's `python`, then parse/exec/RETURN ---
                 tc = tool_calls[0]
-                tname = tc.get("function", {}).get("name")
-                if tname != "python":
-                    # react_llm_verifier only offers the python tool. A backend that calls
-                    # anything else gets a clear error back (its id IS answered, so history
-                    # stays well-formed) — but DON'T `continue`: this is a non-terminal
-                    # round, so it must fall through to the verifier hook below. Mirrors the
-                    # root loop's guard (plm.py) rather than silently exec'ing "".
-                    msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
-                                 "content": f"error: tool {tname!r} not supported (only `python`)"})
+                if not isinstance(tc, dict):
+                    # Malformed tool_call entry (str/int/None): clear error (no id to echo),
+                    # then fall through to the verifier hook (this round is non-terminal). (R-F1)
+                    msgs.append({"role": "tool", "tool_call_id": "",
+                                 "content": f"error: malformed tool_call ({type(tc).__name__}); "
+                                            f"emit a single `python` call"})
                 else:
-                    args_raw = tc.get("function", {}).get("arguments") or "{}"
-                    try:
-                        targs = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                        if not isinstance(targs, dict):
+                    _fn = tc.get("function")
+                    _fn = _fn if isinstance(_fn, dict) else {}   # `function: null` / malformed -> {} (R-F2)
+                    tname = _fn.get("name")
+                    if tname != "python":
+                        # react_llm_verifier only offers the python tool. A backend that calls
+                        # anything else gets a clear error back (its id IS answered, so history
+                        # stays well-formed) — but DON'T `continue`: this is a non-terminal
+                        # round, so it must fall through to the verifier hook below. Mirrors the
+                        # root loop's guard (plm.py) rather than silently exec'ing "".
+                        msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                     "content": f"error: tool {tname!r} not supported (only `python`)"})
+                    else:
+                        args_raw = _fn.get("arguments") or "{}"
+                        try:
+                            targs = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                            if not isinstance(targs, dict):
+                                targs = {}
+                        except Exception:
+                            # Any parse failure -> {} (not just JSONDecodeError): a huge
+                            # integer literal raises ValueError (int_max_str_digits) and
+                            # deeply-nested JSON raises RecursionError, neither a
+                            # JSONDecodeError (#H13/#H14).
                             targs = {}
-                    except Exception:
-                        # Any parse failure -> {} (not just JSONDecodeError): a huge
-                        # integer literal raises ValueError (int_max_str_digits) and
-                        # deeply-nested JSON raises RecursionError, neither a
-                        # JSONDecodeError (#H13/#H14).
-                        targs = {}
-                    code = targs.get("code", "")
+                        code = targs.get("code", "")
+                        if not isinstance(code, str):
+                            # non-string `code`: clear error + fall through (R-F5)
+                            msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                         "content": "error: `code` must be a string of Python source"})
+                        else:
+                            out, term, val = "(no output)", None, None  # defensive init
+                            # `_exec` (= exec_ns) CAPTURES the cell's stdout AND any error together
+                            # and returns them in `out`: a print-then-error cell surfaces BOTH (stdout
+                            # THEN traceback), never just the error, and exec_ns NEVER raises for the
+                            # cell's own code. So this try/except is an ORCHESTRATION safety net
+                            # (fence-strip / `descend` / the `_exec` call), NOT for cell errors —
+                            # cell stdout is never lost.
+                            try:
+                                code = _strip_code_fences(code)
+                                with descend():                 # decrement for the act phase ONLY
+                                    out, term, val = _exec(code, ns, _round)
+                            except SyntaxError as e:
+                                out = f"stderr:\n{e}"
+                            except Exception as e:              # any other failure -> stderr back to the model
+                                out = f"stderr:\n{type(e).__name__}: {e}"
 
-                    out, term, val = "(no output)", None, None  # defensive init
-                    # `_exec` (= exec_ns) CAPTURES the cell's stdout AND any error together
-                    # and returns them in `out`: a print-then-error cell surfaces BOTH (stdout
-                    # THEN traceback), never just the error, and exec_ns NEVER raises for the
-                    # cell's own code. So this try/except is an ORCHESTRATION safety net
-                    # (fence-strip / `descend` / the `_exec` call), NOT for cell errors —
-                    # cell stdout is never lost.
-                    try:
-                        code = _strip_code_fences(code)
-                        with descend():                     # decrement for the act phase ONLY
-                            out, term, val = _exec(code, ns, _round)
-                    except SyntaxError as e:
-                        out = f"stderr:\n{e}"
-                    except Exception as e:                  # any other failure -> stderr back to the model
-                        out = f"stderr:\n{type(e).__name__}: {e}"
-
-                    msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": out})
-                    if term == "return":                    # RETURN(value) succeeded (constraint passed
-                        return val                          # or there was no constraint) — done; NO verifier.
+                            msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": out})
+                            if term == "return":                # RETURN(value) succeeded (constraint passed
+                                return val                      # or there was no constraint) — done; NO verifier.
             # else: text-only turn — the assistant message is already appended; the
             # model sees its own text-turn next round. Either way this round did NOT
             # terminate, so the verifier runs below.

@@ -95,6 +95,7 @@ from pydantic import Field
 from .base import Constraint, ConstraintViolation
 from .decorator import constraint, get_description
 from .registry import REGISTRY
+from .snapshot import to_recipe, from_recipe, is_constraint_class
 
 __all__ = [
     "Constraint",
@@ -103,4 +104,7 @@ __all__ = [
     "constraint",
     "get_description",
     "REGISTRY",
+    "to_recipe",
+    "from_recipe",
+    "is_constraint_class",
 ]

@@ -98,14 +98,23 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
             return [{"role": "user", "content": m}]
         if isinstance(m, dict):
             return [m]
-        return list(m)
+        try:
+            return list(m)
+        except TypeError:                                  # None / int / ... -> clear error
+            raise TypeError(
+                "natural_llm: messages must be a str, a message dict, or an iterable of "
+                f"message dicts; got {type(m).__name__}")
+
+    def _content(resp):                                    # non-dict backend response -> ""
+        return ((resp.get("content") if isinstance(resp, dict) else None) or "")
 
     msgs = _norm(messages)
     with llm_call(depth):
+        check_depth_or_raise()                             # depth gate FIRST: a clear LLMDepthExceeded, not a backend-spec error
         backend = _make_backend()
         if constraint is None:
             check_depth_or_raise()                         # policy owns the depth gate
-            return (backend.generate(msgs, **generate_kwargs).get("content") or "")
+            return _content(backend.generate(msgs, **generate_kwargs))
 
         # Shape guard: `constraint` must actually be a Constraint (class or
         # composite). Otherwise json_schema()/validate() below would raise a raw
@@ -146,7 +155,6 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         gk["response_format"] = {"type": "json_schema",
                                  "json_schema": {"name": "answer", "schema": schema}}
 
-        
         from plm._react_helper import _coerce_budget, _safe_describe, _strip_md_fence
         last_err = None
         # `return_budget` is model-controlled; coerce None/non-int/negative -> a
@@ -154,7 +162,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         rb = _coerce_budget(return_budget, 5)
         for _ in range(1 + rb):
             check_depth_or_raise()
-            content = backend.generate(msgs, **gk).get("content") or ""
+            content = _content(backend.generate(msgs, **gk))
             try:
                 # Strip a structural ```json ... ``` fence first. response_format is
                 # hard-set to json_schema (so OpenAI/vLLM structured outputs return

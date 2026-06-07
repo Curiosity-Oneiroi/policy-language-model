@@ -92,6 +92,7 @@ def policy(obj):
         return _existing0
 
     _warn_if_captures_locals(obj)                         # closures don't survive re-exec
+    _warn_if_async_or_generator(obj)                      # the repl is synchronous
     # Functions use inspect.getsource (cell_file unused); classes need their
     # origin file to read the cell from linecache (no co_firstlineno to use).
     cell_file = None if inspect.isfunction(obj) else _class_origin_filename(obj)
@@ -125,9 +126,10 @@ def policy(obj):
             result = _PLM_POLICIES.get(name, existing)
             main_globals[name] = result
             return result
-        _PLM_POLICIES.pop(name, None)                     # kind changed (fn<->class):
-        main_globals.pop(name, None)                      # drop old, fall through to fresh
-        # create — identity is NOT preserved across a kind change (can't be).
+        # kind changed (fn<->class): identity is NOT preserved (can't be). DON'T drop
+        # the old here — the fresh install below execs into a temp `ns` and only then
+        # OVERWRITES both the registry and __main__, so a re-exec that FAILS leaves the
+        # old policy intact instead of vanishing.
 
     # FRESH install (new policy or kind change): NOW populate the linecache slot
     # (deferred from the top so a refused/no-op re-decoration never touches it).
@@ -144,6 +146,13 @@ def policy(obj):
         return proxy
 
     ns = {}
+    # NOTE : executing a `class` statement RUNS its body, so this re-exec runs a
+    # fresh @policy class's body a SECOND time (the cell already ran it once). The re-exec
+    # is REQUIRED for linecache fidelity — it moves the methods' code objects into the
+    # stable <policy-{name}> slot, not the disposable <cell-N> (reusing the cell object
+    # would break getsource/tracebacks after respawn). The documented constraint is
+    # therefore: keep policy class BODIES side-effect-free (define methods/attrs only);
+    # put any side effect in __init__/methods. (`def` re-exec, above, is side-effect-free.)
     exec(compile(source, stable, "exec"), main_globals, ns)       # under __main__ too
     cls = ns[name]
     _attach_class_policy_metadata(cls, source, stable)
@@ -198,3 +207,25 @@ def _warn_if_captures_locals(obj):
             f"@policy {obj.__name__!r}: captures enclosing-function local(s) {free} "
             f"— lost when the policy is re-exec'd standalone; will NameError at call "
             f"unless they exist as REPL globals. Reference REPL globals or inline.")
+
+
+def _warn_if_async_or_generator(obj):
+    # the PLM repl is SYNCHRONOUS. An async/generator policy is NOT covered by the
+    # recursion-depth cap (the `with _policy_call(...)` boundary exits before the
+    # coroutine/generator BODY runs) and does not compose with the depth/budget model.
+    # Sync is the contract; `parallel(...)` owns concurrency, and threading/
+    # multiprocessing are likewise unsupported in cells (they break the depth ContextVar
+    # propagation and the subprocess-cleanup the kernel relies on). Warn (don't refuse)
+    # so an authored async/generator policy is not a silent surprise.
+    if inspect.isasyncgenfunction(obj):
+        kind = "async generator"
+    elif inspect.iscoroutinefunction(obj):
+        kind = "async (coroutine)"
+    elif inspect.isgeneratorfunction(obj):
+        kind = "generator"
+    else:
+        return
+    _policy_note(
+        f"@policy {obj.__name__!r} is an {kind} function; the PLM repl is SYNCHRONOUS, so "
+        f"it is NOT covered by the recursion-depth cap and does not compose with the "
+        f"depth/budget model. Use a plain `def` (and `parallel(...)` for concurrency).")

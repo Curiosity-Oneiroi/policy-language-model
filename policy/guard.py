@@ -91,13 +91,7 @@ def _audit_stmts(stmts, names, immutable_names=()):
             continue                            # nothing else to check on Delete
         for b in _binding_targets(s):
             if b in names:
-                tail = (
-                    f"It is immutable; use `duplicate_policy({b!r}, '<new_name>')` to fork."
-                    if b in immutable_names else
-                    f"Use {b}._rewrite(...) to edit, `del {b}` to remove, or "
-                    f"`@policy def {b}(...)` to redefine."
-                )
-                return f"Cell would rebind policy {b!r} via {type(s).__name__}. {tail}"
+                return _rebind_msg(b, type(s).__name__, immutable_names)
         for attr in ("body", "orelse", "finalbody"):
             sub = getattr(s, attr, None)
             if sub and (e := _audit_stmts(sub, names, immutable_names)):
@@ -111,12 +105,75 @@ def _audit_stmts(stmts, names, immutable_names=()):
     return None
 
 
+def _rebind_msg(name, form, immutable_names):
+    """Friendly Guard-A message for a cell that would rebind a registered policy name."""
+    tail = (
+        f"It is immutable; use `duplicate_policy({name!r}, '<new_name>')` to fork."
+        if name in immutable_names else
+        f"Use {name}._rewrite(...) to edit, `del {name}` to remove, or "
+        f"`@policy def {name}(...)` to redefine."
+    )
+    return f"Cell would rebind policy {name!r} via {form}. {tail}"
+
+
+def _names_in_pattern(p):
+    """Yield names a match-case PATTERN binds: MatchAs (`case ... as x` / bare capture
+    `case x`), MatchStar (`*x`), MatchMapping (`**rest`); recurses nested patterns."""
+    if isinstance(p, ast.MatchAs):
+        if p.name:
+            yield p.name
+        if p.pattern is not None:
+            yield from _names_in_pattern(p.pattern)
+    elif isinstance(p, ast.MatchStar):
+        if p.name:
+            yield p.name
+    elif isinstance(p, ast.MatchMapping):
+        if p.rest:
+            yield p.rest
+        for sub in p.patterns:
+            yield from _names_in_pattern(sub)
+    elif isinstance(p, (ast.MatchSequence, ast.MatchOr)):
+        for sub in p.patterns:
+            yield from _names_in_pattern(sub)
+    elif isinstance(p, ast.MatchClass):
+        for sub in [*p.patterns, *p.kwd_patterns]:
+            yield from _names_in_pattern(sub)
+
+
+def _audit_extras(node, names, immutable_names):
+    """Reject the enclosing-scope binding forms `_binding_targets` misses — walrus
+    (`x := ...`), `except ... as x`, match captures, and 3.12 `type x = ...` — that
+    would rebind a registered policy name. Guard C reverts them post-cell regardless;
+    this is the friendly FAIL-LOUD before the cell runs. Skips nested function / class /
+    lambda scopes (their bindings are local there). (P-F6)"""
+    _TypeAlias = getattr(ast, "TypeAlias", ())
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue                            # separate scope
+        if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
+            if child.target.id in names:
+                return _rebind_msg(child.target.id, "walrus `:=`", immutable_names)
+        elif isinstance(child, ast.ExceptHandler) and child.name in names:
+            return _rebind_msg(child.name, "`except ... as`", immutable_names)
+        elif isinstance(child, _TypeAlias) and isinstance(getattr(child, "name", None), ast.Name):
+            if child.name.id in names:
+                return _rebind_msg(child.name.id, "`type` alias", immutable_names)
+        elif isinstance(child, ast.match_case):
+            for nm in _names_in_pattern(child.pattern):
+                if nm in names:
+                    return _rebind_msg(nm, "match capture", immutable_names)
+        if e := _audit_extras(child, names, immutable_names):
+            return e
+    return None
+
+
 def _audit_cell(code, policy_names, immutable_names=()):
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return None                             # let compile() surface it
-    return _audit_stmts(tree.body, policy_names, immutable_names)
+    return (_audit_stmts(tree.body, policy_names, immutable_names)
+            or _audit_extras(tree, policy_names, immutable_names))
 
 
 def _post_cell_guard(cell_globals, stderr_buf):

@@ -46,7 +46,11 @@ def iter_default_policies():
     for p in sorted(_DIR.glob("*.py")):
         if p.stem.startswith("_"):
             continue
-        yield p.stem, p.read_text()
+        try:
+            src = p.read_text()
+        except OSError as e:                       # permission flip / removed mid-iteration
+            raise RuntimeError(f"could not read default policy file {p.name!r}: {e}") from e
+        yield p.stem, src
 
 
 # The immutable LLM-default names. Bootstrap seals these as immutable +
@@ -79,9 +83,10 @@ def _bless_llm_callers() -> None:
         if p is None:
             continue
         inner = getattr(p, "_inner", None)         # function policy: bless _inner
-        if inner is not None and hasattr(inner, "__code__"):
-            codes.append(inner.__code__)
-            continue
+        if inner is not None:
+            if hasattr(inner, "__code__"):         # bless it; if it somehow lacks __code__, SKIP —
+                codes.append(inner.__code__)       # do NOT fall through to the class-policy path and
+            continue                               # bless an unrelated object's __call__
         cm = getattr(p, "__call__", None)          # class policy: bless original
         orig = getattr(cm, "__wrapped__", cm)      # __wrapped__ skips _policy_call wrap
         if hasattr(orig, "__code__"):

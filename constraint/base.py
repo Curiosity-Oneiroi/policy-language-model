@@ -197,7 +197,12 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     _constraint_is_composite: ClassVar[bool] = False
     _constraint_children: ClassVar[tuple] = ()
 
-    # Original kwargs passed to the factory builder (for .describe()).
+    # Composite operator label ("AND"/"OR"/"XOR"/"NOT") — set by the algebra wrappers.
+    # Declared here (not just set in the wrapper's class dict) so it reads back as the
+    # plain string, not a pydantic ModelPrivateAttr — needed by the crash-restart recipe.
+    _constraint_op_label: ClassVar[Optional[str]] = None
+
+    # Original kwargs passed to the factory builder (for .describe() + crash-restart recipe).
     _constraint_factory_kwargs: ClassVar[Optional[Dict[str, Any]]] = None
 
     # NL description carried verbatim through .describe().
@@ -266,9 +271,12 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             "_constraint_is_field": True,              # so _describe_structural renders it fully
             "_constraint_field_inner_type": _vfi.annotation,
             "_constraint_field_annotation": _flat,     # so .field works as a list_of/set_of/.. element
-            # NB: describe()/json_schema() delegate to `inner`, so the facade does
-            # NOT carry _constraint_factory_kwargs / _constraint_description — those
-            # are read only by the BASE describe/json_schema, which the facade shadows.
+            # describe()/json_schema() delegate to `inner` (the facade shadows the BASE
+            # ones), so these are NOT used for rendering. `_constraint_factory_kwargs` IS
+            # carried, but for ONE purpose only: crash-restart RECIPE replay — the
+            # snapshot can't dill-pickle this dynamic class, so it stores these kwargs and
+            # rehydrate rebuilds via `Constraint.field(**kwargs)` (see constraint/snapshot.py).
+            "_constraint_factory_kwargs": dict(kwargs),
             "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
         }
         return _ConstraintMeta("_FieldConstraint", (Constraint,), ns)

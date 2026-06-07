@@ -76,8 +76,14 @@ def _compute_child_pythonpath() -> str:
         paths = list(getattr(plm, "__path__", []) or [])
         if paths:
             entries.append(str(Path(paths[0]).parent))  # the dir that makes `import plm` work
-    except Exception:
-        pass
+    except (ImportError, AttributeError, IndexError, OSError) as e:
+        # Don't SILENTLY drop the path on an unrelated error — the child would later fail
+        # `import plm` with no hint. Narrow the catch + warn, then fall back to the
+        # inherited PYTHONPATH.
+        import warnings
+        warnings.warn(
+            f"could not derive the plm path for the kernel child ({e!r}); relying on the "
+            f"inherited PYTHONPATH", RuntimeWarning)
     existing = os.environ.get("PYTHONPATH", "")
     if existing:
         entries.append(existing)
@@ -110,11 +116,15 @@ def _assemble_kernel_script(prefix_text: str) -> str:
 def _run_uv(cmd: list[str]) -> None:
     """Invoke `uv ...`; raise RuntimeError with a useful message on failure."""
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
     except FileNotFoundError:
         raise RuntimeError(
             "`uv` not found on PATH. Install uv (https://docs.astral.sh/uv/) "
             "or put it on PATH before constructing PythonReplSession."
+        )
+    except subprocess.TimeoutExpired:                  # a wedged DNS/mirror can't hang __init__ forever
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` timed out after 300s (a wedged network / mirror?)."
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
@@ -123,13 +133,21 @@ def _run_uv(cmd: list[str]) -> None:
         )
 
 
-def _cleanup(workspace: str, child_pid_box: list[int | None]) -> None:
-    """GC/atexit finalizer — SIGKILLs the (current) child pid and rmtrees the workspace."""
+def _cleanup(control_dir: str, workspace: str, owns_workspace: bool,
+             child_pid_box: list[int | None]) -> None:
+    """GC/atexit finalizer — SIGKILLs the (current) child process GROUP, reaps it, and
+    removes the private control dir (always ours) + a workspace WE created."""
     pid = child_pid_box[0] if child_pid_box else None
     if pid is not None:
         with suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(pid, signal.SIGKILL)
-    shutil.rmtree(workspace, ignore_errors=True)
+            os.killpg(pid, signal.SIGKILL)        # the whole session/pgrp: kernel + grandchildren
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGKILL)          # fallback if it wasn't a group leader
+        with suppress(ChildProcessError, OSError):
+            os.waitpid(pid, 0)                    # reap so we don't leave a zombie
+    shutil.rmtree(control_dir, ignore_errors=True)
+    if owns_workspace:                            # NEVER rmtree a caller-supplied workspace
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 class PythonReplSession:
@@ -171,8 +189,14 @@ class PythonReplSession:
         sigint_grace: float = 5.0,
         var_size_max: int = 10 * 1024 * 1024,
     ) -> None:
+        self._owns_workspace = not workspace          # only rmtree a workspace WE created
         if not workspace:
             workspace = tempfile.mkdtemp(prefix="plm_session_")
+        # Private control dir (0700, SEPARATE from the cwd workspace) for the kernel
+        # script + handshake socket: a cell (its cwd IS the workspace) can't overwrite the
+        # kernel script to brick respawns, and the socket is no longer a
+        # world-reachable /tmp path. Always ours -> always cleaned up.
+        self._control_dir = tempfile.mkdtemp(prefix="plm_ctl_")
 
         self.workspace = str(Path(workspace).resolve())
         self._prefix = code_prefix
@@ -202,7 +226,8 @@ class PythonReplSession:
         # Register the finalizer NOW — before anything that can raise.
         # Otherwise a venv-setup failure would leak the tempdir.
         self._finalizer = weakref.finalize(
-            self, _cleanup, self.workspace, self._child_pid_box,
+            self, _cleanup, self._control_dir, self.workspace,
+            self._owns_workspace, self._child_pid_box,
         )
 
         venv_dir = ws / ".venv"
@@ -215,7 +240,8 @@ class PythonReplSession:
             _run_uv(["uv", "pip", "install", "--python", str(venv_python_path), *preinstall_list])
         self._venv_python = str(venv_python_path)
 
-        self._kernel_path = str(ws / ".repl_kernel.py")
+        # In the private control dir, NOT the cwd workspace — so a cell can't clobber it.
+        self._kernel_path = str(Path(self._control_dir) / "repl_kernel.py")
         with open(self._kernel_path, "w", encoding="utf-8") as f:
             f.write(_assemble_kernel_script(self._prefix))
 
@@ -275,7 +301,7 @@ class PythonReplSession:
         # early-return respawn paths below call _kill_and_respawn -> _spawn_kernel,
         # which OVERWRITES these fields with the fresh kernel's values. Capturing
         # first lets us surface the OLD pending once on THIS cell's stderr (on ANY
-        # return path), instead of losing it to the respawn. (#10/#26)
+        # return path), instead of losing it to the respawn.
         _pre = ""
         if self._pending_boot_stderr is not None:
             _pre += f"[boot: extra-policy install warning]\n{self._pending_boot_stderr}\n"
@@ -321,9 +347,11 @@ class PythonReplSession:
             except (_FrameDecodeError, EOFError, BrokenPipeError, struct.error):
                 self._kill_and_respawn()
                 return {
-                    "type": "result", "return_obj": None,
+                    "type": "result", "return_obj": None, "executed": False,   # caller can detect a non-run
                     "stdout": "",
-                    "stderr": _pre + "[child exited or desynced without a valid payload; prior state preserved]\n",
+                    "stderr": _pre + "[the kernel exited/desynced before returning a result, so "
+                                     "this cell may NOT have executed (or only partially) — it was "
+                                     "restarted with prior state preserved. RE-RUN this cell.]\n",
                 }
 
             if envelope.get("type") == "boot_error":
@@ -335,8 +363,10 @@ class PythonReplSession:
                 }
 
         etype = envelope.get("type") or "result"
-        # Cache the vars snapshot for crash-restart rehydrate. Never surfaced.
-        self.cached_vars_blob = envelope.get("vars_blob") or b""
+        # Cache the vars snapshot for crash-restart rehydrate. Never surfaced. Keep the
+        # LAST-GOOD blob if this cell produced an empty/missing one (a snapshot skip or
+        # error) — overwriting with b"" would WIPE the restart state.
+        self.cached_vars_blob = envelope.get("vars_blob") or self.cached_vars_blob
 
         return_obj: Any = None
         # `_pre` carries any pending boot/rehydrate diagnostics captured at the
@@ -367,31 +397,39 @@ class PythonReplSession:
         if fin is None or not fin.alive:
             return
 
-        with self._io_lock:
-            if self._req_w is not None:
+        # Acquire with a TIMEOUT — a `cell_timeout=None` cell in flight holds `_io_lock`
+        # for the whole cell, so an unconditional `with self._io_lock:` could block close()
+        # forever. If we can't get it in time, skip the graceful shutdown frame and just
+        # force-kill the group + tear down (without the lock).
+        got = self._io_lock.acquire(timeout=_SHUTDOWN_WAIT)
+        try:
+            if got and self._req_w is not None:
                 with suppress(BrokenPipeError, OSError, ValueError):
                     self._write_frame({"type": "shutdown"})
 
             if self._proc is not None:
                 reaped = False
-                try:
-                    self._proc.wait(timeout=_SHUTDOWN_WAIT)
-                    reaped = True
-                except subprocess.TimeoutExpired:
+                if got:
+                    with suppress(subprocess.TimeoutExpired):
+                        self._proc.wait(timeout=_SHUTDOWN_WAIT)
+                        reaped = True
+                if not reaped:                            # timed out, OR we never got the lock
+                    with suppress(ProcessLookupError, OSError):
+                        os.killpg(self._proc.pid, signal.SIGKILL)   # whole group
                     with suppress(ProcessLookupError, OSError):
                         self._proc.kill()
-                    try:
+                    with suppress(subprocess.TimeoutExpired):
                         self._proc.wait(timeout=_REAP_WAIT)
                         reaped = True
-                    except subprocess.TimeoutExpired:
-                        pass                              # genuinely stuck — keep the box so
-                                                          # the finalizer still attempts a kill
                 if reaped:
                     # Child reaped: clear the pid box so the GC/atexit finalizer
                     # never SIGKILLs a now-recycled PID (#R4-6).
                     self._child_pid_box[0] = None
 
             self._close_pipes()
+        finally:
+            if got:
+                self._io_lock.release()
 
         fin()
 
@@ -404,10 +442,11 @@ class PythonReplSession:
         posix_spawn-eligible — `fork()` from a multi-threaded Python process
         can deadlock on glibc's malloc mutex; `posix_spawn` (vfork) avoids it.
         """
-        sock_path = f"/tmp/replsock_{uuid.uuid4().hex[:12]}.sock"
-        with suppress(FileNotFoundError):
+        sock_path = str(Path(self._control_dir) / "repl.sock")    # private 0700 dir, not /tmp
+        with suppress(FileNotFoundError, OSError):                 # broadened: a stale path owned otherwise
             os.unlink(sock_path)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stderr_cap = tempfile.TemporaryFile()                     # capture PRE-handshake kernel stderr
         try:
             listener.bind(sock_path)
             listener.listen(1)
@@ -419,8 +458,9 @@ class PythonReplSession:
                 env=spawn_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=stderr_cap,                                # was DEVNULL -> surfaces boot crashes
                 close_fds=True,
+                start_new_session=True,                           # own session/pgrp: killable as a group, terminal Ctrl-C doesn't hit it
             )
 
             listener.settimeout(30.0)
@@ -428,12 +468,18 @@ class PythonReplSession:
                 client_sock, _ = listener.accept()
             except socket.timeout:
                 self._kill_silently()
+                stderr_cap.seek(0)
+                _err = stderr_cap.read().decode("utf-8", "replace").strip()
+                _exit = self._proc.poll() if self._proc is not None else None
                 raise RuntimeError(
-                    f"PLM kernel didn't connect within 30s — the venv at "
-                    f"{self._venv_python!r} may be broken"
+                    f"PLM kernel didn't connect within 30s (venv {self._venv_python!r}; "
+                    f"exit code {_exit})."
+                    + (f"\n--- kernel stderr ---\n{_err[-2000:]}" if _err else
+                       " The kernel produced no stderr before the handshake.")
                 )
         finally:
             listener.close()
+            stderr_cap.close()
             with suppress(FileNotFoundError, OSError):
                 os.unlink(sock_path)
 
@@ -447,7 +493,7 @@ class PythonReplSession:
             # A handshake read must NOT let an internal _CellTimeout/
             # _FrameDecodeError sentinel escape across this public boundary, nor
             # leak the just-spawned child. On ANY read failure: kill the child,
-            # then raise a clean PLM-process error (#14).
+            # then raise a clean PLM-process error.
             try:
                 return self._read_frame_with_timeout(30.0)
             except (_CellTimeout, _FrameDecodeError, EOFError, BrokenPipeError, struct.error) as e:
@@ -470,7 +516,7 @@ class PythonReplSession:
         # Soft EXTRA-policy install warnings captured during boot (a DEFAULT that
         # fails to install is a HARD boot_error above; extras must not brick
         # boot). Surface them once on the next cell instead of losing them to the
-        # reset boot buffer (#26).
+        # reset boot buffer.
         self._pending_boot_stderr = (envelope.get("boot_stderr") or "").strip() or None
 
         if self.cached_vars_blob:
@@ -493,8 +539,13 @@ class PythonReplSession:
 
     def _kill_silently(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
+            # Kill the whole process GROUP (start_new_session put the kernel in its own
+            # session/pgrp == its pid), so any grandchild a cell spawned dies too — not
+            # just the kernel PID.
             with suppress(ProcessLookupError, OSError):
-                self._proc.kill()
+                os.killpg(self._proc.pid, signal.SIGKILL)
+            with suppress(ProcessLookupError, OSError):
+                self._proc.kill()                          # fallback if it wasn't a group leader
             with suppress(subprocess.TimeoutExpired):
                 self._proc.wait(timeout=_REAP_WAIT)
         # This proc is no longer our live child (killed/reaped, or already dead);
@@ -504,14 +555,18 @@ class PythonReplSession:
         self._close_pipes()
 
     def _close_pipes(self) -> None:
+        # Close ONLY one owner of the fd. makefile()'s SocketIO holds a refcount on the
+        # socket and closes it (via _decref_socketios) when it closes; ALSO closing
+        # client_sock would double-close the same fd — risky if a back-to-back respawn
+        # already recycled it.
         if self._sock_io is not None:
             with suppress(Exception):
-                self._sock_io.close()
-            self._sock_io = None
-        if self._client_sock is not None:
+                self._sock_io.close()                  # closes the underlying socket too
+        elif self._client_sock is not None:
             with suppress(Exception):
-                self._client_sock.close()
-            self._client_sock = None
+                self._client_sock.close()              # no SocketIO -> close the socket directly
+        self._sock_io = None
+        self._client_sock = None
         self._req_w = None
         self._resp_r = None
 

@@ -107,8 +107,14 @@ class _PolicyStore(dict):
         dict.__delitem__(self, key)
 
     def pop(self, key, *default):
-        if self._blocked(key):                        # protected: keep it, return current value
-            return dict.__getitem__(self, key)
+        if self._blocked(key):
+            # An immutable default is PROTECTED — it can't be popped/removed. Do NOT
+            # silently return its live value (the caller would believe they removed it):
+            # honor the pop(k[, default]) contract — return `default` if given, else
+            # raise KeyError to signal the key could not be popped.
+            if default:
+                return default[0]
+            raise KeyError(key)
         return dict.pop(self, key, *default)
 
     def popitem(self):
@@ -182,6 +188,12 @@ def _sync() -> None:
     even if its __main__ binding is missing — Guard C must restore it on the
     next post-cell pass, and a mid-cell `del <immutable>` + helper-call cannot
     drop it before then.
+
+    NOTE : `@policy` is the ONLY supported install surface — it writes BOTH
+    the registry AND __main__. A DIRECT registry-only write (`_PLM_POLICIES[n] = x`
+    without binding `n` in __main__) is therefore indistinguishable from a deleted
+    policy here and is SILENTLY EVICTED on the next `_sync`. Future code touching
+    the registry must go through `@policy` / `_install_policy_source`.
     """
     g = _main()
     for n in list(_PLM_POLICIES):
@@ -243,8 +255,10 @@ def _install_policy_source(full_src: str, slot: str) -> None:
     policy object via the normal decorator path, (b) re-execs the stripped
     source under the canonical `<policy-{name}>` slot via `policy()`, and
     (c) registers the result in `_PLM_POLICIES` + `__main__`. The transient
-    `slot` linecache entry stays cached (small, name-stable, used only for
-    install-time tracebacks).
+    `slot` linecache entry is only needed for install-time tracebacks, so it
+    is dropped once the exec SUCCEEDS (the policy now lives in `<policy-{name}>`)
+    — otherwise each distinct dup/bootstrap name would leak a slot. On
+    failure it is left in place so the surfacing traceback can read the source.
 
     Shared by:
       * PREFIX bootstrap loop (installs default LLM policies + extras under
@@ -257,6 +271,7 @@ def _install_policy_source(full_src: str, slot: str) -> None:
     _linecache.cache[slot] = (len(full_src), None, full_src.splitlines(True), slot)
     g = _main()
     exec(compile(full_src, slot, "exec"), g, g)        # @policy resolves via __main__ globals
+    _linecache.cache.pop(slot, None)                   # success: drop the transient install slot
 
 
 # --- duplicate_policy: fork any DUPLICABLE policy into a fresh mutable copy --

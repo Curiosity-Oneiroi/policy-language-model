@@ -2255,3 +2255,61 @@ def test_81_range_kwargs_reject_swapped_bounds_at_build():
     assert Constraint.field(int_range=(0, 9)).validate(5) == 5
     assert Constraint.field(int_range=(0, None)).validate(999) == 999
     assert Constraint.field(int_range=(5, 5)).validate(5) == 5
+
+
+def test_crash_restart_recipe_roundtrip():
+    """to_recipe/from_recipe survive a constraint built by CALLS (Constraint.field /
+    & | ^ ~) across a dill round-trip — the recipe is picklable (the dynamic class is
+    NOT) and the rebuilt constraint validates IDENTICALLY. Structural subclasses return
+    None (they pickle by value)."""
+    import dill
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    def roundtrip(c):
+        r = to_recipe(c)
+        assert r is not None
+        r2 = dill.loads(dill.dumps(r))             # the recipe pickles (the dynamic class does NOT)
+        return from_recipe(r2)
+
+    A = Constraint.field(instance_of=int)
+    B = Constraint.field(instance_of=int, predicate=lambda x: x > 0)
+    cases = [
+        (Constraint.field(instance_of=int, predicate=lambda x: x > 1000), 2000, 5),         # field + predicate
+        (A & B, 5, -1),                                                                      # AND
+        (A | B, 5, "str"),                                                                   # OR
+        (~B, -1, 5),                                                                         # NOT
+        (A & (B | Constraint.field(instance_of=int, predicate=lambda x: x == 0)), 5, -1),    # nested
+    ]
+    for c, good, bad in cases:
+        c2 = roundtrip(c)
+        c2.validate(good)                          # rebuilt accepts the good value
+        assert rejects(c2, bad)                    # rebuilt rejects the bad value
+        assert rejects(c, bad) == rejects(c2, bad)  # ... identically to the original
+
+    # structural subclass -> reconstructed from its fields/defaults/bounds/validators
+    # (pydantic classes can't cross-process dill-pickle, so the snapshot recipes them too).
+    from pydantic import Field, model_validator
+
+    class S(Constraint):
+        name: str = "anon"
+        n: int = Field(ge=0)
+
+        @model_validator(mode="after")
+        def _chk(self):
+            if self.name == "BAD":
+                raise ValueError("bad")
+            return self
+
+    rs = to_recipe(S)
+    assert rs is not None and rs[0] == "structural"
+    S2 = from_recipe(dill.loads(dill.dumps(rs)))    # recipe pickles; class rebuilt
+    assert S2.validate({"n": 3}).name == "anon"     # default preserved
+    assert rejects(S2, {"n": -1})                   # Field bound (ge=0) preserved
+    assert rejects(S2, {"name": "BAD", "n": 0})     # validator preserved

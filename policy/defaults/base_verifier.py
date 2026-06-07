@@ -114,7 +114,11 @@ def base_verifier(messages):
             if role == "verifier":
                 return False                       # already verified since the last signal
             if role == "tool":
-                return any(t in c for t in ("stderr", "Traceback", "Error"))
+                # Anchor on a REAL error section, not the bare word "Error": react_llm
+                # prefixes a failed tool's output with "stderr:" and a captured traceback
+                # contains "Traceback". Dropping "Error" avoids firing on benign prose like
+                # "Error rate: 0.05" or "no errors found".
+                return ("stderr:" in c) or ("Traceback" in c)
         return False
 
     # ===== VERIFICATION(S): each is its own function; you can run several =====
@@ -152,10 +156,10 @@ def base_verifier(messages):
             "You are a verifier. Look over the agent's trajectory and check it is "
             "going soundly — watch for mistakes, unjustified leaps, or anything "
             "that does not add up; verify independently where you can (you have a "
-            "python tool). <customize: what THIS verifier checks, Also you have to"
-            "decsribe each of the things you thing react_llm can do like how to use."
-            "python efficiently that there are some function things about repl etc."
-            "because react_llm is coded from scratch. you have to spell out everything>."
+            "python tool). <customize: spell out exactly what THIS verifier checks. If "
+            "your check hands the circuit a python tool, also describe what that tool can "
+            "do — the REPL helpers in scope and how to use them — since react_llm's "
+            "sub-agent only knows what you tell it.>"
         )
         instruction = (
             "The trajectory is in `trajectory`. Inspect it, flag anything wrong or "
@@ -239,15 +243,25 @@ def base_verifier(messages):
             return                                   # reviewer gave no valid verdict -> don't apply
         if approved is True:
             # APPROVED: the VERIFIER (trusted scope) applies the edit to the LIVE
-            # trajectory via `exec_ns` — a REPL global already in scope (injected by
-            # the kernel like `react_llm` / `parallel`; no import needed) — so the
-            # proposing/approving sub-LLMs never touched the real list. The namespace
-            # IS the sandbox: restricted builtins (list surgery only, no
-            # import/open/...) + `trajectory`.
+            # trajectory via `exec_ns` — a REPL global already in scope (injected by the
+            # kernel like `react_llm` / `parallel`; no import needed) — so the
+            # proposing/approving sub-LLMs never touched the real list. The restricted
+            # builtins (list surgery only — no import/open/eval) raise the bar against the
+            # obvious/accidental reach, but they are NOT a true sandbox (the deliberate
+            # `().__class__.__subclasses__()` walk remains — the same residual the
+            # react_llm ns has; see exec_ns). The REAL gate is the two independent LLM
+            # reviewers above (propose -> approve); this is PLM's OWN code, self-approved.
             _safe = {"len": len, "range": range, "list": list, "dict": dict,
                      "str": str, "enumerate": enumerate, "sorted": sorted}
-            exec_ns(str(code), {"__builtins__": _safe, "trajectory": messages}, slot="verifier-edit")
-            messages.append({"role": "verifier", "content": "applied approved trajectory edit"})
+            out, _term, _val = exec_ns(str(code), {"__builtins__": _safe, "trajectory": messages},
+                                       slot=f"verifier-edit-{len(messages)}")
+            # exec_ns CAPTURES (never raises) a failing edit into `out`; check it so we do
+            # NOT record "applied" for an edit that actually errored.
+            if "Traceback (most recent call last)" in out:
+                messages.append({"role": "verifier",
+                                 "content": "approved trajectory edit FAILED:\n" + out})
+            else:
+                messages.append({"role": "verifier", "content": "applied approved trajectory edit"})
 
     # ===== main flow: gate, then run each verification in turn =====
     if not _should_run(messages):
@@ -257,4 +271,15 @@ def base_verifier(messages):
     #   _verify_propose_approve — a self-checked trajectory EDIT (propose -> approve -> apply).
     _checks = (_verify, _verify_propose_approve)
     for _check in _checks:
-        _check(messages)
+        try:
+            _check(messages)
+        except Exception:
+            # A verifier is an AUXILIARY control circuit — a check that fails (budget
+            # exhausted, a backend error, a bug in a custom check) must NOT abort the
+            # OUTER agent. Swallow and move on; the trajectory is just left un-edited.
+            pass
+    # Record a `verifier`-channel marker UNCONDITIONALLY (the gate keys off it), so a
+    # round where no check produced an edit/note still can't re-fire on the SAME stale
+    # error next round. Skip if a check already left one as the latest message.
+    if messages and messages[-1].get("role") != "verifier":
+        messages.append({"role": "verifier", "content": "verified (no change)"})
