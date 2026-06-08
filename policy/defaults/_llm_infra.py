@@ -133,17 +133,23 @@ def llm_call(depth=None):
 
     `depth=None`        -> no-op (use current scope; nested LLM calls inherit
                            the contextvar value set by an outer descend()).
-    `depth=int`         -> set `_LLM_DEPTH = min(int(depth), current)` for
-                           the scope. PLM can voluntarily LOWER, but cannot
-                           raise above the sealed ceiling. `depth=999` is
-                           silently clamped to `current`.
-    `depth=garbage`     -> treated as None (no-op).
+    `depth=int (>= 0)`  -> set `_LLM_DEPTH = min(depth, current)` for the scope.
+                           PLM can voluntarily LOWER, but cannot raise above the
+                           sealed ceiling. `depth=999` is silently clamped to `current`.
+
+    Depth is validated STRICTLY: it must be None or a NON-NEGATIVE INTEGER. A negative
+    value, a non-integer float (e.g. `1.5`), a bool, or any non-int RAISES ValueError rather
+    than being silently truncated/clamped — a bad depth is a bug, surfaced loudly.
     """
     _check_blessed_caller("llm_call")
-    try:
-        d = None if depth is None else int(depth)
-    except (TypeError, ValueError):
+    if depth is None:
         d = None
+    elif isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+        raise ValueError(
+            "llm_call: depth must be None or a non-negative integer; got " + repr(depth)
+            + " (no silent coercion — a float like 1.5, a negative, or a non-int is rejected)")
+    else:
+        d = depth
 
     @contextmanager
     def _cm():

@@ -21,15 +21,6 @@ def _merge_reasoning_into_content(reasoning: Optional[str], content: str) -> str
     return f"[my prior thinking]\n{r}\n\n[my reply]\n{c}"
 
 # Internal/agent-only kwargs that should never be forwarded to the vLLM API
-_INTERNAL_KWARGS = {
-    "cumulative_prompt_tokens",
-    "chat_template_kwargs",
-    "_tool_name_mapping",
-    "enable_thinking",
-    "thinking_budget",
-    "repetition_penalty",
-}
-
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -97,8 +88,8 @@ class VLLMBackend(BaseModelBackend):
         self.base_url = base_url
         # Expose api_key as a plain attr so PLM's spec builder (a hasattr loop over
         # api_key/base_url/...) round-trips an authenticated vLLM key to the kernel
-        # sub-LLM. #R4-1 added this to OpenAI/Anthropic/Slate but missed VLLM, so a
-        # custom key was silently dropped on the in-kernel from_spec round-trip. (#R6-3)
+        # sub-LLM. added this to OpenAI/Anthropic/Slate but missed VLLM, so a
+        # custom key was silently dropped on the in-kernel from_spec round-trip.
         self.api_key = api_key
 
         # Initialise base first so self.logger / self.model / tool cache state exist.
@@ -128,7 +119,7 @@ class VLLMBackend(BaseModelBackend):
         # requests.get(base_url + "/models") probe on EVERY in-cell generate (the
         # worker_context cache is None on the kernel path). Fall back to the
         # round-tripped value so the round-trip is lossless and the probe is gone;
-        # an explicit "max_context_override" still wins. (#R5-4)
+        # an explicit "max_context_override" still wins.
         if max_context_override is None:
             max_context_override = spec.get("max_context_length")
 
@@ -295,7 +286,11 @@ class VLLMBackend(BaseModelBackend):
         safety_margin = 2000
         available_tokens = self.max_context_length - estimated_input_tokens - safety_margin
         requested_max_tokens = kwargs.get("max_tokens", 32768)
-        actual_max_tokens = min(requested_max_tokens, max(1024, available_tokens))
+        if available_tokens <= 0:                          # input fills/overflows the window
+            raise ValueError(
+                f"input (~{estimated_input_tokens:,} tokens + {safety_margin} safety margin) leaves "
+                f"no output room in the {self.max_context_length:,}-token context window")
+        actual_max_tokens = max(1, min(requested_max_tokens, available_tokens))   # cap at REAL available, no 1024 floor
 
         if actual_max_tokens < requested_max_tokens:
             token_source = "actual" if cumulative_prompt_tokens is not None else "estimated"
@@ -428,7 +423,11 @@ class VLLMBackend(BaseModelBackend):
         safety_margin = 2000
         available_tokens = self.max_context_length - estimated_input_tokens - safety_margin
         requested_max_tokens = kwargs.get("max_tokens", 16384)
-        actual_max_tokens = min(requested_max_tokens, max(1024, available_tokens))
+        if available_tokens <= 0:                          # input fills/overflows the window
+            raise ValueError(
+                f"input (~{estimated_input_tokens:,} tokens + {safety_margin} safety margin) leaves "
+                f"no output room in the {self.max_context_length:,}-token context window")
+        actual_max_tokens = max(1, min(requested_max_tokens, available_tokens))   # cap at REAL available, no 1024 floor
 
         if actual_max_tokens < requested_max_tokens:
             token_source = "actual" if cumulative_prompt_tokens is not None else "estimated"

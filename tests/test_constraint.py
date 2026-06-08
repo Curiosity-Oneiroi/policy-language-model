@@ -129,16 +129,16 @@ def test_of_dict_of():
 
 
 # =============================================================================
-# 8 — instance_of an arbitrary class
+# 8 — is_instance_of an arbitrary class
 # =============================================================================
 
 
-def test_of_instance_of_arbitrary_class():
+def test_of_is_instance_of_arbitrary_class():
     class MCTS:
         def __init__(self, depth):
             self.depth = depth
 
-    c = Constraint.of(instance_of=MCTS, description="an MCTS policy")
+    c = Constraint.of(is_instance_of=MCTS, description="an MCTS policy")
     m = MCTS(depth=3)
     assert c.validate(m) is m
 
@@ -874,7 +874,7 @@ def test_w3_kind_plus_int_range_rejected_at_compose():
     with pytest.raises(ValueError, match="multiple type-shifting groups"):
         Constraint.of(kind="semver", int_range=(0, 9))
     with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.of(instance_of=int, str_pattern=r"^x$")
+        Constraint.of(is_instance_of=int, str_pattern=r"^x$")
     with pytest.raises(ValueError, match="multiple type-shifting groups"):
         Constraint.of(one_of=["a", "b"], int_range=(0, 9))
 
@@ -1042,7 +1042,7 @@ def test_json_schema_factory_preserves_defs_for_nested_model():
     (lambda: Constraint.of(sorted=True),          123),             # not iterable
     (lambda: Constraint.of(monotonic=True),       [1, "a"]),        # not comparable
     (lambda: Constraint.of(monotonic=True),       123),             # not iterable
-    (lambda: Constraint.of(kind="path_exists"),   123),             # wrong type (#13)
+    (lambda: Constraint.of(kind="path_exists"),   123),             # wrong type
 ])
 def test_37_predicate_typeerror_becomes_constraint_violation(ctor, bad_value):
     c = ctor()
@@ -1061,7 +1061,7 @@ def test_37b_sorted_does_not_consume_generator_then_pass():
 
 # =============================================================================
 # 38 — composite validate keeps non-ConstraintViolation child errors inside the
-#      contract (#6): a structural child whose @model_validator raises a raw
+#      contract: a structural child whose @model_validator raises a raw
 #      non-ValueError (KeyError/TypeError) must surface as ConstraintViolation,
 #      and OR/XOR must still try the OTHER branch instead of letting it escape.
 # =============================================================================
@@ -1073,7 +1073,7 @@ def test_38_composite_non_violation_exception_stays_in_contract():
         def _boom(self):
             raise KeyError("structural validator raised a non-ValueError")
 
-    okdict = Constraint.of(instance_of=dict)
+    okdict = Constraint.of(is_instance_of=dict)
 
     # AND: erroring child -> ConstraintViolation (NOT a raw KeyError).
     with pytest.raises(ConstraintViolation):
@@ -1089,7 +1089,7 @@ def test_38_composite_non_violation_exception_stays_in_contract():
 
 # =============================================================================
 # 39 — not_one_of= with UNHASHABLE members builds (no raw TypeError) and still
-#      enforces membership (#20); mirrors one_of= tolerance.
+#      enforces membership; mirrors one_of= tolerance.
 # =============================================================================
 
 def test_39_not_one_of_unhashable_members():
@@ -1101,7 +1101,7 @@ def test_39_not_one_of_unhashable_members():
 
 # =============================================================================
 # 40 — NOT composite describe() uses a single-child-appropriate header for a
-#      multi-line child, never the misleading "NOT all of:" (#30).
+#      multi-line child, never the misleading "NOT all of:".
 # =============================================================================
 
 def test_40_not_describe_single_child_header():
@@ -1116,7 +1116,7 @@ def test_40_not_describe_single_child_header():
 
 # =============================================================================
 # 41 — stacked exactly_one_of with field-name tuples that JOIN to the same
-#      string keep BOTH rules (#1): ("a_b","c") and ("a","b_c") both ->
+#      string keep BOTH rules: ("a_b","c") and ("a","b_c") both ->
 #      "_exactly_one_of_a_b_c"; neither validator may shadow the other.
 # =============================================================================
 
@@ -1137,7 +1137,7 @@ def test_41_exactly_one_of_colliding_names_both_enforced():
 
 # =============================================================================
 # 42 — struct-only `&` auto-merge keeps BOTH parents' validators even when they
-#      share a method name (#7) — model_validators and field_validators.
+#      share a method name — model_validators and field_validators.
 # =============================================================================
 
 def test_42_struct_and_keeps_both_colliding_model_validators():
@@ -1198,7 +1198,7 @@ def test_42b_struct_and_keeps_both_colliding_field_validators():
 
 # =============================================================================
 # 43 — struct-`&` auto-merge TIGHTENS conflicting field bounds (intersection),
-#      not pydantic last-wins which could LOOSEN them (#17). Order-independent.
+#      not pydantic last-wins which could LOOSEN them. Order-independent.
 # =============================================================================
 
 def test_43_struct_and_tightens_numeric_bounds():
@@ -1893,7 +1893,7 @@ def test_72_struct_and_merges_same_name_field_fields():
 
 def test_73_subset_superset_tolerate_unhashable_members():
     """subset_of/superset_of must not leak a raw TypeError on UNHASHABLE members
-    (mirrors not_one_of #R4-4) — they compare element-wise (==), not via set()."""
+    (mirrors not_one_of) — they compare element-wise (==), not via set()."""
     for ctor in (Constraint.of, Constraint.field):
         c = ctor(subset_of=[[1], [2], [3]])          # unhashable members: builds cleanly
         assert c.validate([[1], [2]]) == [[1], [2]]
@@ -2278,14 +2278,14 @@ def test_crash_restart_recipe_roundtrip():
         r2 = dill.loads(dill.dumps(r))             # the recipe pickles (the dynamic class does NOT)
         return from_recipe(r2)
 
-    A = Constraint.field(instance_of=int)
-    B = Constraint.field(instance_of=int, predicate=lambda x: x > 0)
+    A = Constraint.field(is_instance_of=int)
+    B = Constraint.field(is_instance_of=int, predicate=lambda x: x > 0)
     cases = [
-        (Constraint.field(instance_of=int, predicate=lambda x: x > 1000), 2000, 5),         # field + predicate
+        (Constraint.field(is_instance_of=int, predicate=lambda x: x > 1000), 2000, 5),         # field + predicate
         (A & B, 5, -1),                                                                      # AND
         (A | B, 5, "str"),                                                                   # OR
         (~B, -1, 5),                                                                         # NOT
-        (A & (B | Constraint.field(instance_of=int, predicate=lambda x: x == 0)), 5, -1),    # nested
+        (A & (B | Constraint.field(is_instance_of=int, predicate=lambda x: x == 0)), 5, -1),    # nested
     ]
     for c, good, bad in cases:
         c2 = roundtrip(c)
@@ -2313,3 +2313,417 @@ def test_crash_restart_recipe_roundtrip():
     assert S2.validate({"n": 3}).name == "anon"     # default preserved
     assert rejects(S2, {"n": -1})                   # Field bound (ge=0) preserved
     assert rejects(S2, {"name": "BAD", "n": 0})     # validator preserved
+
+
+def test_crash_restart_recipe_nested_constraints():
+    """H1: a Constraint NESTED inside another (struct field typed as a Constraint, a
+    `Constraint.field(...)`-typed field, a Constraint inside a factory kwarg, or one wrapped
+    in Optional/List) is itself an unpicklable class — the recipe must recurse and store it
+    as a NESTED recipe, not keep it live. Before the fix to_recipe kept the inner class:
+    a by-reference struct (`addr: Address`) made dill `loads` fail (sinking the whole
+    snapshot), and a `.field()`-typed annotation simply failed to pickle (silent drop)."""
+    import dill
+    from typing import Optional
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    def roundtrip(c):
+        r = to_recipe(c)
+        assert r is not None
+        dill.dumps(r)                                  # the recipe MUST pickle (the old bug: it could not)
+        return from_recipe(dill.loads(dill.dumps(r)))
+
+    # (a) struct field typed as another STRUCTURAL Constraint (was: by-ref -> sinks snapshot)
+    class Address(Constraint):
+        city: str
+
+    class Person(Constraint):
+        name: str
+        addr: Address
+
+    P2 = roundtrip(Person)
+    assert P2.validate({"name": "x", "addr": {"city": "NYC"}}).addr.city == "NYC"
+    assert rejects(P2, {"name": "x", "addr": {"city": 123}})   # nested rule still enforced
+
+    # (b) `Constraint.field(...)`-typed field (the README's canonical Pattern-2)
+    class Order(Constraint):
+        currency: Constraint.field(one_of=["USD", "EUR"])
+        qty: Constraint.field(int_range=(1, 100))
+
+    O2 = roundtrip(Order)
+    g = O2.validate({"currency": "USD", "qty": 10})
+    assert g.currency == "USD" and g.qty == 10
+    assert rejects(O2, {"currency": "GBP", "qty": 10})         # one_of preserved
+    assert rejects(O2, {"currency": "USD", "qty": 999})        # int_range preserved
+
+    # (c) a Constraint nested inside a factory kwarg (list_of=Constraint.field(...))
+    N2 = roundtrip(Constraint.field(list_of=Constraint.field(int_range=(1, 5))))
+    assert N2.validate([1, 2, 3]) == [1, 2, 3]
+    assert rejects(N2, [1, 99])
+
+    # (d) a nested Constraint wrapped in a generic (Optional[Address])
+    class Maybe(Constraint):
+        who: Optional[Address] = None
+
+    M2 = roundtrip(Maybe)
+    assert M2.validate({}).who is None
+    assert M2.validate({"who": {"city": "LA"}}).who.city == "LA"
+
+
+def test_crash_restart_recipe_same_name_validators_survive():
+    """H2: two validators that share a func __name__ must BOTH survive a recipe round-trip.
+    Before the fix from_recipe keyed the rebuilt namespace by func.__name__, so a colliding
+    name dropped one rule silently. Two reachable triggers: stacked @exactly_one_of (both
+    inner funcs named `_check`) and an auto-merged `A & B` (both named `_ck`)."""
+    import dill
+    from typing import Optional
+    from pydantic import model_validator
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    def roundtrip(c):
+        return from_recipe(dill.loads(dill.dumps(to_recipe(c))))
+
+    # (1) stacked exactly_one_of — both inner validators are named `_check`
+    @Constraint.exactly_one_of("a", "b")
+    @Constraint.exactly_one_of("c", "d")
+    class X(Constraint):
+        a: Optional[int] = None
+        b: Optional[int] = None
+        c: Optional[int] = None
+        d: Optional[int] = None
+
+    X2 = roundtrip(X)
+    assert not rejects(X2, {"a": 1, "c": 1})         # one of (a,b) + one of (c,d) -> ok
+    assert rejects(X2, {"a": 1, "c": 1, "d": 1})     # (c,d) rule must STILL fire (was dropped)
+    assert rejects(X2, {"a": 1, "b": 1, "c": 1})     # (a,b) rule must STILL fire
+
+    # (2) auto-merged A & B — both model_validators are named `_ck`
+    class A(Constraint):
+        lo: int
+
+        @model_validator(mode="after")
+        def _ck(self):
+            if self.lo < 0:
+                raise ValueError("lo<0")
+            return self
+
+    class B(Constraint):
+        hi: int
+
+        @model_validator(mode="after")
+        def _ck(self):
+            if self.hi < 0:
+                raise ValueError("hi<0")
+            return self
+
+    M2 = roundtrip(A & B)
+    assert not rejects(M2, {"lo": 1, "hi": 1})
+    assert rejects(M2, {"lo": -1, "hi": 1})          # A's rule survives
+    assert rejects(M2, {"lo": 1, "hi": -1})          # B's rule survives (was dropped by the collision)
+
+
+def test_crash_restart_recipe_field_fidelity():
+    """H3 (universal): a structural recipe must reconstruct fields FAITHFULLY, not from a
+    shallow read. The old code carried only annotation + bounds + the bare `fi.default`, so
+    it silently lost `default_factory` (field -> REQUIRED), every other FieldInfo attr
+    (alias/description/json_schema_extra/...), AND `model_config` (extra/frozen/...). The fix
+    captures `fi._attributes_set` + metadata + `model_config`."""
+    import dill
+    from typing import Optional
+    from pydantic import Field, ConfigDict
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    class Rich(Constraint):
+        model_config = ConfigDict(extra="forbid")
+        req: int                                       # required, no default
+        bare: int = 7                                  # bare default
+        opt: Optional[int] = None
+        tags: list = Field(default_factory=list)       # the H3 headline
+        cur: int = Field(default=1, alias="currency", description="the currency")
+        score: int = Field(ge=0, le=100, default=50)
+        notes: str = Field(default="x", json_schema_extra={"hint": "yo"})
+
+    R = from_recipe(dill.loads(dill.dumps(to_recipe(Rich))))
+    base = {"req": 1, "currency": 2}                    # 'currency' is cur's alias
+    g = R.validate(base)
+    assert g.tags == []                                # default_factory -> [] (NOT required)
+    assert g.bare == 7 and g.opt is None and g.score == 50
+    assert g.cur == 2                                  # alias honored
+    assert R.model_fields["cur"].description == "the currency"
+    assert R.model_fields["notes"].json_schema_extra == {"hint": "yo"}
+    assert rejects(R, {"currency": 2})                 # 'req' still required
+    assert rejects(R, {**base, "score": 999})          # ge/le bound preserved
+    assert rejects(R, {**base, "zzz": 9})              # model_config extra=forbid preserved
+
+
+def test_crash_restart_recipe_generator_kwargs_survive():
+    """H4: a one-shot iterable passed to Constraint.field (one_of/coercers/...) is consumed
+    by the time field() snapshots its recipe kwargs. The facade must record INNER's
+    already-MATERIALIZED kwargs, not its own raw (now-exhausted) generator — else
+    from_recipe rebuilds with an empty sequence (crash on one_of, silent no-op on
+    coercers/predicates)."""
+    import dill
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    def roundtrip(c):
+        return from_recipe(dill.loads(dill.dumps(to_recipe(c))))
+
+    # generator one_of: the recipe must carry the MATERIALIZED list, not an exhausted gen
+    c = Constraint.field(one_of=(x for x in ["USD", "EUR"]))
+    assert to_recipe(c)[1] == {"one_of": ["USD", "EUR"]}     # materialized at snapshot time
+    c2 = roundtrip(c)
+    assert not rejects(c2, "USD") and rejects(c2, "GBP")
+
+    # generator coercers: normalize-then-check must survive (a silent no-op if dropped)
+    c3 = roundtrip(Constraint.field(coercers=(f for f in [str.strip, str.upper]), one_of=["USD", "EUR"]))
+    assert not rejects(c3, "  usd ")                          # coerced to "USD" -> accepted
+    assert rejects(c3, "gbp")
+
+
+def test_crash_restart_recipe_namespace_fidelity():
+    """NC-6 + structural-recipe audit: the recipe must reconstruct the FULL user namespace.
+    Before: validators were stored as BOUND classmethods (dragging the whole old class into
+    the pickle AND binding the rebuilt validator to the DEAD class), and ClassVars + methods
+    were dropped — so a `cls.MAX`-reading validator only 'worked' by reading the OLD class via
+    the bound-method bug. Now validators are UNWRAPPED to plain functions and ClassVars/methods
+    survive, so the validator binds to the NEW class."""
+    import dill
+    from typing import ClassVar
+    from pydantic import field_validator
+    from plm.constraint import to_recipe, from_recipe
+
+    def rejects(c, v):
+        try:
+            c.validate(v)
+            return False
+        except Exception:
+            return True
+
+    class Acc(Constraint):
+        MAX: ClassVar[int] = 100
+        amount: int
+
+        @field_validator("amount")
+        @classmethod
+        def _under_max(cls, v):
+            if v > cls.MAX:                          # reads the ClassVar -> must bind to the NEW class
+                raise ValueError("over max")
+            return v
+
+        def doubled(self):                           # a plain method -> must survive
+            return self.amount * 2
+
+    blob = dill.dumps(to_recipe(Acc))
+    assert len(blob) < 2500, len(blob)               # no old-class drag (the bound classmethod was ~5 KB)
+    A2 = from_recipe(dill.loads(blob))
+    assert A2 is not Acc
+    assert getattr(A2, "MAX", None) == 100           # ClassVar preserved
+    assert A2.validate({"amount": 5}).doubled() == 10  # method preserved
+    assert rejects(A2, {"amount": 200})              # validator runs against MAX
+    A2.MAX = 10                                       # the validator binds to the NEW class...
+    assert rejects(A2, {"amount": 50})               # 50 > new MAX(10) -> reject (was masked by old-class bind)
+    assert not rejects(A2, {"amount": 5})
+
+
+def test_all_constraint_shapes_rehydrate_via_recipe():
+    """EXHAUSTIVE: every constraint shape, all four ops (& | ^ ~) and their combinations, and
+    every structural feature must round-trip through `to_recipe -> from_recipe` and BEHAVE
+    identically. Proves this round's recipe rework missed no shape. (Cross-process survival —
+    incl. lambda predicates + validators dill-pickling across the kernel socket — is covered by
+    the kernel crash-restart integration tests.)"""
+    from typing import ClassVar, Optional
+    from pydantic import field_validator, BaseModel
+    from plm.constraint.snapshot import to_recipe, from_recipe
+
+    def rt(c):
+        r = to_recipe(c)
+        assert r is not None, "expected a recipe (not the dill fallback)"
+        return from_recipe(r)
+
+    def outcome(c, v):
+        try:
+            out = c.validate(v)
+            return ("ok", out.model_dump() if isinstance(out, BaseModel) else out)
+        except Exception as e:
+            return ("err", type(e).__name__)
+
+    of = Constraint.of
+    cases = [
+        ("int_range", of(int_range=(0, 9)), [5, -1, 10]),
+        ("float_gt/lt", of(float_gt=0.0, float_lt=1.0), [0.5, 0.0, 1.0]),
+        ("one_of", of(one_of=["a", "b"]), ["a", "c"]),
+        ("not_one_of", of(not_one_of=["x"]), ["y", "x"]),
+        ("str_pattern+len", of(str_pattern=r"^[A-Z]+$", str_length=(2, 5)), ["ABC", "ab", "ABCDEF"]),
+        ("list unique+sorted+nested", of(list_of=of(int_range=(0, 9)), list_length=(1, 3),
+                                         unique=True, sorted=True), [[1, 2, 3], [1, 1], [3, 2, 1], [1, 2, 99]]),
+        ("dict_of nested", of(dict_of=(str, of(float_le=1.0))), [{"a": 0.5}, {"a": 1.5}]),
+        ("set_of", of(set_of=int), [{1, 2}, {1, 2.5}]),
+        ("tuple_of", of(tuple_of=int), [(1, 2), (1, "a")]),
+        ("coercer", of(coercer=str.upper, one_of=["AB"]), ["ab", "xy"]),
+        ("coercers chain", of(coercers=[str.strip, str.upper], one_of=["AB"]), [" ab ", "x"]),
+        ("multiple_of", of(multiple_of=3), [9, 10]),
+        ("str_prefix/suffix", of(str_prefix="a", str_suffix="z"), ["abz", "bz", "ab"]),
+        ("is_instance_of", of(is_instance_of=int), [5, "5", 5.0, True]),   # strict survives rehydrate
+    ]
+    A, B, C = of(int_ge=0), of(int_le=10), of(not_one_of=[5])
+    cases += [
+        ("A & B", A & B, [3, -1, 11]), ("A | B", A | B, [3, -1, 11, 100]),
+        ("A ^ B", A ^ B, [3, -1, 100]), ("~A", ~A, [-1, 3]),
+        ("A & B & C", A & B & C, [3, 5, -1]), ("(A|B)&C", (A | B) & C, [3, 5, -1]),
+        ("~(A&B)", ~(A & B), [3, -1]), ("A & ~C", A & ~C, [5, 3, -1]),
+        ("(A^B)|C", (A ^ B) | C, [3, 100, 5]),
+    ]
+
+    class Basic(Constraint):
+        name: str
+        score: int = Field(ge=0, le=100)
+
+    class WithFV(Constraint):
+        x: int
+        @field_validator("x")
+        @classmethod
+        def _pos(cls, v):
+            if v <= 0:
+                raise ValueError("pos")
+            return v
+
+    class WithMV(Constraint):
+        a: int
+        b: int
+        @model_validator(mode="after")
+        def _s(self):
+            if self.a + self.b > 10:
+                raise ValueError("sum")
+            return self
+
+    class WithCV(Constraint):
+        MAX: ClassVar[int] = 7
+        v: int
+        @field_validator("v")
+        @classmethod
+        def _le(cls, val):
+            if val > cls.MAX:
+                raise ValueError("max")
+            return val
+
+    class WithOpt(Constraint):
+        x: Optional[int] = None
+
+    class Inner(Constraint):
+        k: int = Field(ge=0)
+
+    class Outer(Constraint):
+        inner: Inner
+
+    @Constraint.exactly_one_of("a", "b")
+    class XOne(Constraint):
+        a: Optional[int] = None
+        b: Optional[int] = None
+
+    class Lo(Constraint):
+        x: int = Field(ge=10)
+
+    class Hi(Constraint):
+        x: int = Field(ge=0)
+
+    cases += [
+        ("struct Basic+Field", Basic, [{"name": "x", "score": 50}, {"name": "x", "score": 200}]),
+        ("struct field_validator", WithFV, [{"x": 5}, {"x": -1}]),
+        ("struct model_validator", WithMV, [{"a": 2, "b": 3}, {"a": 9, "b": 9}]),
+        ("struct ClassVar+method", WithCV, [{"v": 5}, {"v": 8}]),
+        ("struct Optional", WithOpt, [{"x": 1}, {}, {"x": None}]),
+        ("struct nested constraint", Outer, [{"inner": {"k": 1}}, {"inner": {"k": -1}}]),
+        ("struct exactly_one_of", XOne, [{"a": 1}, {"a": 1, "b": 2}, {}]),
+        ("struct composite Lo&Hi", Lo & Hi, [{"x": 12}, {"x": 5}, {"x": -1}]),
+    ]
+
+    for label, c, probes in cases:
+        assert (c.describe() or "").strip(), label   # every shape also DESCRIBES without crashing
+        rebuilt = rt(c)
+        for v in probes:
+            assert outcome(c, v) == outcome(rebuilt, v), (label, v)
+    assert len(cases) == 31                          # 14 scalar + 9 composite + 8 structural
+
+
+def test_describe_robust_against_pathological_member():
+    """NC-8: describe() must not crash on a class member whose descriptor `__get__` raises a
+    non-AttributeError — the `dir(cls)` walk's `getattr`, and `get_description`'s `.wrapped` /
+    `.__func__` descend, are both guarded. The bad member is skipped; the rest renders. And
+    `get_description` is robust for EVERY caller (returns None, never raises)."""
+    from typing import ClassVar
+    from plm.constraint.decorator import get_description
+
+    class Raising:
+        def __get__(self, obj, owner):
+            raise RuntimeError("boom-getter")
+
+    class Bad(Constraint):
+        x: int = 0
+        sneaky: ClassVar = Raising()                 # descriptor that raises on class access
+
+    d = Bad.describe()                               # must NOT raise
+    assert isinstance(d, str) and "x" in d           # renders; the raising member is skipped
+    assert get_description(Raising()) is None         # robust for any caller, never propagates
+
+
+def test_is_instance_of_is_strict_no_coercion():
+    """NC-9: `is_instance_of=T` is a STRICT type check (pydantic Strict) — NO coercion. For a
+    builtin it rejects other types INCLUDING a bool for int (a bool is not a real int). For an
+    arbitrary class it stays an isinstance check (Strict can't annotate an is-instance schema,
+    and such classes don't coerce). The old `instance_of=` name is gone (renamed)."""
+    of = Constraint.of
+
+    ci = of(is_instance_of=int)
+    assert ci.validate(5) == 5
+    for bad in ("5", 5.0, True):                      # string / float / bool all rejected (no coercion)
+        with pytest.raises(ConstraintViolation):
+            ci.validate(bad)
+
+    cs = of(is_instance_of=str)
+    assert cs.validate("x") == "x"
+    with pytest.raises(ConstraintViolation):
+        cs.validate(5)
+
+    cb = of(is_instance_of=bool)
+    assert cb.validate(True) is True
+    with pytest.raises(ConstraintViolation):
+        cb.validate(1)                               # an int is not a bool
+
+    class W:                                          # arbitrary class -> isinstance (unchanged)
+        pass
+    w = W()
+    cw = of(is_instance_of=W)
+    assert cw.validate(w) is w
+    with pytest.raises(ConstraintViolation):
+        cw.validate("x")
+
+    with pytest.raises(Exception):                    # old name removed
+        of(instance_of=int)
+    assert "strictly an instance of int" in of(is_instance_of=int).describe()

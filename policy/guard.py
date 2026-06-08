@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import ast
 
-from .registry import _IMMUTABLE_POLICIES, _MISSING, _PLM_POLICIES
+from .registry import _SEALED_POLICIES, _MISSING, _PLM_POLICIES
 
 
 def _names_in_target(target):
@@ -140,16 +140,44 @@ def _names_in_pattern(p):
             yield from _names_in_pattern(sub)
 
 
+def _enclosing_scope_nodes(child):
+    """The subtrees of a nested def/lambda/class that evaluate in the ENCLOSING scope (NOT the
+    body): default values, decorators, base classes, class keywords, and every annotation. A
+    binding form here (e.g. `def f(x=(predict := 5)): ...`) rebinds an OUTER name, so it must
+    still be audited even though the body is a separate scope."""
+    out = []
+    args = getattr(child, "args", None)
+    if args is not None:
+        out += [d for d in getattr(args, "defaults", []) if d is not None]
+        out += [d for d in getattr(args, "kw_defaults", []) if d is not None]
+        for a in (list(getattr(args, "posonlyargs", [])) + list(getattr(args, "args", []))
+                  + list(getattr(args, "kwonlyargs", []))
+                  + [getattr(args, "vararg", None), getattr(args, "kwarg", None)]):
+            if a is not None and getattr(a, "annotation", None) is not None:
+                out.append(a.annotation)
+    out += list(getattr(child, "decorator_list", []))
+    out += list(getattr(child, "bases", []))
+    out += list(getattr(child, "keywords", []))
+    if getattr(child, "returns", None) is not None:
+        out.append(child.returns)
+    return out
+
+
 def _audit_extras(node, names, immutable_names):
     """Reject the enclosing-scope binding forms `_binding_targets` misses — walrus
     (`x := ...`), `except ... as x`, match captures, and 3.12 `type x = ...` — that
     would rebind a registered policy name. Guard C reverts them post-cell regardless;
-    this is the friendly FAIL-LOUD before the cell runs. Skips nested function / class /
-    lambda scopes (their bindings are local there). (P-F6)"""
+    this is the friendly FAIL-LOUD before the cell runs. A nested function / class / lambda's
+    BODY is a separate scope (skipped), but its SIGNATURE positions evaluate here, so they are
+    substituted in and audited too."""
     _TypeAlias = getattr(ast, "TypeAlias", ())
+    children = []
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue                            # separate scope
+            children.extend(_enclosing_scope_nodes(child))   # body skipped; signature audited
+        else:
+            children.append(child)
+    for child in children:
         if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
             if child.target.id in names:
                 return _rebind_msg(child.target.id, "walrus `:=`", immutable_names)
@@ -182,7 +210,7 @@ def _post_cell_guard(cell_globals, stderr_buf):
         if binding is canonical:
             continue                            # OK
         if binding is _MISSING:
-            if name in _IMMUTABLE_POLICIES:
+            if name in _SEALED_POLICIES:
                 # Immutable policy was dynamically del'd / popped from __main__.
                 # Restore the binding from the registry (which `_sync` never
                 # evicted for immutable names).
@@ -198,7 +226,7 @@ def _post_cell_guard(cell_globals, stderr_buf):
         cell_globals[name] = canonical          # rebound -> restore + note
         tail = (
             f"It is immutable; use `duplicate_policy({name!r}, '<new_name>')` to fork."
-            if name in _IMMUTABLE_POLICIES else
+            if name in _SEALED_POLICIES else
             f"Use {name}._rewrite(...) to edit or `del {name}`/{name}._remove() to remove."
         )
         stderr_buf.write(

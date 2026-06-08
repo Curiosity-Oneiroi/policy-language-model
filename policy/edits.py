@@ -112,7 +112,7 @@ def _compute_edit(src: str, old: str, new: str, replace_all: bool):
 # The FULL set of line boundaries `str.splitlines()` breaks on — checking only
 # '\n'/'\r' in the newline guards below would mis-handle a line that ends in one
 # of the others (e.g. \v in a string literal, \u2028 in a comment): the guard
-# would wrongly append a spurious '\n' right after the existing separator (#11).
+# would wrongly append a spurious '\n' right after the existing separator.
 _LINE_BOUNDARIES = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"  # full str.splitlines() set
 
 

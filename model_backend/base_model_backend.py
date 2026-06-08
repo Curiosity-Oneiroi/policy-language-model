@@ -96,7 +96,12 @@ class BaseModelBackend(ModelBackend):
             if role == "verifier":          # private verifier channel — never sent to the model
                 continue
             allowed = self._ALLOWED_MESSAGE_KEYS.get(role, {"role", "content"})
-            out.append({k: v for k, v in msg.items() if k in allowed})
+            # Drop None-valued OPTIONAL keys (tool_calls/reasoning/name) so a `tool_calls: None`
+            # or `reasoning: None` doesn't bloat the wire or trip a strict provider validator;
+            # keep role + content even if None (content: None is valid on a tool-call-only
+            # assistant turn).
+            out.append({k: v for k, v in msg.items()
+                        if k in allowed and (v is not None or k in ("role", "content"))})
         return out
 
     # -------------------------------------------------------------------------
@@ -187,6 +192,8 @@ class BaseModelBackend(ModelBackend):
             if msg.get("tool_calls"):
                 sanitized_tool_calls = []
                 for tc in msg["tool_calls"]:
+                    if not isinstance(tc, dict):          # defense: drop a malformed (non-dict)
+                        continue                          # tool_call instead of crashing on .copy()
                     tc_copy = tc.copy()
                     if tc_copy.get("function") and tc_copy["function"].get("name"):
                         original_name = tc_copy["function"]["name"]

@@ -167,13 +167,17 @@ def test_getsource_and_signature_and_repr():
     assert "return state * 2" in _inspect.getsource(predict._inner)  # linecache synced
 
 
-def test_async_and_argcount_change():
-    import asyncio
+def test_argcount_change_and_async_rewrite_refused():
+    """A rewrite may change the signature (argcount), but the repl is SYNCHRONOUS, so a rewrite
+    to `async def` is REFUSED — the old sync policy is kept intact."""
     @policy
     def predict(s):
         return s
-    predict._rewrite("async def predict(s, n):\n    return s * n\n")   # sync -> async, +arg
-    assert asyncio.run(predict("a", 3)) == "aaa"
+    predict._rewrite("def predict(s, n):\n    return s * n\n")         # sync argcount change works
+    assert predict("a", 3) == "aaa"
+    with pytest.raises(TypeError, match="SYNCHRONOUS"):
+        predict._rewrite("async def predict(s, n):\n    return s * n\n")
+    assert predict("a", 3) == "aaa"                                    # unchanged + still sync
 
 
 def test_closure_warning_then_nameerror(capsys):
@@ -676,9 +680,9 @@ def test_int_crash_restart_constraints_survive():
         # class with a default, a Field bound, and a validator (reconstructed from fields).
         s.execute_cell(
             "from pydantic import Field, model_validator\n"
-            "field_c = Constraint.field(instance_of=int, predicate=lambda x: x > 100)\n"
-            "comp_c = Constraint.field(instance_of=int) & "
-            "Constraint.field(instance_of=int, predicate=lambda x: x > 0)\n"
+            "field_c = Constraint.field(is_instance_of=int, predicate=lambda x: x > 100)\n"
+            "comp_c = Constraint.field(is_instance_of=int) & "
+            "Constraint.field(is_instance_of=int, predicate=lambda x: x > 0)\n"
             "class StructC(Constraint):\n"
             "    name: str = 'anon'\n"
             "    n: int = Field(ge=0)\n"
@@ -704,6 +708,198 @@ def test_int_crash_restart_constraints_survive():
             "print(_rej(field_c, 5), _rej(comp_c, -1), "
             "_rej(StructC, {'n': -1}), _rej(StructC, {'name': 'BAD', 'n': 0}))")
         assert r2["stdout"].strip() == "True True True True", r2
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_nested_constraints_survive():
+    """H1 — a Constraint NESTED inside another survives a hard respawn. Before the fix the
+    recipe kept the inner class live: `addr: Address` (a struct field typed as another
+    structural Constraint) pickled BY-REFERENCE and made the rehydrate `dill.loads` fail,
+    SINKING THE WHOLE SNAPSHOT (sibling vars + all policies gone); a `Constraint.field(...)`-
+    typed field (the README's Pattern-2) and a `list_of=Constraint.field(...)` factory kwarg
+    were silently dropped. Now to_recipe recurses into nested Constraints."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=15.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell(
+            "class Address(Constraint):\n    city: str\n"
+            "class Person(Constraint):\n    name: str\n    addr: Address\n"
+            "class Order(Constraint):\n"
+            "    currency: Constraint.field(one_of=['USD','EUR'])\n"
+            "    qty: Constraint.field(int_range=(1,100))\n"
+            "nested = Constraint.field(list_of=Constraint.field(int_range=(1,5)))\n"
+            "some_var = 42\n")                          # a plain sibling: must NOT be sunk
+        ep = s.kernel_epoch
+        r0 = s.execute_cell("import os as _o\n_o._exit(0)")   # hard crash -> respawn + rehydrate
+        assert s.kernel_epoch > ep, "expected a respawn"
+        assert not r0.get("rehydrate_error"), r0.get("rehydrate_error")  # snapshot must NOT be sunk
+        r = s.execute_cell(
+            "print(globals().get('some_var'), "
+            "Order.validate({'currency':'USD','qty':10}).qty, "
+            "nested.validate([1,2,3]), "
+            "Person.validate({'name':'x','addr':{'city':'NYC'}}).addr.city)")
+        assert r["stdout"].strip() == "42 10 [1, 2, 3] NYC", r
+        # nested rules still ENFORCED after the respawn
+        r2 = s.execute_cell(
+            "def _rej(c, v):\n"
+            "    try:\n"
+            "        c.validate(v); return False\n"
+            "    except Exception:\n"
+            "        return True\n"
+            "print(_rej(Order, {'currency':'GBP','qty':10}), _rej(nested, [1,99]), "
+            "_rej(Person, {'name':'x','addr':{'city':123}}))")
+        assert r2["stdout"].strip() == "True True True", r2
+    finally:
+        s.close()
+
+
+def test_int_kernel_internals_cell_rebind_proof():
+    """NR-1/1b/2/4: a cell rebinding the kernel's own __main__ internals must NOT disable the
+    guard mechanism — the KERNEL_LOOP reads them from the re-imported side module
+    `plm.repl._kernel_state`, not the cell-rebindable __main__ globals. (Within the trust model;
+    defends an accidental rebind of an obscure internal, not deliberate sys.modules poisoning.)"""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        # NR-1: rebind Guard C+'s canon to {} AND clobber an injected helper -> still reverted
+        # next cell (Guard C+ reads the side module's CANON, not the cell's {}).
+        s.execute_cell("_REPL_INJECTED_CANON = {}\nparallel = 'EVIL'")
+        assert s.execute_cell("print(type(parallel).__name__)")["stdout"].strip() == "function"
+        # NR-1b: rebind the canon to a non-dict -> Guard C+ must not crash the loop.
+        s.execute_cell("_REPL_INJECTED_CANON = None")
+        assert s.execute_cell("print('alive')")["stdout"].strip() == "alive"
+        # NR-4: rebind the buffer reset to a no-op -> stdout must not leak into the next cell.
+        s.execute_cell("_repl_reset_buffers = lambda: None\nprint('cellA')")
+        assert s.execute_cell("print('cellB')")["stdout"].strip() == "cellB"
+        # NR-2: empty the snapshot blocklist -> crash-restart still works (anchor survives).
+        s.execute_cell("_REPL_INJECTED = set()\nanchor = 'KEEP'")
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")
+        assert s.kernel_epoch > ep
+        assert s.execute_cell("print(globals().get('anchor'))")["stdout"].strip() == "KEEP"
+    finally:
+        s.close()
+
+
+def test_int_close_does_not_resurrect_session():
+    """O5: a worker thread's post-close auto-respawn (its blocked read wakes EOF when close()
+    kills the kernel) must NOT resurrect a torn-down session — no orphan kernel, no 30s
+    accept() hang. Normal crash-restart (with _closed False) is completely unaffected."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        # Normal crash-restart still works (the _closed guards are inert when not closed).
+        s.execute_cell("x = 1")
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")
+        assert s.kernel_epoch > ep
+        assert s.execute_cell("print(globals().get('x'))")["stdout"].strip() == "1"
+    finally:
+        s.close()
+    # After close, what the in-flight worker would do must spawn NOTHING (no orphan kernel).
+    assert s._closed
+    ep2 = s.kernel_epoch
+    s._kill_and_respawn()
+    assert s.kernel_epoch == ep2
+    s._spawn_kernel()                                  # direct spawn is also a no-op when closed
+    assert s.kernel_epoch == ep2
+
+
+def test_compute_child_pythonpath_merges_and_dedupes():
+    """NR-3: the child PYTHONPATH PREPENDS the plm dir to the inherited/caller PYTHONPATH and
+    PRESERVES it (doesn't clobber), deduping PER DIRECTORY — so the kernel can import `plm`
+    while a caller-supplied `env=` PYTHONPATH (which beats os.environ in the constructor's env
+    merge) survives into the child."""
+    import os
+    from plm.repl.session import _compute_child_pythonpath as f
+    sep = os.pathsep
+    plm_dir = f("").split(sep)[0]
+    assert f("") == plm_dir                                          # empty -> just the plm dir
+    assert f(f"/my/libs{sep}/other").split(sep) == [plm_dir, "/my/libs", "/other"]   # plm first, preserved
+    assert f(f"{plm_dir}{sep}/my/libs{sep}/my/libs").split(sep) == [plm_dir, "/my/libs"]  # per-dir dedupe
+
+
+def test_frame_length_cap_rejects_oversize():
+    """NR-5: a frame-length header past the cap is a corrupt/desynced protocol error -> the
+    parent raises _FrameDecodeError (caught -> respawn) instead of an unbounded read; a normal
+    length still decodes. The kernel-side cap (_REPL_MAX_FRAME) matches the parent's."""
+    import io, struct, pickle, types
+    from plm.repl.session import PythonReplSession, _MAX_FRAME_BYTES, _FrameDecodeError
+    from plm.repl.kernel import KERNEL_BOOTSTRAP
+
+    class FakeResp:                                       # minimal stand-in for the response socket
+        def __init__(self, data): self._b = io.BytesIO(data)
+        def read(self, n): return self._b.read(n)
+        def fileno(self): return 0
+
+    over = struct.pack(">I", _MAX_FRAME_BYTES + 1)        # oversized length header
+    with pytest.raises(_FrameDecodeError):
+        PythonReplSession._read_frame_with_timeout(types.SimpleNamespace(_resp_r=FakeResp(over)), None)
+
+    body = pickle.dumps({"type": "ok"})                   # a normal frame still decodes
+    frame = struct.pack(">I", len(body)) + body
+    got = PythonReplSession._read_frame_with_timeout(types.SimpleNamespace(_resp_r=FakeResp(frame)), None)
+    assert got == {"type": "ok"}
+
+    assert _MAX_FRAME_BYTES == 2 * 1024 ** 3 < 2 ** 32                    # sane: below the uint32 header max
+    assert "_REPL_MAX_FRAME = 2 * 1024 ** 3" in KERNEL_BOOTSTRAP          # parent + kernel caps agree
+
+
+def test_int_generator_policies_survive_crash_restart():
+    """M3: EVERY generator-policy shape survives a hard respawn AND stays depth-correct after —
+    a function generator, a class generator __call__, a class generator method, and nesting
+    (normal->gen, gen->gen via `yield from`, gen->normal). Policies re-exec from `_p_source` on
+    respawn and the proxy re-applies the depth-tracking wrap. (Bodies re-import the depth
+    ContextVar so the probe survives — an unpicklable global ref would be lost equally for a
+    normal policy.)"""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=20.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        s.execute_cell(
+            "@policy\ndef rep():\n    from plm.policy.proxy import _POLICY_CALL_DEPTH as _D\n    return _D.get()\n"
+            "@policy\ndef genrep():\n    from plm.policy.proxy import _POLICY_CALL_DEPTH as _D\n    yield _D.get()\n"
+            "@policy\ndef norm_calls_gen():\n    return list(genrep())\n"
+            "@policy\ndef gen_yieldfrom():\n    yield from genrep()\n"
+            "@policy\ndef gen_calls_norm():\n    yield rep()\n"
+            "@policy\nclass GCall:\n    def __call__(self):\n"
+            "        from plm.policy.proxy import _POLICY_CALL_DEPTH as _D\n        yield _D.get()\n"
+            "@policy\nclass GMeth:\n    def stream(self):\n        for i in range(3):\n            yield i*i\n"
+            "    def total(self):\n        return sum(self.stream())\n")
+        probe = ("print(list(genrep()), norm_calls_gen(), list(gen_yieldfrom()), "
+                 "list(gen_calls_norm()), list(GCall()()), GMeth().total())")
+        expected = "[1] [2] [2] [2] [1] 5"
+        assert s.execute_cell(probe)["stdout"].strip() == expected      # before crash
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")
+        assert s.kernel_epoch > ep
+        r = s.execute_cell(probe)
+        assert r["stdout"].strip() == expected, r                       # depth-correct AFTER respawn
     finally:
         s.close()
 
@@ -988,7 +1184,7 @@ def test_int_policy_depth_cap_fires_in_kernel(repl):
 
 
 # =============================================================================
-# Frame transport robustness (#4) + answer-render guard (#5)
+# Frame transport robustness + answer-render guard
 # =============================================================================
 
 def _bare_session():
@@ -1121,8 +1317,8 @@ def test_render_answer_never_raises():
 
 
 # =============================================================================
-# Misc batch: budget coercion (#18), edit int-guards (#24), Guard A match/case
-# (#15), rename clobber-protection (#13)
+# Misc batch: budget coercion, edit int-guards, Guard A match/case
+#, rename clobber-protection
 # =============================================================================
 
 def test_coerce_budget_normalizes():
@@ -1198,7 +1394,7 @@ def test_int_extra_policy_failure_soft_and_surfaced():
     try:
         r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
         assert "booted True" in r["stdout"], r          # defaults present; broken extra didn't brick boot
-        assert "boot: extra-policy install warning" in r["stderr"], r   # surfaced once (#26)
+        assert "boot: extra-policy install warning" in r["stderr"], r   # surfaced once
     finally:
         s.close()
 
@@ -1278,6 +1474,75 @@ def test_plmmetaparameters_rejects_non_dict_extra_policies():
             PLMMetaParameters(system_prompt="x", extra_policies=bad)
 
 
+def test_metaparams_from_dir_loads_sealed_and_mutable():
+    """Folder metaparam: from_dir reads system_prompt.md + policies/sealed/*.py (-> sealed_policies)
+    + policies/mutable/*.py (-> extra_policies), keyed by file stem."""
+    import plm
+    import pathlib
+    from plm.plm import PLMMetaParameters
+    base = pathlib.Path(plm.__path__[0]) / "metaparams" / "example"
+    if not base.is_dir():
+        pytest.skip("example metaparam folder not present")
+    mp = PLMMetaParameters.from_dir(base)
+    assert "example" in mp.system_prompt
+    assert sorted(mp.extra_policies or {}) == ["editable_helper"]      # mutable bucket
+    assert sorted(mp.sealed_policies or {}) == ["locked_helper"]       # sealed bucket
+    assert "@policy" in mp.sealed_policies["locked_helper"]
+
+
+def test_metaparams_name_in_both_buckets_rejected():
+    """A name in BOTH extra_policies (mutable) and sealed_policies (immutable) is ambiguous -> reject."""
+    from plm.plm import PLMMetaParameters
+    PLMMetaParameters(system_prompt="x", sealed_policies={"s": "@policy\ndef s(): ...\n"})   # sealed-only ok
+    with pytest.raises(ValueError, match="both|exactly one"):
+        PLMMetaParameters(system_prompt="x",
+                          extra_policies={"foo": "@policy\ndef foo(): ...\n"},
+                          sealed_policies={"foo": "@policy\ndef foo(): ...\n"})
+
+
+def test_int_sealed_extra_policy_locked_unduplicable_unblessed():
+    """metaparams policies/sealed/: a sealed extra installs immutable + un-duplicable + NOT blessed
+    (no raw LLM-primitive access), survives crash-restart still sealed; a mutable extra stays
+    editable. Driven directly via the env vars PLM's `from_dir` populates."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    import json
+    env = {
+        "_PLM_EXTRA_POLICIES": json.dumps({"editable": "@policy\ndef editable(x):\n    return x + 1\n"}),
+        "_PLM_SEALED_EXTRA_POLICIES": json.dumps({
+            "locked": "@policy\ndef locked(x):\n    return x * 2\n",
+            "peeker": ("@policy\ndef peeker():\n"
+                       "    from plm.policy.defaults._llm_infra import descend\n"
+                       "    descend()\n    return 'leaked'\n"),
+        }),
+    }
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0,
+                              sigint_grace=2.0, env=env)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        assert s.execute_cell("print(locked(5), editable(5))")["stdout"].strip() == "10 6"
+        s.execute_cell("locked._rewrite('def locked(x):\\n    return 0\\n')")           # immutable
+        assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"
+        r = s.execute_cell("duplicate_policy('locked', 'forked'); print('forked' in list_policies())")
+        assert r["stdout"].strip() == "False"                                            # un-duplicable
+        r2 = s.execute_cell("print(peeker())")                                           # NOT blessed
+        assert "leaked" not in r2["stdout"] and r2["stderr"].strip() != ""
+        s.execute_cell("editable._rewrite('def editable(x):\\n    return x * 100\\n')")  # mutable -> editable
+        assert s.execute_cell("print(editable(5))")["stdout"].strip() == "500"
+        ep = s.kernel_epoch                                                              # survives crash-restart
+        s.execute_cell("import os as _o\n_o._exit(0)")
+        assert s.kernel_epoch > ep
+        assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"
+        s.execute_cell("locked._rewrite('def locked(x):\\n    return 0\\n')")
+        assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"              # still immutable
+    finally:
+        s.close()
+
+
 def test_int_extra_policies_non_dict_payload_is_soft():
     """#2 (kernel soft-guard): a valid-JSON-but-not-object _PLM_EXTRA_POLICIES
     (set directly in env, bypassing the parent check) must NOT brick boot — it's
@@ -1292,6 +1557,23 @@ def test_int_extra_policies_non_dict_payload_is_soft():
         r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
         assert "booted True" in r["stdout"], r                 # did not brick boot
         assert "not an object" in r["stderr"], r               # ignored + noted (#26 surface)
+    finally:
+        s.close()
+
+
+def test_int_extra_policies_invalid_json_is_soft_and_noted():
+    """NR-9: a MALFORMED-JSON _PLM_EXTRA_POLICIES (set directly in env) must NOT brick boot — like
+    the not-an-object sibling it's ignored and surfaced via boot_stderr (was swallowed silently)."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
+                              env={"_PLM_EXTRA_POLICIES": "{not valid json"})
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        assert "booted True" in r["stdout"], r                 # did not brick boot
+        assert "not valid JSON" in r["stderr"], r              # ignored + noted
     finally:
         s.close()
 
@@ -1361,7 +1643,7 @@ def test_int_close_resets_pid_box():
         pytest.skip(f"kernel unavailable: {e}")
     assert s._child_pid_box[0] is not None              # set on spawn
     s.close()
-    assert s._child_pid_box[0] is None                  # cleared after reap (#R4-6)
+    assert s._child_pid_box[0] is None                  # cleared after reap
 
 
 def test_int_respawn_drops_deleted_boot_policy_orphan():

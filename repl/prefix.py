@@ -13,11 +13,14 @@ bootstrap loop below; depth gating lives entirely in
 `plm/policy/defaults/_llm_infra`.
 
 The REPL is SYNCHRONOUS: cells and policies are plain synchronous Python.
-`async def` / generator policies, `threading`, and `multiprocessing` are
-unsupported — they bypass the recursion-depth cap and the depth ContextVar
-propagation, and spawn work the per-cell subprocess cleanup can't account for.
-`@policy` warns on an async/generator def; use `parallel(...)` for concurrency
-(it copies the depth context into each branch).
+`async def` policies are REFUSED by `@policy` (a coroutine returns a promise and
+runs its body outside the recursion-depth cap and the depth/budget model), as is
+a rewrite that introduces one; `threading` and `multiprocessing` are likewise
+unsupported (they bypass the depth ContextVar propagation and spawn work the
+per-cell subprocess cleanup can't account for). SYNC generator policies ARE
+supported and run depth-correctly (the proxy re-enters the policy-call boundary
+around each `next()`). Use `parallel(...)` for concurrency (it copies the depth
+context into each branch).
 """
 
 from __future__ import annotations
@@ -54,6 +57,13 @@ from plm.policy import (
 )
 from plm.repl.parallel import parallel
 from plm.repl.exec_ns import exec_ns       # shared code-runner (verifiers / code-as-data)
+# Kernel-internal state (snapshot blocklist, Guard C+ canon, buffer reset) lives in an
+# importable side module the KERNEL_LOOP guards RE-IMPORT each cell, so a cell rebinding the
+# corresponding __main__ name can't disable them (R5-1 pattern; see plm/repl/_kernel_state.py).
+# `reset_buffers` is captured now — defined in the bootstrap above; INJECTED/CANON are assigned
+# below once computed.
+import plm.repl._kernel_state as _repl_ks
+_repl_ks.reset_buffers = _repl_reset_buffers
 # Pydantic-backed authoring surface (Constraint & friends), BEST-EFFORT + GUARDED:
 # standard kernels carry pydantic (DEFAULT_PREINSTALL), so expose the WHOLE constraint
 # surface AMBIENTLY for cells + editable policies — no import needed, like the names
@@ -125,7 +135,11 @@ def _repl_collect_vars():
     # (dill's PicklingWarning, emitted routinely now that every class policy is
     # unpicklable by value, is silenced once at boot — see the PREFIX top — so it
     # never leaks into the captured cell stderr surfaced to the model.)
-    _blocked = _REPL_INJECTED or _builtins.set()
+    # Read the blocklist from the side module (re-imported fresh), NOT the __main__
+    # `_REPL_INJECTED` global a cell could rebind to `set()` to ship every kernel helper as a
+    # snapshot var. Fall back to the __main__ value pre-assignment / if the import fails.
+    import plm.repl._kernel_state as _repl_ks
+    _blocked = _repl_ks.INJECTED or _REPL_INJECTED or _builtins.set()
     _snap = {}
     _constraint_recipes = {}
     for _k, _v in _builtins.list(_builtins.globals().items()):
@@ -134,7 +148,8 @@ def _repl_collect_vars():
         # A Constraint CLASS can't cross-process dill-pickle: a factory/composite FAILS
         # `dumps` (recursive self-ref), and a __main__ structural class pickles BY-REFERENCE
         # (loads fails on the fresh kernel — and would otherwise sink the WHOLE snapshot).
-        # Snapshot a replayable RECIPE instead — or DROP it; NEVER keep a Constraint class by
+        # Snapshot a replayable RECIPE instead — recursive: a NESTED Constraint becomes a
+        # nested recipe, never a live class (or DROP it). NEVER keep a Constraint class by
         # value (mirrors the per-entry policy-source fallback below). Guarded: no constraint
         # surface -> skip (the var then falls through to the normal probe and is dropped).
         if _repl_is_constraint_class is not None and _repl_is_constraint_class(_v):
@@ -159,7 +174,7 @@ def _repl_collect_vars():
     # Per-entry registry snapshot. Before, `_PLM_POLICIES` was dumped as ONE value,
     # so a SINGLE unpicklable policy sank the ENTIRE registry blob — and
     # crash-restart then lost ALL authored policies AND resurrected deleted defaults
-    # (#H11/#H12). Now each policy is handled on its own:
+    #. Now each policy is handled on its own:
     #   * picklable  -> kept BY VALUE (dill memoization within the single final blob
     #                   keeps a cell var aliasing it restored to the SAME object, so
     #                   liveness/identity across respawn is preserved);
@@ -244,6 +259,11 @@ _REPL_INJECTED_CANON = {
     if callable(_v) or type(_v).__name__ == "module"
 }
 
+# Publish the blocklist + canon to the side module the KERNEL_LOOP guards re-import, so a cell
+# rebinding the __main__ names can't disable the snapshot blocklist or Guard C+.
+_repl_ks.INJECTED = frozenset(_REPL_INJECTED)
+_repl_ks.CANON = _REPL_INJECTED_CANON
+
 # ============================================================================
 # Phase 2 bootstrap: install the immutable LLM defaults + any extras, seal
 # their names as immutable + un-duplicable, then bless their `_inner.__code__`
@@ -252,14 +272,14 @@ _REPL_INJECTED_CANON = {
 # Appended AFTER the `_REPL_INJECTED = {...}` freeze (so the policy NAMES like
 # `natural_llm` / `react_llm` are NOT in the freeze -> they're snapshotted and
 # accepted by `@policy`; immutability is enforced separately via
-# `_IMMUTABLE_POLICIES`, not the freeze). All temps `_repl_`-prefixed -> never
+# `_SEALED_POLICIES`, not the freeze). All temps `_repl_`-prefixed -> never
 # snapshotted, never visible to dir() filtering.
 # ============================================================================
 
 import json as _repl_json
 from plm.policy.defaults import (
     iter_default_policies as _repl_iter_defaults,
-    UNDUPLICABLE_DEFAULTS as _repl_undup,
+    _LLM_DEFAULT_POLICIES as _repl_llm_defaults,
     _bless_llm_callers as _repl_bless,
 )
 from plm.policy.registry import (
@@ -269,12 +289,17 @@ from plm.policy.registry import (
 
 try:
     _repl_extra_pols = _repl_json.loads(_os.environ.get("_PLM_EXTRA_POLICIES") or "{}")
-except Exception:
+except Exception as _repl_xp_exc:
+    # Malformed JSON: mirror the not-an-object branch below — drop softly but SURFACE a boot
+    # note, else a typo'd _PLM_EXTRA_POLICIES vanishes with no hint.
+    _repl_stderr_buf.write(
+        "[boot] _PLM_EXTRA_POLICIES was not valid JSON (" + repr(_repl_xp_exc)
+        + "); ignoring extras.\n")
     _repl_extra_pols = {}
 if not isinstance(_repl_extra_pols, dict):
     # Valid JSON but not an object (e.g. "[]", "null", "123", '"x"'): `.items()`
     # below would raise OUTSIDE the per-item try and hard-brick boot, violating
-    # the "extras stay soft" contract (#26). Drop it softly + surface a note via
+    # the "extras stay soft" contract. Drop it softly + surface a note via
     # boot_stderr. (The parent also fail-fast-validates extra_policies; this is
     # defense in depth for any path that sets the env var directly.)
     _repl_stderr_buf.write(
@@ -287,7 +312,7 @@ if not isinstance(_repl_extra_pols, dict):
 # same @policy install path, so both become normal policies in _PLM_POLICIES.
 # A DEFAULT failing to install means a BROKEN KERNEL (a core policy is unusable),
 # so we DON'T swallow it: the exception propagates out of boot, the wrapper emits
-# a `boot_error` frame, and the parent raises a clear PLM-process error (#26) —
+# a `boot_error` frame, and the parent raises a clear PLM-process error —
 # instead of limping with a missing default whose traceback is lost to the reset
 # boot buffer. EXTRAS (user/injected {name: source}) must NOT brick boot, so they
 # stay soft; their tracebacks are captured in `_repl_stderr_buf` and surfaced via
@@ -295,7 +320,7 @@ if not isinstance(_repl_extra_pols, dict):
 for _repl_pn, _repl_ps in _repl_iter_defaults():   # source already includes the "@policy" line
     _repl_install(_repl_ps, "<policy-bootstrap-" + _repl_pn + ">")
 for _repl_pn, _repl_ps in _repl_extra_pols.items():
-    if _repl_pn in _repl_undup:                  # an extra must NOT shadow a SEALED default —
+    if _repl_pn in _repl_llm_defaults:                  # an extra must NOT shadow a SEALED default —
         _repl_stderr_buf.write(                  # it would re-decorate it BEFORE the seal loop below
             "[boot] extra policy " + repr(_repl_pn) + " collides with a sealed default "
             "name; ignored. Rename it, or duplicate_policy the default at runtime.\n")
@@ -305,17 +330,45 @@ for _repl_pn, _repl_ps in _repl_extra_pols.items():
     except BaseException:                        # an injected/extra policy must NOT brick boot —
         _traceback.print_exc()                  # contain even a SystemExit/MemoryError (Design#8)
 
-# Seal ONLY the names in UNDUPLICABLE_DEFAULTS (the immutable LLM-loop defaults
-# — natural_llm / react_llm / react_llm_verifier) as DEFAULT policies: `_seal`
-# sets the intrinsic `_p_immutable` flag on each object AND records the name in
-# the immutable/un-duplicable name-sets. Other defaults (e.g. the mutable
-# base_verifier) and extras stay mutable + duplicable.
+# SEALED extras (metaparams policies/sealed/): install like mutable extras (soft-fail), then
+# SEAL each below (immutable + un-duplicable) — WITHOUT blessing. A user's sealed policy is
+# locked from edit/duplicate but reaches the model only via natural_llm/react_llm like any
+# policy; only the LLM defaults get blessed for raw-primitive access.
+try:
+    _repl_sealed_extras = _repl_json.loads(_os.environ.get("_PLM_SEALED_EXTRA_POLICIES") or "{}")
+except Exception as _repl_sxp:
+    _repl_stderr_buf.write("[boot] _PLM_SEALED_EXTRA_POLICIES was not valid JSON ("
+                           + repr(_repl_sxp) + "); ignoring sealed extras.\n")
+    _repl_sealed_extras = {}
+if not isinstance(_repl_sealed_extras, dict):
+    _repl_stderr_buf.write("[boot] _PLM_SEALED_EXTRA_POLICIES was valid JSON but not an object; "
+                           "ignoring sealed extras.\n")
+    _repl_sealed_extras = {}
+_repl_sealed_extra_names = []
+for _repl_pn, _repl_ps in _repl_sealed_extras.items():
+    if _repl_pn in _repl_llm_defaults:                  # can't shadow a sealed DEFAULT
+        _repl_stderr_buf.write("[boot] sealed extra " + repr(_repl_pn) + " collides with a sealed "
+                               "default name; ignored. Rename it.\n")
+        continue
+    try:
+        _repl_install(_repl_ps, "<policy-bootstrap-" + _repl_pn + ">")
+        _repl_sealed_extra_names.append(_repl_pn)
+    except BaseException:
+        _traceback.print_exc()                  # a sealed extra must NOT brick boot either
+
+# Seal the LLM-loop defaults (_LLM_DEFAULT_POLICIES — natural_llm / react_llm /
+# react_llm_verifier) AND the user sealed extras: `_seal` sets the intrinsic
+# `_p_immutable` flag on each object AND records the name in `_SEALED_POLICIES`
+# (the one seal set). Other defaults (e.g. the mutable base_verifier) and the
+# mutable extras stay mutable + duplicable.
 # An extra named like one of these sealed defaults is REJECTED in the extras loop
 # above — so this seal always seals the canonical default body, never an
 # operator-supplied replacement. (An extra MAY still shadow a MUTABLE default like
 # base_verifier; that is allowed, since it stays mutable + duplicable anyway.)
-for _repl_pn in _repl_undup:
+for _repl_pn in _repl_llm_defaults:
     _repl_seal(_repl_pn)
+for _repl_pn in _repl_sealed_extra_names:        # user SEALED extras: immutable + un-duplicable
+    _repl_seal(_repl_pn)                         # (NOT blessed — only the defaults below are)
 
 # Bless ONLY the immutable un-duplicable LLM policies' bodies as legitimate
 # callers of _llm_infra's public functions. Anything else calling

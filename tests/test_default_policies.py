@@ -27,7 +27,7 @@ import pytest
 
 import plm.policy.defaults._llm_infra as _llm_infra
 from plm.policy import (
-    _IMMUTABLE_POLICIES,
+    _SEALED_POLICIES,
     _PLM_POLICIES,
     _audit_cell,
     duplicate_policy,
@@ -37,7 +37,7 @@ from plm.policy import (
     rewrite_policy,
 )
 from plm.policy.defaults import (
-    UNDUPLICABLE_DEFAULTS,
+    _LLM_DEFAULT_POLICIES,
     _bless_llm_callers,
     iter_default_policies,
 )
@@ -48,7 +48,6 @@ from plm.policy.proxy import (
     _FunctionPolicy,
 )
 from plm.policy.registry import (
-    _UNDUPLICABLE_POLICIES,
     _install_policy_source,
     _seal,
     _unsealed,
@@ -64,13 +63,12 @@ def _clear_registry() -> None:
         main.pop(n, None)
     with _unsealed():                 # harness reset: the store retains defaults while sealed
         _PLM_POLICIES.clear()
-    _IMMUTABLE_POLICIES.clear()
-    _UNDUPLICABLE_POLICIES.clear()
+    _SEALED_POLICIES.clear()
 
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    """Clean __main__/registry/_IMMUTABLE_POLICIES/_UNDUPLICABLE_POLICIES around
+    """Clean __main__/registry/_SEALED_POLICIES around
     every test. Reset _BLESSED_CALLERS to empty (tests set it explicitly when
     they need the gate to pass). Default AGENT_DEPTH=2 (the production root).
     """
@@ -118,7 +116,7 @@ def _install_defaults() -> None:
     main.setdefault("ConstraintViolation", ConstraintViolation)
     for name, src in iter_default_policies():
         _install_policy_source(src, "<policy-bootstrap-" + name + ">")
-    for name in UNDUPLICABLE_DEFAULTS:
+    for name in _LLM_DEFAULT_POLICIES:
         _seal(name)             # sets the intrinsic _p_immutable flag + the name-sets
     _bless_llm_callers()
 
@@ -218,8 +216,7 @@ def test_2_bootstrap_installs_defaults(defaults_installed):
     assert "natural_llm" in names
     assert "react_llm" in names
     for name in ("natural_llm", "react_llm"):
-        assert name in _IMMUTABLE_POLICIES
-        assert name in _UNDUPLICABLE_POLICIES
+        assert name in _SEALED_POLICIES                       # sealed = immutable + un-duplicable
         p = _PLM_POLICIES[name]
         assert isinstance(p, _FunctionPolicy)
 
@@ -232,7 +229,7 @@ def test_3_extras_load_mutable(defaults_installed):
         "<policy-bootstrap-my_extra>",
     )
     assert "my_extra" in _PLM_POLICIES
-    assert "my_extra" not in _IMMUTABLE_POLICIES
+    assert "my_extra" not in _SEALED_POLICIES
     # Editable
     rewrite_policy("my_extra", "def my_extra():\n    return 'edited'\n")
     assert _PLM_POLICIES["my_extra"]() == "edited"
@@ -673,8 +670,26 @@ def test_react_llm_malformed_shapes_dont_crash(defaults_installed, stub_backend)
     assert rl("go2") == "ok"
 
 
+def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stub_backend):
+    """M4: a non-dict first tool_call (from a non-conformant provider) must NOT be STORED into
+    the assistant turn's history. R-F1 already handles the in-round error, but storing the
+    malformed entry would crash the NEXT round's real-backend history sanitizer (`tc.copy()` /
+    `tc.get('function')`). So the stored `tool_calls` is None when the first element isn't a dict
+    — the bug was reachable only with a real backend (the stub doesn't sanitize history)."""
+    rl = _PLM_POLICIES["react_llm"]
+    stub_backend.script = [
+        {"content": "", "tool_calls": ["not-a-dict"]},          # malformed
+        make_python_call("RETURN('ok')"),
+    ]
+    assert rl("go") == "ok"
+    round2_msgs = stub_backend.calls[1]["messages"]             # history sent on the 2nd round
+    asst = [m for m in round2_msgs if m.get("role") == "assistant"][-1]
+    assert asst.get("tool_calls") is None                       # malformed element NOT stored
+    assert "not-a-dict" not in str(round2_msgs)                 # nowhere in the stored history
+
+
 def test_react_deepcopy_caller_messages_not_mutated(defaults_installed, stub_backend):
-    """Batch 4 (R-F6): a verifier mutating `msgs` in place does NOT corrupt the
+    """Batch 4: a verifier mutating `msgs` in place does NOT corrupt the
     caller's own message dicts — _norm deep-copies the input."""
     stub_backend.script = [make_text("thinking"), make_python_call("RETURN('done')")]
     caller_msgs = [{"role": "user", "content": "original"}]
@@ -689,8 +704,38 @@ def test_react_deepcopy_caller_messages_not_mutated(defaults_installed, stub_bac
     assert caller_msgs[0]["content"] == "original"     # caller's dict untouched
 
 
+def test_react_null_tool_call_id_becomes_empty_string(defaults_installed, stub_backend):
+    """ND-1: a backend that sets `id: null` EXPLICITLY must not yield tool_call_id=None (the
+    `.get('id','')` default only fires for a MISSING key) — a None id violates the strict
+    OpenAI tool schema next round. `tc.get('id') or ''` normalizes it to ''."""
+    import json
+    rl = _PLM_POLICIES["react_llm"]
+    stub_backend.script = [
+        {"content": "", "reasoning": None, "tool_calls": [{
+            "id": None, "type": "function",                        # EXPLICIT null id
+            "function": {"name": "python", "arguments": json.dumps({"code": "print('x')"})}}]},
+        make_python_call("RETURN('done')"),
+    ]
+    assert rl("go") == "done"
+    round2_msgs = stub_backend.calls[1]["messages"]                 # history sent on the 2nd round
+    tool_turns = [m for m in round2_msgs if m.get("role") == "tool"]
+    assert tool_turns and tool_turns[0]["tool_call_id"] == "", tool_turns
+
+
+def test_react_generate_kwargs_reserved_key_clear_error(defaults_installed, stub_backend):
+    """ND-2: a generate_kwargs key colliding with react_llm's own `messages`/`tools` raises a
+    CLEAR ValueError up front (not a cryptic 'got multiple values' TypeError), before any
+    backend call."""
+    rl = _PLM_POLICIES["react_llm"]
+    with pytest.raises(ValueError, match="generate_kwargs may not contain"):
+        rl("go", generate_kwargs={"tools": [1]})
+    with pytest.raises(ValueError, match="generate_kwargs may not contain"):
+        rl("go", generate_kwargs={"messages": []})
+    assert stub_backend.calls == []                                # raised before any generate()
+
+
 def test_react_llm_verifier_depth1_with_verifier_hard_errors(defaults_installed, stub_backend):
-    """Batch 6 (D2): a verifier needs depth >= 2 (it runs one level below + composes
+    """Batch 6: a verifier needs depth >= 2 (it runs one level below + composes
     depth-1 circuits). react_llm_verifier(..., verifier=..., depth=1) raises a clear
     LLMDepthExceeded UP FRONT (no backend call) instead of crashing mid-loop. Without a
     verifier, depth=1 is fine."""
@@ -842,7 +887,7 @@ def test_12c_policy_via_kwargs_grant(defaults_installed, stub_backend):
     assert "_granted_helper" in _PLM_POLICIES
     # The granted policy is mutable (PLM-created via the sub-LLM is no different
     # from any other mutable policy).
-    assert "_granted_helper" not in _IMMUTABLE_POLICIES
+    assert "_granted_helper" not in _SEALED_POLICIES
 
 
 def test_12e_kwargs_splat_binds_direct_local_names(defaults_installed, stub_backend):
@@ -1064,7 +1109,7 @@ def test_17_llm_defaults_are_immutable(defaults_installed):
 
 def test_18_guard_a_rejects_immutable_rebind(defaults_installed):
     """Guard A rejects a static rebind of an immutable name."""
-    err = _audit_cell("natural_llm = 5", set(_PLM_POLICIES), _IMMUTABLE_POLICIES)
+    err = _audit_cell("natural_llm = 5", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is not None and "rebind" in err
     assert "immutable" in err
 
@@ -1074,16 +1119,16 @@ def test_18_guard_a_rejects_immutable_rebind(defaults_installed):
     def mutable_helper():
         return 1
 
-    err = _audit_cell("mutable_helper = 5", set(_PLM_POLICIES), _IMMUTABLE_POLICIES)
+    err = _audit_cell("mutable_helper = 5", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is not None and "rebind" in err
-    # Should NOT mention immutable since the mutable_helper is not in _IMMUTABLE_POLICIES
+    # Should NOT mention immutable since the mutable_helper is not in _SEALED_POLICIES
     assert "_rewrite" in err.lower()
 
 
 def test_18_guard_a_rejects_immutable_del(defaults_installed):
     """`del <immutable>` is flagged by Guard A's new ast.Delete branch.
     `del <mutable>` stays allowed."""
-    err = _audit_cell("del natural_llm", set(_PLM_POLICIES), _IMMUTABLE_POLICIES)
+    err = _audit_cell("del natural_llm", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is not None and "del" in err.lower()
 
     @policy
@@ -1091,7 +1136,7 @@ def test_18_guard_a_rejects_immutable_del(defaults_installed):
         return 1
 
     # mutable del is fine (no error)
-    err = _audit_cell("del mutable_helper", set(_PLM_POLICIES), _IMMUTABLE_POLICIES)
+    err = _audit_cell("del mutable_helper", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is None
 
 
@@ -1289,6 +1334,16 @@ def test_31_blessed_callers_is_frozenset(defaults_installed):
         _llm_infra._BLESSED_CALLERS.add(object())
 
 
+def test_llm_call_depth_strict_no_coercion(defaults_installed):
+    """ND-5: depth must be None or a NON-NEGATIVE INTEGER — a non-integer (1.5), a negative, a
+    bool, or a non-int now RAISES instead of being silently truncated/clamped. Exercised via
+    natural_llm (a blessed caller; the error fires at llm_call before any backend use)."""
+    nl = _PLM_POLICIES["natural_llm"]
+    for bad in (1.5, -1, 2.0, "2", True):
+        with pytest.raises(ValueError, match="depth"):
+            nl("hi", depth=bad)
+
+
 def test_32_setattr_seal_blocks_inner_swap(defaults_installed):
     """natural_llm._inner = evil raises TypeError."""
     nl = _PLM_POLICIES["natural_llm"]
@@ -1319,14 +1374,14 @@ def test_32_init_succeeds():
     until _p_name is set 5th, BEFORE update_wrapper's setattrs)."""
     def fn():
         return 1
-    fn.__name__ = "natural_llm"          # name in _IMMUTABLE_POLICIES set, but seal
+    fn.__name__ = "natural_llm"          # name in _SEALED_POLICIES set, but seal
                                           # only fires when _p_name IS already in the set
-    _IMMUTABLE_POLICIES.add("natural_llm")
+    _SEALED_POLICIES.add("natural_llm")
     try:
         proxy = _FunctionPolicy(fn, "def natural_llm(): return 1", "<policy-natural_llm>")
         assert proxy._p_name == "natural_llm"
     finally:
-        _IMMUTABLE_POLICIES.discard("natural_llm")
+        _SEALED_POLICIES.discard("natural_llm")
 
 
 def test_33_policy_call_depth_cap():
@@ -1445,8 +1500,8 @@ def test_parallel_collect_all_and_guards():
     result slot (parallel() itself never raises for a task error) and the OTHER tasks
     still run to completion, in input order. Plus: no ~300s artificial hang (K-F4
     structural fix — it waits only for the actual slowest task); survives
-    max_workers=inf (Corr#5); refuses to run inside a running loop with a clear error
-    and no leaked coroutine (K-F3)."""
+    max_workers=inf; refuses to run inside a running loop with a clear error
+    and no leaked coroutine."""
     import asyncio
     import time
     from plm.repl.parallel import parallel
@@ -1459,6 +1514,23 @@ def test_parallel_collect_all_and_guards():
     assert isinstance(results[0], ValueError) and str(results[0]) == "boom"
     assert results[1] == 42                       # a sibling ordered AFTER the error still ran
     assert results[2] is None                     # a task that returns nothing -> None slot
+
+    # O4: FULL isolation — a control-flow BaseException a policy may raise (SystemExit /
+    # CancelledError) is RETURNED in its slot too, NEVER propagated out of parallel(). The
+    # documented filter is isinstance(r, BaseException) (Exception would miss these and read a
+    # returned SystemExit as success).
+    def _sysexit():
+        raise SystemExit(2)
+
+    def _cancel():
+        raise asyncio.CancelledError()
+
+    out = parallel(lambda: 7, _sysexit, _cancel)
+    assert out[0] == 7                                          # parallel did not raise
+    assert isinstance(out[1], SystemExit) and not isinstance(out[1], Exception)
+    assert isinstance(out[1], BaseException)                    # caught by the documented filter
+    assert isinstance(out[2], asyncio.CancelledError)          # returned, not propagated
+    assert [type(r).__name__ for r in out if isinstance(r, BaseException)] == ["SystemExit", "CancelledError"]
 
     # Isolation + no artificial hang: an error and a (briefly) slow task are BOTH collected,
     # and parallel returns shortly after the slow one — nowhere near the old 300s join.
@@ -1567,8 +1639,8 @@ def test_rlv_immutable_unduplicable_blessed(defaults_installed, stub_backend):
     """react_llm_verifier is sealed immutable + un-duplicable, and its body is
     blessed (a scripted call runs the descend()/llm_call gated helpers)."""
     rlv = _PLM_POLICIES["react_llm_verifier"]
-    assert "react_llm_verifier" in _IMMUTABLE_POLICIES
-    assert "react_llm_verifier" in _UNDUPLICABLE_POLICIES
+    assert "react_llm_verifier" in _SEALED_POLICIES          # sealed = immutable + un-duplicable
+    assert "react_llm_verifier" in _LLM_DEFAULT_POLICIES     # AND blessed (an LLM-loop default)
     v0 = rlv._p_version
     rewrite_policy("react_llm_verifier", "def react_llm_verifier(messages):\n    return 'evil'\n")
     assert rlv._p_version == v0                 # immutable → rewrite no-ops
@@ -1584,8 +1656,8 @@ def test_base_verifier_mutable_and_duplicable(defaults_installed):
     """base_verifier is a default policy but intentionally NOT sealed: it is
     mutable (rewrite bumps version) and duplicable."""
     assert "base_verifier" in _PLM_POLICIES
-    assert "base_verifier" not in _IMMUTABLE_POLICIES
-    assert "base_verifier" not in _UNDUPLICABLE_POLICIES
+    assert "base_verifier" not in _SEALED_POLICIES          # NOT sealed (mutable + duplicable)
+    assert "base_verifier" not in _LLM_DEFAULT_POLICIES     # NOT blessed (reaches model via react/natural)
     dup = duplicate_policy("base_verifier", "bv_copy")
     assert dup is not None and "bv_copy" in _PLM_POLICIES
     bv = _PLM_POLICIES["base_verifier"]
@@ -1673,8 +1745,8 @@ def test_base_verifier_propose_approve_applies_edit_on_true(defaults_installed, 
 
 def test_base_verifier_gate_marks_once_and_check_failure_isolated(defaults_installed, stub_backend):
     """Batch 5: a check that RAISES (here: react_llm budget exhausted, no script) does NOT
-    abort the agent (D-A6), and the gate records a verifier marker UNCONDITIONALLY so it
-    won't re-fire on the same stale error next round (Corr#2)."""
+    abort the agent, and the gate records a verifier marker UNCONDITIONALLY so it
+    won't re-fire on the same stale error next round."""
     bv = _PLM_POLICIES["base_verifier"]
     stub_backend.script = []           # circuits get only empty turns -> exhaust budget -> raise
     msgs = [{"role": "user", "content": "do x"},
@@ -1760,7 +1832,7 @@ def test_d1_sealed_namespace_blocks_kernel_reach_but_RETURN_identical():
 
 def test_exec_ns_traceback_rebind_proof_and_interrupts_propagate():
     """Batch 2: exec_ns captures the traceback even when the code rebinds `sys.stderr`
-    (K-F1 — written straight to the buffer), strips its own exec frame (K-F6), and
+    (K-F1 — written straight to the buffer), strips its own exec frame, and
     RE-RAISES KeyboardInterrupt/SystemExit/GeneratorExit instead of swallowing them
     (K-F9/R-F7)."""
     from plm.repl.exec_ns import exec_ns
@@ -1775,6 +1847,31 @@ def test_exec_ns_traceback_rebind_proof_and_interrupts_propagate():
         exec_ns("raise SystemExit(3)", {})
     with pytest.raises(KeyboardInterrupt):
         exec_ns("raise KeyboardInterrupt", {})
+
+
+def test_sealed_sub_llm_cannot_escape_or_hang_via_interactive_builtins():
+    """H5: the sealed sub-LLM ns must NOT expose the interactive 'needs-a-human-at-a-terminal'
+    builtins — exit/quit (raise SystemExit, escaping the react loop's `except Exception` and
+    killing the whole run with no self-correction) and breakpoint/input (drop into pdb / block
+    on stdin -> hang). They're absent from safe_builtins(), so a sub-LLM calling them gets a
+    CAPTURED NameError (self-correctable), not an escape or a hang. Distinct from the
+    K-F9/R-F7 test above: an EXPLICIT `raise SystemExit` still propagates — only the reachable
+    BUILTINS are removed. help/copyright/credits/license stay (harmless print/pagers)."""
+    from plm.repl.exec_ns import exec_ns, safe_builtins, make_sealed_return
+
+    sb = safe_builtins()
+    assert not ({"exit", "quit", "breakpoint", "input"} & set(sb))   # all four denied
+    assert {"help", "print", "len", "range", "dict"} <= set(sb)      # harmless/legit kept
+
+    def sealed_run(code):
+        ns = {"__builtins__": sb, "RETURN": make_sealed_return(sb)}
+        return exec_ns(code, ns)                                     # must NOT raise/hang
+
+    for call in ("exit()", "quit()", "breakpoint()", "x = input('? ')"):
+        out, term, val = sealed_run(call)
+        assert term is None and "NameError" in out, (call, out)     # captured, not escaped/hung
+    out, term, val = sealed_run("print('hi'); RETURN(6*7)")         # normal flow unaffected
+    assert term == "return" and val == 42 and "hi" in out
 
 
 # ============== Section: single-store immutability seal (finding #1) ==============
@@ -1795,7 +1892,7 @@ def test_seal_subscript_poison_refused(defaults_installed):
 
 def test_seal_subscript_del_and_pop_refused(defaults_installed):
     """`del`/`pop` of a default registry entry is refused; it stays present. pop no
-    longer silently returns the live value (P-F4): without a default it raises KeyError,
+    longer silently returns the live value: without a default it raises KeyError,
     with a default it returns the default — never removing the protected entry."""
     nl0 = _PLM_POLICIES["natural_llm"]
     del _PLM_POLICIES["natural_llm"]
@@ -1830,14 +1927,223 @@ def test_pf6_guard_a_rejects_exotic_binding_forms():
     assert _audit_cell("(other := 1)", names) is None                               # unrelated name: fine
 
 
-def test_d7_async_generator_policy_warns(defaults_installed, capsys):
-    """D7: @policy warns (a [policy] note to stderr) on an async/generator def — the repl
-    is SYNCHRONOUS, so such policies aren't covered by the recursion-depth cap."""
+def test_d7_async_refused_generators_allowed(defaults_installed):
+    """D7/M3: the repl is SYNCHRONOUS, so @policy REFUSES async — a function, OR a class with
+    an async method, OR a rewrite that introduces one. SYNC generators are ALLOWED and yield
+    normally. (Depth-correctness across arbitrary compositions is verified exhaustively in
+    test_generator_policy_depth_correct_all_permutations.)"""
+    # async function -> refused, not installed
+    with pytest.raises(TypeError, match="SYNCHRONOUS"):
+        @policy
+        async def af():
+            return 1
+    assert "af" not in _PLM_POLICIES
+
+    # a @policy class with an async method -> refused
+    with pytest.raises(TypeError, match="SYNCHRONOUS"):
+        @policy
+        class C:
+            async def __call__(self):
+                return 1
+
+    # a sync generator policy works + yields correctly
     @policy
-    def gen_pol():
+    def seq():
+        for i in range(3):
+            yield i * i
+
+    assert list(seq()) == [0, 1, 4]
+
+    # a rewrite that introduces async is ALSO refused; the old sync policy is kept intact
+    @policy
+    def keep():
+        return 1
+
+    with pytest.raises(TypeError, match="SYNCHRONOUS"):
+        keep._rewrite("async def keep():\n    return 9\n")
+    assert keep() == 1
+
+
+def test_generator_policy_depth_correct_all_permutations():
+    """M3: a sync generator policy must run DEPTH-CORRECTLY in EVERY composition — the proxy
+    re-enters the policy-call boundary per `next()`, so a generator body runs at the same
+    policy depth a normal call would, in ANY chain of normal/generator policies. Exhaustive
+    over all 254 normal/generator chains of length 1..7 (built from raw _FunctionPolicy
+    proxies — exactly what @policy installs)."""
+    import itertools
+    import inspect as _inspect
+    from plm.policy.proxy import _FunctionPolicy, _POLICY_CALL_DEPTH as D
+
+    def mk(fn):
+        return _FunctionPolicy(fn, "src", "<gen-perm-test>")
+
+    def run(x):                                       # drive a result: a generator -> its yielded value
+        if _inspect.isgenerator(x):
+            for v in x:
+                return v
+            return None
+        return x
+
+    def build(kinds):                                 # chain p0->...->p{L-1}; leaf reports its policy depth
+        L = len(kinds)
+        pols = [None] * L
+        if kinds[-1] == "n":
+            pols[L - 1] = mk(lambda: D.get())
+        else:
+            def leaf():
+                yield D.get()
+            pols[L - 1] = mk(leaf)
+        for i in range(L - 2, -1, -1):
+            c = pols[i + 1]
+            if kinds[i] == "n":
+                pols[i] = mk((lambda c=c: run(c())))
+            else:
+                def fwd(c=c):
+                    yield run(c())
+                pols[i] = mk(fwd)
+        return pols[0]
+
+    total = 0
+    for L in range(1, 8):
+        for kinds in itertools.product("ng", repeat=L):
+            total += 1
+            assert run(build(kinds)()) == L, ("".join(kinds), L)   # leaf runs at depth == chain length
+    assert total == 254
+
+
+def test_generator_policy_full_protocol_and_no_leak():
+    """M3: a generator policy supports the FULL generator protocol depth-correctly and leaks no
+    depth — send/throw/close/return, control-flow thrown IN, yield-from delegation, and nested
+    recursion (the cap fires mid-body), all with the policy-call boundary re-entered per step."""
+    from plm.policy.proxy import _FunctionPolicy, _POLICY_CALL_DEPTH as D, POLICY_CALL_DEPTH_CAP
+
+    def mk(fn):
+        return _FunctionPolicy(fn, "src", "<gen-proto-test>")
+
+    base = D.get()
+
+    def echo():                                          # send forwards the value
+        x = yield 1
+        yield ("got", x)
+    g = mk(echo)()
+    assert next(g) == 1 and g.send("hi") == ("got", "hi")
+
+    def catcher():                                       # throw caught -> re-yielded
+        try:
+            yield 1
+        except ValueError as e:
+            yield ("caught", str(e))
+    g = mk(catcher)(); next(g)
+    assert g.throw(ValueError("boom")) == ("caught", "boom")
+
+    def cf():                                            # control-flow thrown IN is delivered
+        try:
+            yield 1
+        except SystemExit:
+            yield "exit"
+    g = mk(cf)(); next(g)
+    assert g.throw(SystemExit()) == "exit"
+
+    def nocatch():                                       # uncaught throw propagates
         yield 1
-    err = capsys.readouterr().err
-    assert "synchronous" in err.lower() and "gen_pol" in err
+    g = mk(nocatch)(); next(g)
+    with pytest.raises(KeyError):
+        g.throw(KeyError("k"))
+
+    fin = []                                             # close runs finally
+    def closer():
+        try:
+            yield 1
+        finally:
+            fin.append(1)
+    g = mk(closer)(); next(g); g.close()
+    assert fin == [1]
+
+    def rv():                                            # return value preserved
+        yield 1
+        return "R"
+    g = mk(rv)(); next(g)
+    with pytest.raises(StopIteration) as si:
+        next(g)
+    assert si.value.value == "R"
+
+    def inner():                                         # yield-from: correct depth + return value
+        d = yield D.get()
+        return ("ret", d)
+    def outer():
+        r = yield from mk(inner)()
+        yield r
+    g = mk(outer)()
+    assert next(g) == 2                                  # outer=1, inner body=2
+    assert g.send("S") == ("ret", "S")
+
+    def deep(n):                                         # recursion cap fires from inside a gen body
+        if n > 0:
+            yield from deep_p(n - 1)
+        else:
+            yield D.get()
+    deep_p = mk(deep)
+    with pytest.raises(RecursionError):
+        list(deep_p(POLICY_CALL_DEPTH_CAP + 5))
+
+    assert D.get() == base                               # NO depth leak after ANY of it
+
+
+def test_policy_returning_generator_is_not_depth_wrapped():
+    """M3 (regression): ONLY a policy that IS a generator function gets depth-wrapped. A NORMAL
+    policy that merely RETURNS a generator — a genexpr, another policy's generator, or a plain
+    function's generator — is returned UNTOUCHED, so iterating it adds NO spurious policy frame
+    (the returner is off the stack by then). Plus a grab-bag of weird generator edges."""
+    from plm.policy.proxy import _FunctionPolicy, _POLICY_CALL_DEPTH as D
+
+    def mk(fn):
+        return _FunctionPolicy(fn, "src", "<gen-return-test>")
+
+    rep = mk(lambda: D.get())
+
+    assert list(mk(lambda: (rep() for _ in range(2)))()) == [1, 1]   # genexpr -> not double-counted
+
+    def gp():
+        yield D.get()
+    genp = mk(gp)
+    assert list(mk(lambda: genp())()) == [1]             # forward another policy's gen -> 1 frame only
+
+    def plain():
+        yield D.get()
+    assert list(mk(lambda: plain())()) == [0]            # plain (non-policy) gen -> no policy frame
+
+    def gp2():
+        yield rep()
+    assert list(mk(gp2)()) == [2]                        # IS a generator function -> wrapped, depth 2
+
+    def acc():                                           # stateful (send-driven) generator policy
+        total = 0
+        while True:
+            x = yield total
+            if x is None:
+                return total
+            total += x
+    g = mk(acc)()
+    assert [next(g), g.send(5), g.send(3)] == [0, 5, 8]
+
+    # PEP-479: a StopIteration raised in the body surfaces as RuntimeError (not silent stop)
+    def bad():
+        yield 1
+        raise StopIteration
+    g = mk(bad)(); next(g)
+    with pytest.raises(RuntimeError):
+        next(g)
+
+    def empty():                                         # unreachable yield -> empty generator
+        return
+        yield
+    assert list(mk(empty)()) == []
+    assert list(mk(lambda: (x for x in []))()) == []     # empty genexpr returned
+
+    # interleaved generator policies stay depth-correct independently
+    a, b = mk(lambda: (rep() for _ in range(2)))(), mk(gp2)()
+    assert [next(a), next(b), next(a)] == [1, 2, 1]
+    assert D.get() == 0                                  # no leak
 
 
 def test_da7_natural_llm_input_and_response_validation(defaults_installed, stub_backend):

@@ -12,19 +12,26 @@ Layout (per the plan):
     `iter_default_policies` and replayed as synthetic cells via the bootstrap
     loader, NOT imported as Python modules — that's how the policy source
     extraction + linecache pipeline works uniformly for defaults + extras.
-    Immutability/blessing is decided per-name by `UNDUPLICABLE_DEFAULTS`
-    (below), NOT by being a default file: `base_verifier` is a default file that
-    is deliberately NOT in that set, so it stays mutable + duplicable +
-    unblessed (it reaches the model only via `natural_llm` / `react_llm`).
+    Sealing/blessing is decided per-name by `_LLM_DEFAULT_POLICIES` (below), NOT
+    by being a default file: `base_verifier` is a default file that is deliberately
+    NOT in that set, so it stays mutable + duplicable + unblessed (it reaches the
+    model only via `natural_llm` / `react_llm`).
+
+Two DISTINCT concepts (kept separate):
+  * `_LLM_DEFAULT_POLICIES` (here) — the LLM-loop default NAMES. The bootstrap
+    BLESSES these (grants their bodies raw access to `_make_backend`/`descend`/
+    `llm_call`) and also seals them. This is the BLESS set.
+  * `registry._SEALED_POLICIES` — the RUNTIME SEAL set, populated by
+    `registry._seal`. It holds EVERY sealed (immutable + un-duplicable) policy: the
+    LLM defaults, a metaparam's sealed extras, and (in future) any policy PLM itself
+    seals — sealed but NOT blessed by membership. A SUPERSET of the bless set.
 
 This package exports three names the PREFIX bootstrap uses:
   * `iter_default_policies()` — yields (name, full_source) for each policy file.
-  * `UNDUPLICABLE_DEFAULTS` — names that are sealed immutable + un-duplicable
-    after the bootstrap install.
+  * `_LLM_DEFAULT_POLICIES` — the names blessed (and sealed) after bootstrap.
   * `_bless_llm_callers()` — refreshes `_BLESSED_CALLERS` against the
-    `_inner.__code__` of the immutable LLM-default proxies. Called from
-    PREFIX (post-install) AND from `kernel.py`'s rehydrate handler
-    (post-restore).
+    `_inner.__code__` of the LLM-default proxies. Called from PREFIX
+    (post-install) AND from `kernel.py`'s rehydrate handler (post-restore).
 """
 
 from __future__ import annotations
@@ -53,11 +60,13 @@ def iter_default_policies():
         yield p.stem, src
 
 
-# The immutable LLM-default names. Bootstrap seals these as immutable +
-# un-duplicable + blessed. NOTE: `base_verifier` ships as a default file too but
-# is intentionally ABSENT here — that is what keeps it mutable + duplicable +
-# unblessed (a PLM-forkable reference verifier).
-UNDUPLICABLE_DEFAULTS = frozenset({"natural_llm", "react_llm", "react_llm_verifier"})
+# The LLM-loop default NAMES — the BLESS set. Bootstrap blesses these (raw
+# _make_backend/descend/llm_call access) AND seals them (immutable + un-duplicable).
+# This is DISTINCT from the runtime SEAL set (`registry._SEALED_POLICIES`),
+# which also contains a metaparam's sealed extras — those are sealed but NOT blessed.
+# NOTE: `base_verifier` ships as a default file too but is intentionally ABSENT here —
+# that keeps it mutable + duplicable + unblessed (a PLM-forkable reference verifier).
+_LLM_DEFAULT_POLICIES = frozenset({"natural_llm", "react_llm", "react_llm_verifier"})
 
 
 def _bless_llm_callers() -> None:
@@ -66,7 +75,7 @@ def _bless_llm_callers() -> None:
 
     Called TWICE in the kernel's lifecycle:
       1. From PREFIX bootstrap, AFTER the LLM defaults are installed and
-         `_IMMUTABLE_POLICIES`/`_UNDUPLICABLE_POLICIES` are populated.
+         `_SEALED_POLICIES` is populated.
       2. From `plm/repl/kernel.py`'s rehydrate handler, AFTER `_PLM_POLICIES`
          is reconciled (boot's v0 defaults preserved). Defensively uniform
          — for the LLM defaults whose code we kept-from-PREFIX, it's a no-op;
@@ -75,10 +84,14 @@ def _bless_llm_callers() -> None:
 
     Single-shot frozenset assignment — never expose a writable set.
     """
-    from plm.policy.registry import _PLM_POLICIES, _UNDUPLICABLE_POLICIES
+    from plm.policy.registry import _PLM_POLICIES
     from plm.policy.defaults import _llm_infra
     codes = []
-    for pn in _UNDUPLICABLE_POLICIES:
+    # Bless ONLY the LLM-loop defaults (the BLESS set) — NOT the runtime SEAL set
+    # (`_SEALED_POLICIES`). Those were once identical, but a metaparam's SEALED extra is in
+    # the SEAL set while deliberately NOT blessed (it reaches the model via natural_llm/react_llm
+    # like any policy); blessing the whole sealed set would wrongly grant it raw access.
+    for pn in _LLM_DEFAULT_POLICIES:
         p = _PLM_POLICIES.get(pn)
         if p is None:
             continue

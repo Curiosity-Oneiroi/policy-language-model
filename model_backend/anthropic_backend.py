@@ -27,7 +27,7 @@ class AnthropicBackend(BaseModelBackend):
         import os
         # Expose api_key as a plain attr so PLM's spec builder round-trips it to
         # the kernel sub-LLM (else an explicitly-passed key is dropped, leaving
-        # only the ANTHROPIC_API_KEY env fallback). Mirrors Slate/VLLM/OpenAI (#R4-1).
+        # only the ANTHROPIC_API_KEY env fallback). Mirrors Slate/VLLM/OpenAI.
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         try:
             import anthropic

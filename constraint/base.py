@@ -34,8 +34,8 @@ The Constraint.field(**kw) kwarg surface, by built-in type:
   bytes   : bytes_length=(lo,hi)   (a bytearray is accepted but normalized to bytes)
   complex : abs_range=(lo,hi), real_range=(lo,hi), imag_range=(lo,hi)
   bool/None: no dedicated kwargs by design — use one_of=[True]/[False] / one_of=[None]
-             (or instance_of=bool); Optional[...] handles nullable struct fields
-  type    : instance_of=T, callable=True, behaves_like=[((args),out),..]
+             (or is_instance_of=bool); Optional[...] handles nullable struct fields
+  type    : is_instance_of=T (STRICT isinstance, no coercion), callable=True, behaves_like=[((args),out),..]
   named   : kind="email|url|uuid|semver|iso_date|identifier|json|regex|path_exists"
   custom  : predicate=fn / predicates=[fn,..], coercer=fn / coercers=[fn,..], description="..."
   (element types T in list_of/set_of/tuple_of/dict_of may themselves be Constraints.)
@@ -273,10 +273,15 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             "_constraint_field_annotation": _flat,     # so .field works as a list_of/set_of/.. element
             # describe()/json_schema() delegate to `inner` (the facade shadows the BASE
             # ones), so these are NOT used for rendering. `_constraint_factory_kwargs` IS
-            # carried, but for ONE purpose only: crash-restart RECIPE replay — the
-            # snapshot can't dill-pickle this dynamic class, so it stores these kwargs and
-            # rehydrate rebuilds via `Constraint.field(**kwargs)` (see constraint/snapshot.py).
-            "_constraint_factory_kwargs": dict(kwargs),
+            # carried, but for ONE purpose only: crash-restart RECIPE replay — the snapshot
+            # can't dill-pickle this dynamic class, so it stores these kwargs and rehydrate
+            # rebuilds via `Constraint.field(**kwargs)` (see constraint/snapshot.py). Derive
+            # it from INNER — like every other facade attr (`_constraint_field_inner_type`,
+            # `_constraint_field_annotation`) reads from inner — NOT from the facade's own raw
+            # `kwargs`: inner captured them AFTER materializing one-shot iterables, whereas the
+            # raw `kwargs` here hold ALREADY-EXHAUSTED generators (one_of/coercers/...), so a
+            # raw copy would recipe an empty/garbage sequence.
+            "_constraint_factory_kwargs": dict(inner._constraint_factory_kwargs),
             "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
         }
         return _ConstraintMeta("_FieldConstraint", (Constraint,), ns)
@@ -391,11 +396,11 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             # alone) makes pydantic raise TypeError on a non-sized value, and a
             # coercer can raise anything. Funnel any such failure into the
             # documented ConstraintViolation contract instead of leaking a raw
-            # exception to a direct `.validate()` caller (#R4-2). Build the message
+            # exception to a direct `.validate()` caller. Build the message
             # DEFENSIVELY: a pathological exception's own `__str__` can itself raise
             # (e.g. a custom validator error whose `__str__` blows up), and an
             # unguarded f-string interpolation of it would leak THAT raw exception
-            # out of validate(), breaking the contract for the wrapper too (#H8).
+            # out of validate(), breaking the contract for the wrapper too.
             try:
                 _detail = str(e)
             except Exception:
@@ -427,7 +432,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             # Pydantic wraps the value in a "value" field; flatten for export.
             value_schema = dict(schema.get("properties", {}).get("value", schema))
             # Preserve the document's `$defs`: when the value annotation references
-            # another model (e.g. instance_of=Model, list_of=Model), the flattened
+            # another model (e.g. is_instance_of=Model, list_of=Model), the flattened
             # value schema carries `$ref: #/$defs/Model` but the definitions live
             # at the top level — drop them and the refs dangle. Carry them along so
             # the refs still resolve in the exported (now top-level) schema.
@@ -436,7 +441,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             # Carry x-description from the factory kwargs + user description.
             # describe() can raise on a pathological constraint; never let that
             # abort json_schema() — it's called e.g. by natural_llm to build
-            # response_format, OUTSIDE its retry loop. Omit x-desc on failure (#6).
+            # response_format, OUTSIDE its retry loop. Omit x-desc on failure.
             try:
                 x_desc = cls.describe()
             except Exception:
@@ -479,7 +484,7 @@ _KNOWN_KWARGS = frozenset(
     {
         "int_range", "int_gt", "int_ge", "int_lt", "int_le",
         "float_range", "float_gt", "float_ge", "float_lt", "float_le",
-        "instance_of", "one_of", "not_one_of",
+        "is_instance_of", "one_of", "not_one_of",
         "str_pattern", "str_length", "not_pattern", "not_empty",
         "list_of", "dict_of", "list_length", "unique", "sorted", "monotonic",
         "approx", "callable", "behaves_like",
@@ -519,13 +524,13 @@ def _resolve_elem_type(arg: Any) -> Any:
             # List[composite]/Dict[..,composite] against the composite's EMPTY
             # model — rejecting valid scalar elements and accepting garbage. Route
             # each element through an AfterValidator that runs the composite's own
-            # validate(), so OR/AND/XOR/NOT actually apply per element (#R4-3).
+            # validate(), so OR/AND/XOR/NOT actually apply per element.
             # Use a 2-arg validator so pydantic injects ValidationInfo, and thread
             # the outer `context=` into the child validate() — matching the
             # top-level composite path and every other `context=context` hand-off.
             # A 1-arg lambda silently dropped the context, so a context-dependent
             # @model_validator in a structural child of a COMPOSITE element never
-            # saw it (validate(value, *, context=) is a documented public API). (#R6-1)
+            # saw it (validate(value, *, context=) is a documented public API).
             return Annotated[Any, AfterValidator(
                 lambda v, _info, _c=arg: _c.validate(v, context=_info.context))]
         return arg          # plain structural subclass: pydantic validates it as a model
@@ -613,7 +618,7 @@ def _wrap_coercer(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     `_wrap_predicate`. A coercer applied to the wrong-typed value (e.g.
     `coercer=str.lower` on an int) would otherwise escape pydantic RAW and bypass
     the ConstraintViolation contract. Unlike a predicate, a coercer RETURNS the
-    transformed value, so we return `fn(v)` unchanged on success (#R4-2)."""
+    transformed value, so we return `fn(v)` unchanged on success."""
     fn_name = getattr(fn, "__name__", "<coercer>")
 
     def _wrapped(v: Any) -> Any:
@@ -645,7 +650,7 @@ _TYPE_KWARG_GROUPS: Dict[str, frozenset] = {
     "set":      frozenset({"set_of", "frozenset_of", "set_length"}),
     "bytes":    frozenset({"bytes_length"}),
     "complex":  frozenset({"abs_range", "real_range", "imag_range"}),
-    "instance": frozenset({"instance_of"}),
+    "instance": frozenset({"is_instance_of"}),
     "literal":  frozenset({"one_of"}),
     "kind":     frozenset({"kind"}),
 }
@@ -769,6 +774,23 @@ def _build_factory(**kwargs: Any) -> Type[Constraint]:
     return cls  # type: ignore[return-value]
 
 
+def _strict_base(target_cls: Any) -> Any:
+    """Annotation for `is_instance_of=target_cls` that does NOT coerce.
+
+    For a coercible type (int/float/str/bytes/bool, containers, std-lib types) pydantic's
+    `Strict()` turns off coercion — so `is_instance_of=int` rejects "5", 5.0 AND True (a bool is
+    not a real int). For an ARBITRARY class pydantic uses an is-instance schema that `Strict()`
+    can't annotate (and which never coerces anyway), so we fall back to the plain type — already
+    an isinstance-only check. Probing a tiny TypeAdapter is the robust way to tell the two apart
+    without enumerating every coercible std-lib type."""
+    ann = Annotated[target_cls, pd.Strict()]
+    try:
+        pd.TypeAdapter(ann)              # builds the schema eagerly; raises if Strict can't apply
+        return ann
+    except Exception:
+        return target_cls                # is-instance schema (arbitrary class): plain == isinstance
+
+
 def _interpret_kwargs(
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, Dict[str, Any], List[Callable[[Any], None]], List[Callable[[Any], Any]]]:
@@ -848,10 +870,11 @@ def _interpret_kwargs(
             base_type = float
             field_kwargs[key] = kwargs.pop(k_float)
 
-    # --- instance_of ---
-    if "instance_of" in kwargs:
-        target_cls = kwargs.pop("instance_of")
-        base_type = target_cls
+    # --- is_instance_of (STRICT: pydantic Strict() -> a real isinstance check, NO coercion) ---
+    if "is_instance_of" in kwargs:
+        target_cls = kwargs.pop("is_instance_of")
+        base_type = _strict_base(target_cls)             # reject "5"/5.0/True for int; arbitrary class
+                                                         # stays isinstance-only (Strict can't annotate it)
 
     # --- one_of (Literal[...]) ---
     if "one_of" in kwargs:
@@ -876,7 +899,7 @@ def _interpret_kwargs(
                 # never equal a hashable scalar, so it is genuinely NOT forbidden —
                 # but `in set` raises. Fall back to element-wise == (-> False), so
                 # such a value is ALLOWED, matching the unhashable-MEMBERS path
-                # (acceptance must not depend on member hashability) (#R4-4).
+                # (acceptance must not depend on member hashability).
                 forbidden = any(v == b for b in _bad)
             if forbidden:
                 raise ValueError(f"{v!r} is in the forbidden set {list(_bad)!r}")
@@ -1151,7 +1174,7 @@ def _interpret_kwargs(
 
     # --- set relations / membership ---
     # Element-wise (==) rather than set ops, so UNHASHABLE members AND unhashable
-    # values are tolerated (mirrors not_one_of's #R4-4 spirit) — no eager set()
+    # values are tolerated (mirrors not_one_of's spirit) — no eager set()
     # leaks a raw TypeError out of the factory.
     if "subset_of" in kwargs:
         _sub = list(kwargs.pop("subset_of"))
@@ -1263,7 +1286,7 @@ _DESCRIBE_RULES: Tuple[Tuple[str, bool, Callable[[Any], str]], ...] = (
     ("float_ge",    False, lambda v: f"float ge {v}"),
     ("float_lt",    False, lambda v: f"float lt {v}"),
     ("float_le",    False, lambda v: f"float le {v}"),
-    ("instance_of", False, lambda v: f"an instance of {v.__name__}"),
+    ("is_instance_of", False, lambda v: f"strictly an instance of {v.__name__} (no coercion)"),
     ("one_of",      False, lambda v: f"one of {list(v)}"),
     ("not_one_of",  False, lambda v: f"not one of {list(v)}"),
     ("str_pattern", False, lambda v: f"matches pattern /{v}/"),
@@ -1380,7 +1403,11 @@ def _collect_validator_descriptions(cls: Type[Constraint]) -> List[str]:
             extras.append(d)
 
     for name in dir(cls):
-        _add(get_description(getattr(cls, name, None)))
+        try:
+            _member = getattr(cls, name, None)        # a descriptor __get__ can raise (non-AttributeError)
+        except Exception:
+            continue                                  # skip a member that can't even be read off the class
+        _add(get_description(_member))
     decs = getattr(cls, "__pydantic_decorators__", None)
     if decs is not None:
         for v in list(getattr(decs, "model_validators", {}).values()):

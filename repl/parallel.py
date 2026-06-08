@@ -33,15 +33,19 @@ def parallel(*tasks, max_workers=None):
       - Each task is a zero-arg callable (typically a lambda capturing args).
       - Returns a LIST, same length + order as `tasks`. Each slot is the task's return
         value (`None` if it returned nothing), OR — if the task RAISED — the EXCEPTION
-        OBJECT it raised. So `parallel()` itself NEVER raises for a task error; check a
-        slot with `isinstance(r, Exception)`.
+        OBJECT it raised. `parallel()` is FULLY ISOLATING: it NEVER propagates anything a
+        task does. That includes control-flow `BaseException`s a policy may raise
+        (`SystemExit`/`KeyboardInterrupt`/`GeneratorExit`/`CancelledError`) — those are
+        RETURNED in the slot too, never re-raised. So check a slot with
+        `isinstance(r, BaseException)` (NOT `Exception`, which would miss those and read a
+        returned `SystemExit` as a successful result).
       - ISOLATED: every task runs to completion; one task raising does NOT abort the
         others. `parallel()` waits for ALL of them (you always get every result), so it
         returns once the slowest task finishes.
       - The REPL is synchronous: calling `parallel()` from inside a running event loop
         raises a clear RuntimeError (it cannot nest into one) — that is parallel()'s OWN
-        error, not a task's. Nested `parallel(...)` from a worker thread (no loop there)
-        works — each makes its own loop.
+        error, the ONLY thing it ever raises, never a task's. Nested `parallel(...)` from a
+        worker thread (no loop there) works — each makes its own loop.
 
     Example:
         # any zero-arg callables — plain functions, policies, sub-LLM calls, ...
@@ -52,8 +56,8 @@ def parallel(*tasks, max_workers=None):
         # a wide batch; one branch failing leaves a result-or-exception in its slot:
         results = parallel(*[lambda i=i: my_policy(items[i]) for i in range(500)],
                            max_workers=64)
-        ok   = [r for r in results if not isinstance(r, Exception)]
-        errs = [r for r in results if isinstance(r, Exception)]
+        ok   = [r for r in results if not isinstance(r, BaseException)]
+        errs = [r for r in results if isinstance(r, BaseException)]
     """
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
@@ -89,10 +93,24 @@ def parallel(*tasks, max_workers=None):
         # `copy_context()` per task carries the current context (e.g. the depth gate) into the
         # worker. `return_exceptions=True` -> gather runs ALL tasks to completion and returns
         # a RESULT-OR-EXCEPTION per task, so one failing branch never aborts the others.
+        def _shielded(_t):
+            # FULL isolation: a task that raises ANYTHING — a normal Exception OR a control-flow
+            # BaseException (SystemExit/KeyboardInterrupt/GeneratorExit/CancelledError), which a
+            # policy can legitimately raise — has it CAUGHT and RETURNED in its slot, never
+            # propagated out of parallel(). (Runs in a worker thread, so such an exception never
+            # reached the caller anyway; this just makes the return a guarantee, not a gather
+            # quirk.) The task's behaviour/side-effects/context are untouched — only its
+            # exception is captured, with its traceback preserved on the object.
+            def _run():
+                try:
+                    return _t()
+                except BaseException as _e:
+                    return _e
+            return _run
         pool = ThreadPoolExecutor(max_workers=n)         # own pool, not a per-call default
         try:
-            futs = [loop.run_in_executor(pool, copy_context().run, t) for t in tasks]
-            return await asyncio.gather(*futs, return_exceptions=True)
+            futs = [loop.run_in_executor(pool, copy_context().run, _shielded(t)) for t in tasks]
+            return await asyncio.gather(*futs, return_exceptions=True)   # belt-and-suspenders
         finally:
             pool.shutdown(wait=False)
 

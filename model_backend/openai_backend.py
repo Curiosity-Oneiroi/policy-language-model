@@ -8,9 +8,23 @@ import os
 import re
 
 
-# Reasoning models (o1, o3, gpt-5, etc.) use Responses API params and strip unsupported sampling params
+# Reasoning models (o1..o9, gpt-5) use Responses API params and strip unsupported sampling params
 _REASONING_MODEL_PATTERN = re.compile(r"^(o[1-9]|gpt-5)")
 _UNSUPPORTED_REASONING_PARAMS = {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
+
+
+def _normalize_model_name(model: Optional[str]) -> str:
+    """Strip a `provider/` routing prefix (LiteLLM/OpenRouter/Azure: `openai/o3-mini`,
+    `azure/gpt-5`) and lowercase, so reasoning-model detection is robust to casing + prefixes."""
+    return (model or "").split("/")[-1].lower()
+
+
+def _is_reasoning_model_name(model: Optional[str]) -> bool:
+    """The SINGLE reasoning-model classifier — used by BOTH the `use_responses_api` auto-detect
+    AND the `_is_reasoning_model` property, so they can never disagree (a mismatch sends an
+    o-series/gpt-5 model down the wrong API path -> `temperature` 400, or a missing `reasoning`
+    dict). Covers o1..o9 + gpt-5, regardless of casing or a `provider/` prefix."""
+    return bool(_REASONING_MODEL_PATTERN.match(_normalize_model_name(model)))
 
 # Kwargs we are willing to forward to the OpenAI HTTP APIs. Everything else
 # the caller passes (event-logging plumbing, agent-core internals, custom
@@ -193,14 +207,14 @@ class OpenAIBackend(BaseModelBackend):
         # them into the kernel sub-LLM's `_PLM_BACKEND_SPEC`. Without this, an
         # in-cell natural_llm/react_llm rebuilt via from_spec loses a custom
         # api_key/base_url and silently falls back to OPENAI_API_KEY + the default
-        # api.openai.com endpoint (#R4-1). Mirrors Slate/VLLM which already do this.
+        # api.openai.com endpoint. Mirrors Slate/VLLM which already do this.
         self.api_key = api_key_value
         self.base_url = base_url
 
-        # Auto-detect if we should use Responses API based on model name
+        # Auto-detect Responses API from the model name via the SHARED classifier (so it can
+        # never disagree with `_is_reasoning_model`, and correctly covers o2/o4/o5+ + prefixes).
         if use_responses_api is None:
-            reasoning_models = ["o1", "o3", "gpt-5"]
-            self.use_responses_api = bool(model and any(m in model.lower() for m in reasoning_models))
+            self.use_responses_api = _is_reasoning_model_name(model)
         else:
             self.use_responses_api = use_responses_api
 
@@ -227,8 +241,10 @@ class OpenAIBackend(BaseModelBackend):
 
     @property
     def _is_reasoning_model(self) -> bool:
-        """True if model is a reasoning model (o1, o3, gpt-5, etc.) with special param requirements."""
-        return bool(_REASONING_MODEL_PATTERN.match(self.model))
+        """True if the model is a reasoning model (o1..o9, gpt-5) with special param
+        requirements. Shares `_is_reasoning_model_name` with the `use_responses_api`
+        auto-detect, so the two can NEVER disagree."""
+        return _is_reasoning_model_name(self.model)
     
     def _prepare_responses_api_kwargs(self, kwargs: Dict[str, Any], default_tokens: int = 4096) -> Dict[str, Any]:
         """Build kwargs for the Responses API by allowlisting known-good params.
@@ -386,9 +402,11 @@ class OpenAIBackend(BaseModelBackend):
     ) -> Dict[str, Any]:
         """Use Responses API (full instructions + input format, reasoning param handling)."""
         sanitized_tools, tool_name_mapping = self._sanitize_and_cache_tools(tools)
+        # Prior turns' tool_calls are validated by OpenAI even when THIS turn has no tools, so
+        # sanitize history UNCONDITIONALLY — consistent with the Chat path.
+        messages = self._sanitize_message_history(messages, tool_name_mapping)
         if sanitized_tools:
             kwargs["_tool_name_mapping"] = tool_name_mapping
-            messages = self._sanitize_message_history(messages, tool_name_mapping)
 
         payload = self._prepare_responses_api_payload(messages)
         prepared_kwargs = self._prepare_responses_api_kwargs(kwargs)
@@ -594,9 +612,9 @@ class OpenAIBackend(BaseModelBackend):
         """Structured output via Responses API (text.format json_schema)."""
         try:
             sanitized_tools, tool_name_mapping = self._sanitize_and_cache_tools(tools)
+            messages = self._sanitize_message_history(messages, tool_name_mapping)   # always
             if sanitized_tools:
                 kwargs["_tool_name_mapping"] = tool_name_mapping
-                messages = self._sanitize_message_history(messages, tool_name_mapping)
             payload = self._prepare_responses_api_payload(messages)
             prepared_kwargs = self._prepare_responses_api_kwargs(kwargs)
             request_params: Dict[str, Any] = {

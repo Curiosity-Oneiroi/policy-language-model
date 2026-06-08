@@ -33,6 +33,12 @@ DEFAULT_PYTHON: str = "3.12"
 _SHUTDOWN_WAIT = 2.0
 _REAP_WAIT = 1.0
 
+# a 4-byte length header names up to ~4 GiB; on a desync/corruption that bound would drive
+# an unbounded read instead of a clean failure. Real frames are tiny (var_size_max defaults to
+# 10 MiB/var; you'd need ~200 max-size vars to approach this), so a length past this cap is a
+# corrupt/desynced header -> _FrameDecodeError -> respawn. MUST match kernel.py's _REPL_MAX_FRAME.
+_MAX_FRAME_BYTES = 2 * 1024 ** 3
+
 
 class _CellTimeout(Exception):
     """Internal — caught by `execute_cell` to drive SIGINT/SIGKILL escalation.
@@ -54,45 +60,47 @@ class _FrameDecodeError(Exception):
     Caught by `execute_cell` -> respawn; never allowed to escape uncaught."""
 
 
-def _compute_child_pythonpath() -> str:
-    """Build PYTHONPATH so the kernel child can import `plm.*`.
+def _compute_child_pythonpath(inherited: str = "") -> str:
+    """Prepend the dir that makes `import plm` work to the child's `inherited` PYTHONPATH.
 
-    The child runs in a fresh per-session venv that does NOT install `plm` — it is
-    live project source, not a wheel. So we hand the child the directory that makes
-    `plm` importable in THIS (parent) process, derived from `plm.__path__[0]`.
+    The child runs in a fresh per-session venv that does NOT install `plm` — it is live project
+    source, not a wheel. So we hand the child the directory that makes `plm` importable in THIS
+    (parent) process, derived from `plm.__path__[0]`.
 
-    This replaces an earlier `Path(__file__).resolve().parents[2]` guess: `resolve()`
-    collapses the `plm` symlink, so that guess landed on a dir not containing the
-    package, and the child only worked when the parent's PYTHONPATH happened to
-    carry the right dir. Deriving from `plm.__path__[0]` (UN-resolved, to preserve
-    the symlinked name) is correct regardless of how the parent obtained the
-    package (symlink, editable, install). The model backends now live under
-    `plm.model_backend` (no AFramework dependency), so only `plm` is needed. The
-    inherited PYTHONPATH is still appended as a fallback.
+    This replaces an earlier `Path(__file__).resolve().parents[2]` guess: `resolve()` collapses
+    the `plm` symlink, so that guess landed on a dir not containing the package, and the child
+    only worked when the parent's PYTHONPATH happened to carry the right dir. Deriving from
+    `plm.__path__[0]` (UN-resolved, to preserve the symlinked name) is correct regardless of how
+    the parent obtained the package (symlink, editable, install). The model backends now live
+    under `plm.model_backend` (no AFramework dependency), so only `plm` is needed.
+
+    `inherited` is the PYTHONPATH the child would otherwise carry — a caller-supplied `env=`
+    PYTHONPATH (which beats `os.environ` in the env merge upstream) or the inherited process one.
+    It is PRESERVED, not clobbered: the plm dir goes FIRST (so `import plm` always
+    resolves), then every distinct dir of `inherited`, deduped PER DIRECTORY (not per whole
+    string) so a partial overlap never yields a duplicated entry.
     """
-    entries: list[str] = []
+    raw: list[str] = []
     try:
         import plm
         paths = list(getattr(plm, "__path__", []) or [])
         if paths:
-            entries.append(str(Path(paths[0]).parent))  # the dir that makes `import plm` work
+            raw.append(str(Path(paths[0]).parent))  # the dir that makes `import plm` work
     except (ImportError, AttributeError, IndexError, OSError) as e:
         # Don't SILENTLY drop the path on an unrelated error — the child would later fail
-        # `import plm` with no hint. Narrow the catch + warn, then fall back to the
-        # inherited PYTHONPATH.
+        # `import plm` with no hint. Narrow the catch + warn, then rely on `inherited`.
         import warnings
         warnings.warn(
             f"could not derive the plm path for the kernel child ({e!r}); relying on the "
             f"inherited PYTHONPATH", RuntimeWarning)
-    existing = os.environ.get("PYTHONPATH", "")
-    if existing:
-        entries.append(existing)
+    raw.append(inherited)
     seen: set[str] = set()
     deduped: list[str] = []
-    for e in entries:
-        if e and e not in seen:
-            seen.add(e)
-            deduped.append(e)
+    for chunk in raw:
+        for d in chunk.split(os.pathsep):            # split so INDIVIDUAL dirs dedupe
+            if d and d not in seen:
+                seen.add(d)
+                deduped.append(d)
     return os.pathsep.join(deduped)
 
 
@@ -206,7 +214,7 @@ class PythonReplSession:
         self.execution_count = 0
         self.cached_vars_blob: bytes = b""
         self.last_rehydrate_error: str | None = None
-        self._pending_boot_stderr: str | None = None   # soft extra-policy boot warnings (#26)
+        self._pending_boot_stderr: str | None = None   # soft extra-policy boot warnings
         # Bumped on every (re)spawn. A caller streaming incremental state (e.g. the
         # root loop's `plm_messages` delta) reads this to detect a respawn — whose
         # fresh kernel has lost any accumulated state — and resync from scratch.
@@ -219,6 +227,10 @@ class PythonReplSession:
         self._resp_r = None  # type: ignore[assignment]
         self._child_pid_box: list[int | None] = [None]
         self._io_lock = threading.Lock()
+        # Set once by close(); read by _kill_and_respawn/_spawn_kernel so the worker thread's
+        # post-close auto-respawn (its blocked read wakes EOF when close() kills the kernel)
+        # can't RESURRECT a torn-down session (orphan kernel) or hang 30s in accept().
+        self._closed = False
 
         ws = Path(self.workspace)
         ws.mkdir(parents=True, exist_ok=True)
@@ -245,13 +257,17 @@ class PythonReplSession:
         with open(self._kernel_path, "w", encoding="utf-8") as f:
             f.write(_assemble_kernel_script(self._prefix))
 
-        self._child_env: dict[str, str] = {
-            **os.environ,
-            **(env or {}),
-            "PYTHONPATH": _compute_child_pythonpath(),
+        # Merge env FIRST (a caller's `env=` overrides os.environ), THEN derive the
+        # kernel-critical keys from the merged result: PYTHONPATH prepends the plm dir to
+        # whatever PYTHONPATH the child would carry — a caller's or the inherited one — instead
+        # of clobbering it; PYTHONUNBUFFERED/_REPL_VAR_SIZE_MAX are set last so a caller's
+        # env can't override these few the kernel relies on.
+        self._child_env: dict[str, str] = {**os.environ, **(env or {})}
+        self._child_env.update({
+            "PYTHONPATH": _compute_child_pythonpath(self._child_env.get("PYTHONPATH", "")),
             "PYTHONUNBUFFERED": "1",
             "_REPL_VAR_SIZE_MAX": str(self.var_size_max),
-        }
+        })
 
         with self._io_lock:
             self._spawn_kernel()
@@ -397,36 +413,42 @@ class PythonReplSession:
         if fin is None or not fin.alive:
             return
 
-        # Acquire with a TIMEOUT — a `cell_timeout=None` cell in flight holds `_io_lock`
-        # for the whole cell, so an unconditional `with self._io_lock:` could block close()
-        # forever. If we can't get it in time, skip the graceful shutdown frame and just
-        # force-kill the group + tear down (without the lock).
+        # Mark closed BEFORE the force-kill below: an in-flight cell's worker thread, blocked
+        # on a read, wakes with EOF the moment that kill lands and then auto-respawns — the
+        # flag (set first, so the kill-that-wakes-it happens-after) makes that respawn a no-op
+        # instead of resurrecting this torn-down session.
+        self._closed = True
+
+        # Teardown must be SERIALIZED with the worker (it holds _io_lock for a whole cell), so
+        # we never touch shared state (_proc / pipes / pid box) concurrently. A
+        # `cell_timeout=None` cell blocked on a read would hold the lock forever — so if we
+        # can't get it, SIGKILL the kernel group: a kill mutates NO Python state, it just
+        # UNBLOCKS that read. The worker then wakes, sees `_closed`, exits WITHOUT respawning
+        # (see _kill_and_respawn), and RELEASES the lock — which we re-acquire. Either way we
+        # end up holding it, and the teardown below runs with NO concurrent worker. (Even a
+        # freak independent kernel-death-at-close lands here: close() holds the lock and kills
+        # whatever `_proc` the worker's respawn left — so an orphan / 30s-accept hang can't
+        # happen.)
         got = self._io_lock.acquire(timeout=_SHUTDOWN_WAIT)
+        if not got:
+            _proc = self._proc                            # single read; killpg below is state-free
+            if _proc is not None:
+                with suppress(ProcessLookupError, OSError):
+                    os.killpg(_proc.pid, signal.SIGKILL)  # unblock the in-flight read
+                with suppress(ProcessLookupError, OSError):
+                    _proc.kill()
+            got = self._io_lock.acquire(timeout=_SHUTDOWN_WAIT)   # worker releases right after the kill
+
         try:
-            if got and self._req_w is not None:
+            # Idle close (lock obtained cleanly, kernel still alive): ask it to exit gracefully
+            # first. Then _kill_silently ENSURES dead + reaped + pipes closed + pid box cleared
+            # (idempotent — also mops up any kernel a respawn-at-close raced into existence).
+            if self._proc is not None and self._proc.poll() is None and self._req_w is not None:
                 with suppress(BrokenPipeError, OSError, ValueError):
                     self._write_frame({"type": "shutdown"})
-
-            if self._proc is not None:
-                reaped = False
-                if got:
-                    with suppress(subprocess.TimeoutExpired):
-                        self._proc.wait(timeout=_SHUTDOWN_WAIT)
-                        reaped = True
-                if not reaped:                            # timed out, OR we never got the lock
-                    with suppress(ProcessLookupError, OSError):
-                        os.killpg(self._proc.pid, signal.SIGKILL)   # whole group
-                    with suppress(ProcessLookupError, OSError):
-                        self._proc.kill()
-                    with suppress(subprocess.TimeoutExpired):
-                        self._proc.wait(timeout=_REAP_WAIT)
-                        reaped = True
-                if reaped:
-                    # Child reaped: clear the pid box so the GC/atexit finalizer
-                    # never SIGKILLs a now-recycled PID (#R4-6).
-                    self._child_pid_box[0] = None
-
-            self._close_pipes()
+                with suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=_SHUTDOWN_WAIT)
+            self._kill_silently()
         finally:
             if got:
                 self._io_lock.release()
@@ -442,6 +464,8 @@ class PythonReplSession:
         posix_spawn-eligible — `fork()` from a multi-threaded Python process
         can deadlock on glibc's malloc mutex; `posix_spawn` (vfork) avoids it.
         """
+        if self._closed:                                          # defense: never spawn into a closed session
+            return
         sock_path = str(Path(self._control_dir) / "repl.sock")    # private 0700 dir, not /tmp
         with suppress(FileNotFoundError, OSError):                 # broadened: a stale path owned otherwise
             os.unlink(sock_path)
@@ -535,6 +559,8 @@ class PythonReplSession:
 
     def _kill_and_respawn(self) -> None:
         self._kill_silently()
+        if self._closed:
+            return                                     # closed during teardown -> kill only, NEVER resurrect
         self._spawn_kernel()
 
     def _kill_silently(self) -> None:
@@ -550,7 +576,7 @@ class PythonReplSession:
                 self._proc.wait(timeout=_REAP_WAIT)
         # This proc is no longer our live child (killed/reaped, or already dead);
         # clear the pid box so the finalizer can't SIGKILL a recycled PID. The
-        # next _spawn_kernel resets the box to the fresh child's pid (#R4-6).
+        # next _spawn_kernel resets the box to the fresh child's pid.
         self._child_pid_box[0] = None
         self._close_pipes()
 
@@ -612,6 +638,9 @@ class PythonReplSession:
 
         hdr = _read_exact(4)
         (n,) = struct.unpack(">I", hdr)
+        if n > _MAX_FRAME_BYTES:                     # corrupt/desynced header -> protocol error, not an
+            raise _FrameDecodeError(                 # unbounded read; caught below -> respawn
+                f"frame length {n} exceeds cap {_MAX_FRAME_BYTES} (corrupt/desynced header)")
         body = _read_exact(n)
         try:
             return pickle.loads(body)

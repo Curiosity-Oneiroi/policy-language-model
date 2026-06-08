@@ -279,6 +279,19 @@ class SlateBackend(BaseModelBackend):
         - tool messages keep their ``tool_call_id``; their content is
           stringified if not already a string.
         """
+        # Reclaim stale translated-ids: keep only those still referenced in THIS batch. An id is
+        # recorded on a translated RESPONSE call and normally discarded when its result returns;
+        # a final-turn call (no result) or ids from a past conversation would otherwise accumulate
+        # unbounded on this long-lived backend instance.
+        _live_ids: set[str] = set()
+        for _m in canonical_messages:
+            if _m.get("tool_call_id"):
+                _live_ids.add(_m["tool_call_id"])
+            for _tc in (_m.get("tool_calls") or []):
+                if isinstance(_tc, dict) and _tc.get("id"):
+                    _live_ids.add(_tc["id"])
+        self._terminal_translated_ids &= _live_ids
+
         out: List[Dict] = []
         for msg in canonical_messages:
             role = msg.get("role")
@@ -358,8 +371,9 @@ class SlateBackend(BaseModelBackend):
         # arguments:{code:...}} shape downstream.
         wants_python = _caller_advertised_python_tool(tools)
         if wants_python:
-            # Inject the gaslight system message at the front (if there's
-            # already a system message we keep the caller's first, our second).
+            # Inject the gaslight system message AFTER any leading system messages: ALL of the
+            # caller's leading system messages are kept (in order) and the gaslight follows them,
+            # placed just before the first non-system turn. (NB-12: code keeps all, not just the first)
             first_user = next(
                 (i for i, m in enumerate(slate_messages) if m.get("role") != "system"),
                 len(slate_messages),
@@ -446,7 +460,7 @@ class SlateBackend(BaseModelBackend):
                         f"Slate upstream {resp.status_code}: {err_text[:500]}"
                     )
 
-                event = ""
+                event = "message"          # SSE default event type when no `event:` line
                 data_lines: List[str] = []
 
                 def _flush():
@@ -457,7 +471,7 @@ class SlateBackend(BaseModelBackend):
                         payload = json.loads("\n".join(data_lines))
                     except json.JSONDecodeError:
                         return
-                    if event == "text":
+                    if event in ("text", "message"):   # "message" = SSE default (no `event:` line) -> content
                         chunk = payload.get("chunk")
                         if chunk:
                             content_parts.append(chunk)
@@ -541,7 +555,7 @@ class SlateBackend(BaseModelBackend):
                     line = raw_line.rstrip("\r")
                     if line == "":
                         _flush()
-                        event, data_lines = "", []
+                        event, data_lines = "message", []   # reset to SSE default
                         continue
                     if line.startswith(":"):
                         continue  # SSE comment / heartbeat

@@ -18,7 +18,7 @@ import os as _repl_os, struct as _repl_struct, pickle as _repl_pickle, socket as
 
 # Parent-death detector (Linux): if the parent dies abruptly, deliver SIGTERM so this
 # kernel doesn't linger ORPHANED mid-cell — start_new_session put us in our own session,
-# so we wouldn't otherwise be reaped with the parent. Best-effort. (S-F16)
+# so we wouldn't otherwise be reaped with the parent. Best-effort.
 try:
     import ctypes as _repl_ctypes, signal as _repl_signal
     _repl_ctypes.CDLL(None).prctl(1, _repl_signal.SIGTERM)   # PR_SET_PDEATHSIG=1
@@ -31,6 +31,11 @@ _repl_sock_io = _repl_sock.makefile("rwb", buffering=0)
 _repl_req_in  = _repl_sock_io
 _repl_resp_out = _repl_sock_io
 
+# a 4-byte length header names up to ~4 GiB; on a desync/corruption that would drive an
+# unbounded read. Real frames are tiny, so a length past this cap is a corrupt header -> bail
+# (the parent then respawns). MUST match session.py's _MAX_FRAME_BYTES.
+_REPL_MAX_FRAME = 2 * 1024 ** 3
+
 
 def _repl_read_frame():
     hdr = b""
@@ -40,6 +45,8 @@ def _repl_read_frame():
             raise EOFError("parent closed request socket")   # (only b'' is a genuine close)
         hdr += _chunk
     (_n,) = _repl_struct.unpack(">I", hdr)
+    if _n > _REPL_MAX_FRAME:                            # corrupt/desynced length -> bail (parent respawns)
+        raise EOFError(f"frame length {_n} exceeds cap {_REPL_MAX_FRAME} (corrupt header)")
     buf = b""
     while _builtins.len(buf) < _n:
         chunk = _repl_req_in.read(_n - _builtins.len(buf))
@@ -67,7 +74,7 @@ def _repl_reset_buffers():
 KERNEL_LOOP = r'''
 # `boot_stderr`: soft EXTRA-policy install tracebacks captured during PREFIX (a
 # failed DEFAULT is a hard boot_error and never reaches here). The parent
-# surfaces it once on the next cell so it isn't lost to the buffer reset (#26).
+# surfaces it once on the next cell so it isn't lost to the buffer reset.
 _repl_write_frame({"type": "ready", "boot_stderr": _repl_stderr_buf.getvalue()})
 
 # Kernel-side cell counter → unique <cell-N> linecache filenames, with no
@@ -94,7 +101,7 @@ while True:
         # it propagate would hit the outer boot_error wrapper, poison the stream
         # with a spurious boot_error, kill the kernel, and silently drop the next
         # cell. The cell that the SIGINT was meant to interrupt already completed
-        # and reported, so there is nothing to abort. (#R6-6)
+        # and reported, so there is nothing to abort.
         continue
 
     _repl_etype = _repl_req.get("type")
@@ -113,7 +120,7 @@ while True:
 
             # Pop the source-fallback registry (policies that couldn't snapshot by
             # value — e.g. class policies) BEFORE globals().update so it never leaks
-            # into __main__; it's re-installed from source after the reconcile (#H11).
+            # into __main__; it's re-installed from source after the reconcile.
             _repl_pol_sources = _repl_restored.pop("_PLM_POLICY_SOURCES", None) or {}
             # CALL-built constraints (Constraint.field / & | ^ ~) that couldn't dill-pickle
             # were snapshotted as RECIPES — popped here so they don't reach globals().update;
@@ -130,13 +137,13 @@ while True:
             # the snapshot. We keep the existing "snapshot is canonical for
             # mutables" semantic (PLM-deleted extras stay deleted) BUT force the
             # LLM defaults to come from on-disk source.
-            from plm.policy.defaults import UNDUPLICABLE_DEFAULTS as _repl_undup_defs
+            from plm.policy.defaults import _LLM_DEFAULT_POLICIES as _repl_llm_defaults
             from plm.policy.defaults import _bless_llm_callers as _repl_bless_after
             from plm.policy.registry import _unsealed as _repl_unsealed
 
             # Snapshot the FRESH-PREFIX boot policies (name -> proxy) BEFORE the
             # registry reset below, so orphaned __main__ bindings can be reaped
-            # after reconciliation (see the drop loop further down, #R5-2).
+            # after reconciliation (see the drop loop further down,).
             _repl_preboot = {
                 _repl_pn: _PLM_POLICIES[_repl_pn]
                 for _repl_pn in _builtins.list(_PLM_POLICIES)
@@ -144,7 +151,7 @@ while True:
 
             if "_PLM_POLICIES" in _repl_restored:
                 _repl_saved_defaults = {
-                    n: _PLM_POLICIES[n] for n in _repl_undup_defs if n in _PLM_POLICIES
+                    n: _PLM_POLICIES[n] for n in _repl_llm_defaults if n in _PLM_POLICIES
                 }
                 # The registry protects default entries during normal cell exec;
                 # this is a harness-owned full reset, so drop the seal for it. The
@@ -172,7 +179,7 @@ while True:
             # proxy via dill identity-preservation; PLM should look up via
             # the global at call time, not cache the reference.)
             _repl_g = _builtins.globals()
-            for _repl_dn in _repl_undup_defs:
+            for _repl_dn in _repl_llm_defaults:
                 if _repl_dn in _PLM_POLICIES:
                     _repl_g[_repl_dn] = _PLM_POLICIES[_repl_dn]
 
@@ -188,7 +195,7 @@ while True:
             # fresh-PREFIX proxy object: if the snapshot re-bound that name to a user
             # value (e.g. a cell did `base_verifier = 42` after deleting the policy),
             # globals().update() restored the user's value and the identity check
-            # leaves it untouched (no clobbering a legitimate cell variable). (#R5-2)
+            # leaves it untouched (no clobbering a legitimate cell variable).
             for _repl_pn, _repl_proxy in _repl_preboot.items():
                 if _repl_pn not in _PLM_POLICIES and _repl_g.get(_repl_pn) is _repl_proxy:
                     _repl_g.pop(_repl_pn, None)
@@ -199,7 +206,7 @@ while True:
             # unresolvable on the fresh respawn). The snapshot carried their
             # `_p_source` instead; re-exec `@policy` on it via the normal install
             # path so an AUTHORED class policy SURVIVES a hard respawn rather than
-            # being silently lost (#H11/#H12). Skip a name a by-value entry already
+            # being silently lost. Skip a name a by-value entry already
             # restored; best-effort per source so one broken body can't abort the
             # whole rehydrate.
             if _repl_pol_sources:
@@ -211,7 +218,7 @@ while True:
                         _repl_install_src(
                             "@policy\n" + _repl_src, "<policy-rehydrate-" + _repl_pn + ">")
                     except Exception as _repl_reinstall_exc:
-                        # Surface, don't swallow (K-F5): an authored class policy whose
+                        # Surface, don't swallow: an authored class policy whose
                         # body fails to re-exec on respawn must NOT vanish silently.
                         _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
                             "[rehydrate] policy " + _repl_pn + " not replayed: "
@@ -229,6 +236,14 @@ while True:
                         _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
                             "[rehydrate] constraint " + _repl_cn + " not replayed: "
                             + _builtins.repr(_repl_crec_exc) + "; ")
+            elif _repl_constraint_recipes:
+                # Recipes exist but the constraint surface never imported (no pydantic in this
+                # kernel) -> they'd be SILENTLY dropped and downstream cells would hit surprise
+                # NameErrors. Surface which names were lost so the cause is visible.
+                _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                    "[rehydrate] " + _builtins.str(_builtins.len(_repl_constraint_recipes))
+                    + " constraint(s) not replayed (constraint surface unavailable): "
+                    + _builtins.str(_builtins.sorted(_repl_constraint_recipes)) + "; ")
 
             _rebuild_linecache_from_policies()
 
@@ -252,7 +267,11 @@ while True:
     _repl_code = _repl_req["code"]
     _repl_cell_file = f"<cell-{_repl_cell_n}>"
     _repl_cell_n += 1
-    _repl_reset_buffers()
+    # Reset the capture buffers via the side module (re-imported fresh), so a cell that
+    # rebound the __main__ `_repl_reset_buffers` to a no-op can't leak stdout across cells
+    # . Fall back to the __main__ function if the side module isn't populated.
+    import plm.repl._kernel_state as _repl_ks
+    (_repl_ks.reset_buffers or _repl_reset_buffers)()
     _linecache.cache[_repl_cell_file] = (
         _builtins.len(_repl_code), None, _repl_code.splitlines(True), _repl_cell_file)
 
@@ -280,7 +299,7 @@ while True:
     # the single source of truth — fed by the delta channel (additive) and by a
     # `plm_messages` seed above (replace) — so a seeded/delta'd trajectory persists to
     # later no-input cells, while a cell mutating the public list (append/clear/reassign)
-    # can't corrupt the accumulation OR persist a stray rebind into the next cell (K-F7).
+    # can't corrupt the accumulation OR persist a stray rebind into the next cell.
     _repl_g["plm_messages"] = _builtins.list(_repl_plm_messages)
 
     # Guard A: reject a static rebind of a registered policy name BEFORE exec.
@@ -302,13 +321,13 @@ while True:
     # `plm.policy._audit_cell = ...` — or poisoning sys.modules remains the
     # documented irreducible Python-no-privacy boundary, like
     # `_PLM_POLICIES.__setitem__` and `_llm_infra._BLESSED_CALLERS` reassignment.)
-    # Mirrors the existing per-iteration `_IMMUTABLE_POLICIES` re-import. (#R5-1)
+    # Mirrors the existing per-iteration `_SEALED_POLICIES` re-import.
     import builtins as _repl_builtins
     from plm.policy import (
         _audit_cell as _repl_audit_cell,
         _PLM_POLICIES as _repl_plm_store,
     )
-    from plm.policy.registry import _IMMUTABLE_POLICIES as _repl_imm
+    from plm.policy.registry import _SEALED_POLICIES as _repl_imm
     _repl_immset_for_audit = _repl_builtins.set(_repl_imm)
     _repl_audit_err = _repl_audit_cell(
         _repl_code, _repl_builtins.set(_repl_plm_store), _repl_immset_for_audit
@@ -335,7 +354,7 @@ while True:
         # Classify the terminal with a FRESHLY re-imported builtins, not the bare
         # `_builtins` the cell just had a chance to rebind: a fake `_builtins` whose
         # `.type`/`.getattr` lie could otherwise mask the cell's own exception as a
-        # silent RETURN (or hide its traceback). Guard C must still run below. (#H10)
+        # silent RETURN (or hide its traceback). Guard C must still run below.
         import builtins as _repl_builtins
         _repl_exc_name = _repl_builtins.type(_repl_exc).__name__
         if _repl_exc_name == "_REPLReturn":
@@ -354,7 +373,7 @@ while True:
     # A cell can rebind the bare `_repl_g` (or `_builtins`) __main__ name during its
     # exec (e.g. `_repl_g = {}`); trusting the pre-exec `_repl_g` would make Guard C
     # "restore" immutable defaults into a DECOY dict, leaving the real __main__
-    # hijack live for the next cell (#H9). `builtins.globals()` is frame-derived —
+    # hijack live for the next cell. `builtins.globals()` is frame-derived —
     # it returns THIS loop's real __main__ dict regardless of what the `_repl_g` key
     # was rebound to — and the fresh `import` defeats a rebound `_repl_builtins`.
     import builtins as _repl_builtins
@@ -368,14 +387,23 @@ while True:
     # Guard C+: the same protection for the non-policy INJECTED helpers (callables:
     # policy ops, parallel, exec_ns, the constraint surface). Restore any the cell
     # rebound or deleted so a granted helper can't be clobbered for the next cell.
-    # (Uses the trusted `_repl_g` established above; `_REPL_INJECTED_CANON` holds the
-    # boot-canonical callables — never `plm_messages`/registries, so live state is safe.)
-    _repl_reverted = [
-        _repl_k for _repl_k, _repl_v in _REPL_INJECTED_CANON.items()
-        if _repl_g.get(_repl_k) is not _repl_v
-    ]
-    for _repl_k in _repl_reverted:
-        _repl_g[_repl_k] = _REPL_INJECTED_CANON[_repl_k]
+    # The canon is read from the SIDE MODULE (re-imported fresh), NOT the __main__
+    # `_REPL_INJECTED_CANON` a cell could rebind to `{}` (revert nothing -> a clobbered
+    # `_dill` persists -> snapshot corruption,) or to a non-dict (`.items()` raises,
+    # ). Wrapped so a broken canon can never crash the loop. (Uses the trusted `_repl_g`.)
+    import plm.repl._kernel_state as _repl_ks
+    try:
+        _repl_canon = _repl_ks.CANON
+        _repl_reverted = [
+            _repl_k for _repl_k, _repl_v in _repl_canon.items()
+            if _repl_g.get(_repl_k) is not _repl_v
+        ]
+        for _repl_k in _repl_reverted:
+            _repl_g[_repl_k] = _repl_canon[_repl_k]
+    except Exception as _repl_canon_exc:
+        _repl_reverted = []
+        _repl_stderr_buf.write("\n[repl guard] Guard C+ skipped (canon unreadable): "
+                               + _builtins.repr(_repl_canon_exc) + "\n")
     if _repl_reverted:
         _repl_stderr_buf.write(
             "\n[repl guard] kernel-injected name(s) reverted: "

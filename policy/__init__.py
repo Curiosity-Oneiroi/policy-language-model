@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from .decorator import policy
 from .registry import (
-    _IMMUTABLE_POLICIES,
+    _SEALED_POLICIES,
     _PLM_POLICIES,
     _install_policy_source,
     delete_lines,
@@ -39,7 +39,7 @@ __all__ = [
     # kernel-loop integration surface
     "_PLM_POLICIES", "_audit_cell", "_post_cell_guard",
     # Phase 2: shared replay helper + immutability set (bootstrap loader uses these)
-    "_install_policy_source", "_IMMUTABLE_POLICIES",
+    "_install_policy_source", "_SEALED_POLICIES",
     # useful for tests / introspection
     "_FunctionPolicy", "_policy_note", "PolicyStructuralFallbackWarning",
 ]

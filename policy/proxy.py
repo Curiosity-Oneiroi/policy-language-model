@@ -114,6 +114,48 @@ def _policy_call(name: str):
         _POLICY_CALL_DEPTH.reset(tok)
 
 
+def _depth_tracked_gen(name, gen):
+    """A generator policy returns its generator at CALL time (the body hasn't run yet), so the
+    call's `_policy_call` boundary exits BEFORE the body executes — leaving the body un-counted
+    by the depth cap (and the LLM-depth gate). This wraps `gen` so the boundary is re-entered
+    around EACH resume of its body — so the generator's frame is counted exactly while its body
+    runs (a body-step at depth+1, matching a normal policy) and released while the consumer's
+    code between yields runs. The depth is read LIVE at each step, so this is correct in ANY
+    calling context (top level, from another policy, nested generators), and the cap fires from
+    inside the resume if a body-step recurses too deep.
+
+    It is a TRANSPARENT delegator: the FULL generator protocol — `next()`/`send()`/`throw()`/
+    `close()` — is forwarded to `gen`, and `gen`'s `return` value (StopIteration.value) is
+    preserved, so a generator policy behaves EXACTLY like its undecorated generator, only
+    depth-counted."""
+    to_send, to_throw = None, None
+    while True:
+        with _policy_call(name):
+            try:
+                value = gen.throw(to_throw) if to_throw is not None else gen.send(to_send)
+            except StopIteration as _si:
+                return _si.value                     # preserve the generator's return value
+            finally:
+                to_send = to_throw = None
+        try:
+            to_send = yield value
+        except GeneratorExit:                        # consumer closed us -> close the inner gen
+            gen.close()
+            raise
+        except BaseException as _exc:                # consumer threw into us -> forward into gen
+            to_throw = _exc
+
+
+def _maybe_track_gen(name, fn, result):
+    """If the POLICY ITSELF is a generator function, wrap its returned generator so the depth cap
+    covers its lazy body. Key on `fn` (the policy), NOT on `isgenerator(result)`: a NORMAL policy
+    that merely RETURNS a generator — a genexpr, or another policy's generator (a thin
+    pass-through) — must be left UNTOUCHED. Its own body already ran under the boundary, and the
+    returned generator is data/forwarded; wrapping it would add a spurious frame, since the
+    returner is already off the stack by the time that generator is iterated."""
+    return _depth_tracked_gen(name, result) if inspect.isgeneratorfunction(fn) else result
+
+
 # --- function policy ----------------------------------------------------------
 
 class _FunctionPolicy:
@@ -155,7 +197,10 @@ class _FunctionPolicy:
         # increments at this boundary regardless of caller (LLM defaults,
         # PLM-authored mutables, top-level cells — all the same).
         with _policy_call(self._p_name):
-            return self._inner(*a, **k)      # ~50ns forward + 1 contextvar inc/dec
+            # ~50ns forward + 1 contextvar inc/dec. If this policy is a GENERATOR function its
+            # returned generator is wrapped so its lazy body stays depth-counted (the boundary
+            # here exits before that body ever runs); a normal policy is returned untouched.
+            return _maybe_track_gen(self._p_name, self._inner, self._inner(*a, **k))
 
     @property
     def __signature__(self):
@@ -196,7 +241,7 @@ class _FunctionPolicy:
         g = _main()                          # kernel __main__ (where @policy injected)
         g.pop(self._p_name, None)
         _PLM_POLICIES.pop(self._p_name, None)
-        linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot (P-F9)
+        linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot
 
     def _duplicate(self, new_name):
         """Fork this policy under `new_name`. Returns the new mutable copy,
@@ -254,6 +299,11 @@ class _FunctionPolicy:
             _policy_note(f"{self._p_name}._rewrite: bad source ({e!r}); source unchanged")
             return                              # accepts (await-in-sync, dup arg, ...) + def errors
         new_obj = ns[new_name]
+        # The repl is SYNCHRONOUS: refuse an async rewrite too (not just at @policy decoration),
+        # so EDIT/INSERT/DELETE — which all funnel here — can't sneak a coroutine past the
+        # depth/budget model. Raises BEFORE the swap, so the old (sync) policy is kept intact.
+        from .decorator import _reject_async        # lazy: proxy <- decorator import cycle
+        _reject_async(new_obj)
         old_name, old_filename = self._p_name, self._p_filename
         self._inner, self._p_source = new_obj, new_source
         self._p_version += 1
@@ -352,13 +402,13 @@ def _attach_class_policy_metadata(cls, source, filename):
     # fail outright (classmethod object isn't callable). Such a __call__ ignores
     # instance state and is degenerate, so skip the depth-wrap — it's safe: the
     # LLM-depth gate is enforced independently by the blessed-caller checks in
-    # _llm_infra, not by this advisory class-call cap. (#R5-6)
+    # _llm_infra, not by this advisory class-call cap.
     _orig_call = cls.__dict__.get("__call__")
     if isinstance(_orig_call, types.FunctionType):
         @functools.wraps(_orig_call)
         def _wrapped_call(self, *a, **k):
             with _policy_call(type(self).__name__):
-                return _orig_call(self, *a, **k)
+                return _maybe_track_gen(type(self).__name__, _orig_call, _orig_call(self, *a, **k))
         _wrapped_call._plm_depth_wrapped = True       # OUR marker; the re-wrap path keys on
         cls.__call__ = _wrapped_call                  # this (NOT __wrapped__) to detect double-wrap
 
@@ -394,6 +444,8 @@ def _class_remove(cls):
     g = _main()
     g.pop(cls.__name__, None)
     _PLM_POLICIES.pop(cls.__name__, None)
+    linecache.cache.pop(getattr(cls, "_p_filename", None), None)   # reclaim <policy-{name}> slot (
+                                                                  # mirrors the function-policy _remove)
 
 
 def _class_duplicate(cls, new_name):
@@ -445,6 +497,10 @@ def _rewrite_class_policy(cls, new_source):
         _policy_note(f"{cls.__name__}._rewrite: bad source ({e!r}); source unchanged")
         return
     new_cls = ns[new_name]
+    # Refuse a rewrite that introduces an async method (e.g. an async __call__) — same sync
+    # contract as @policy decoration; raises before any swap, leaving the old class intact.
+    from .decorator import _reject_async        # lazy: proxy <- decorator import cycle
+    _reject_async(new_cls)
 
     # Structural checks FIRST (can't mutate metaclass/slots/incompatible bases in
     # place) -> fall back to remove+recreate, leaving cls.__dict__ untouched. Pass
@@ -504,12 +560,12 @@ def _rewrite_class_policy(cls, new_source):
     # OUR OWN private marker, NOT the generic `__wrapped__`: an LLM-authored
     # `__call__` decorated with `@functools.wraps`/`@lru_cache`/etc. carries
     # `__wrapped__` too, so the old `__wrapped__ is None` check skipped wrapping
-    # it — leaving that class policy's `__call__` UNCAPPED (#12). `_plm_depth_wrapped`
+    # it — leaving that class policy's `__call__` UNCAPPED. `_plm_depth_wrapped`
     # is set only by us, so it distinguishes "already wrapped by us" from "user
     # used a wraps-style decorator".
     _inner_call = cls.__dict__.get("__call__")
     # Same guard as the install path: only re-wrap a plain instance-method
-    # __call__, never a staticmethod/classmethod descriptor (#R5-6). The
+    # __call__, never a staticmethod/classmethod descriptor. The
     # isinstance check short-circuits before the _plm_depth_wrapped lookup, so a
     # descriptor is skipped cleanly.
     if isinstance(_inner_call, types.FunctionType) and not getattr(
@@ -518,7 +574,7 @@ def _rewrite_class_policy(cls, new_source):
         @functools.wraps(_inner_call)
         def _wrapped_call(self, *a, **k):
             with _policy_call(type(self).__name__):
-                return _inner_call(self, *a, **k)
+                return _maybe_track_gen(type(self).__name__, _inner_call, _inner_call(self, *a, **k))
         _wrapped_call._plm_depth_wrapped = True
         cls.__call__ = _wrapped_call
 

@@ -196,7 +196,7 @@ def _safe_describe(constraint: Any) -> str:
     """`constraint.describe()` for an error/prompt string, but NEVER raising.
 
     describe() can itself raise (e.g. a factory built from an exhausted one-shot
-    iterable — see the one_of/coercers describe bug — or `instance_of=<class with
+    iterable — see the one_of/coercers describe bug — or `is_instance_of=<class with
     a throwing __repr__/__name__>`). It is called from runtime paths whose only
     job is to FORMAT an error or a reminder; a failure there must not escape and
     abort the task (the never-escape contract, #6). Fall back to a placeholder."""

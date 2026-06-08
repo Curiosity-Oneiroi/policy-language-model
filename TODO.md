@@ -81,6 +81,17 @@ Chat-Completions backends (in `_sanitize_and_cache_tools`, recognizing BOTH
 shapes), and flatten nested→flat in the OpenAI Responses path. Add a per-backend
 tool-shape round-trip test.
 
+**Related symptoms (round-2 sweep — same root cause, deferred together):** the flat/nested
+duality also surfaces as `AnthropicBackend._convert_tools_to_anthropic` hard-indexing
+`tool["function"]["name"]` → KeyError on the first call (Anthropic is listed in
+`_BACKEND_DEPS` but PLM ~never uses it); `_get_tools_signature` hashing only names (not
+params) and giving flat tools an empty signature; `_sanitize_and_cache_tools` skipping
+name-sanitization for flat tools; and `AnthropicBackend.generate` never sanitizing. ALL are
+LATENT in the active wiring (one fixed flat `python` tool, openai/vllm) and collapse into the
+single shape-aware-accessor fix above — a `_tool_def_fields(tool)` helper read from BOTH the
+signature, the sanitizer, and the Anthropic converter. Not worth doing until Anthropic or
+multi/varying tools are actually used.
+
 ## D6 / S-F6 / S-F7 — kernel IPC trust model (pickle over a Unix socket)
 
 **What:** the parent `pickle.loads` every frame the kernel sends and `dill.loads`

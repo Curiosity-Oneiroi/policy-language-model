@@ -113,7 +113,7 @@ def _intersected_bound_markers(a_meta, b_meta):
     `_tighten_field_infos` uses this to keep a merged struct-&-struct field's
     numeric/length bounds VISIBLE in `json_schema()`/`describe()` (the sub-LLM's
     two steering channels) while the appended `AfterValidator` stays the
-    authoritative enforcer (#R6-2). Exactly ONE marker per type is returned, so
+    authoritative enforcer. Exactly ONE marker per type is returned, so
     the visible metadata never carries a duplicate constraint that pydantic would
     choke on at model-build time.
 
@@ -121,7 +121,7 @@ def _intersected_bound_markers(a_meta, b_meta):
     `Annotated[int, Interval(...)]` / `Len(...)` written directly, vs the
     `Field(ge=...)`-decomposed `Ge`/`Le`) is DECOMPOSED into its atomic markers
     first, so those bounds surface too and a Len-vs-MinLen mix yields the COMPLETE
-    intersected bound rather than a misleading half (#H3/#H4). Non-combinable
+    intersected bound rather than a misleading half. Non-combinable
     metadata (patterns, multiple_of, validators/coercers, custom markers) is
     intentionally OMITTED — it can't reduce to one marker safely, so it stays
     enforced by the AfterValidator alone.
@@ -217,7 +217,7 @@ def _rewrite_schema_refs(node, rename):
     """Recursively rewrite every JSON-Schema `$ref: #/$defs/<old>` to
     `#/$defs/<new>` for each old->new in `rename`. Used by the composite
     `_json_schema` $defs-hoist to keep a branch's refs pointing at its OWN def
-    after a same-name/different-shape collision forced a rename (#H7)."""
+    after a same-name/different-shape collision forced a rename."""
     if isinstance(node, dict):
         _ref = node.get("$ref")
         if isinstance(_ref, str) and _ref.startswith("#/$defs/"):
@@ -269,7 +269,7 @@ def _tighten_field_infos(a_info, b_info):
         # non-schema field type — the base Constraint default is
         # arbitrary_types_allowed) do we retry WITH that config. Without this
         # retry, an arbitrary-typed shared field raised PydanticSchemaGenerationError
-        # at construction and ESCAPED the merge instead of tightening (#1). Metadata
+        # at construction and ESCAPED the merge instead of tightening. Metadata
         # here came from a valid struct (which built under arbitrary_types_allowed),
         # so the retry is guaranteed to build.
         annotated = Annotated[tuple([ann, *meta])]
@@ -288,9 +288,9 @@ def _tighten_field_infos(a_info, b_info):
     # func is ALREADY present in a_meta (identity match). This applies a coercer
     # shared via a common base EXACTLY once even when each side adds its own
     # DISTINCT bound — the old whole-list `b_meta != a_meta` skip missed that and
-    # double-applied the coercer (#R6-7 / #H2 / #H5). Compared by func IDENTITY
+    # double-applied the coercer (#R6-7 / /). Compared by func IDENTITY
     # (`id`), NEVER `==`, so a metadata object whose `__eq__` raises cannot leak out
-    # of the `&` operator (#H6). b's declarative bound markers are kept — double-
+    # of the `&` operator. b's declarative bound markers are kept — double-
     # checking a bound is harmless/idempotent, and a's adapter applies the shared
     # coercer's transform that b's distinct bound is then checked against.
     _a_validator_funcs = {id(_f) for _m in a_meta if (_f := _validator_func(_m)) is not None}
@@ -316,7 +316,7 @@ def _tighten_field_infos(a_info, b_info):
     # Mark our synthetic enforcer so a NESTED merge ((A&B)&C) does NOT mistake a
     # prior merge's AfterValidator for a user coercer and trip the visibility gate
     # below — which would hide the (still-correctly-enforced) bound from a 3+-way
-    # merge of pure bounds (#H1). The mark rides on the function, read via .func.
+    # merge of pure bounds. The mark rides on the function, read via .func.
     _intersect._plm_merge_enforcer = True
 
     def _is_merge_enforcer(_m):
@@ -327,7 +327,7 @@ def _tighten_field_infos(a_info, b_info):
     # json_schema()/describe() so the sub-LLM is steered with the real bound (e.g.
     # `minimum: 10` for `Field(ge=10) & Field(ge=0)`); without this the metadata is
     # just the opaque AfterValidator and the bound vanishes from BOTH steering
-    # channels (#R6-2). Only single, non-duplicate, combinable annotated_types
+    # channels. Only single, non-duplicate, combinable annotated_types
     # markers are surfaced (Ge/Gt/Le/Lt/MinLen/MaxLen, incl. decomposed Interval/Len)
     # — patterns/multiple_of/custom stay enforced by _intersect alone (duplicating
     # them risks a pydantic build error). GATE on "no GENUINE transformer either
@@ -519,7 +519,7 @@ def _not_validate(children: List[type], value: Any, context: Optional[Dict] = No
     except Exception:                                   # inner failed (CV or any other error)
         return value  # -> value is NOT in inner; negation succeeded
     try:                                                # describe() must not turn the rejection
-        _neg = inner.describe()                         # into a raw describe-error escape (#6)
+        _neg = inner.describe()                         # into a raw describe-error escape
     except Exception:
         _neg = "<unavailable>"
     raise ConstraintViolation(
@@ -624,7 +624,7 @@ def _make_composite_wrapper(
         # (OpenAI / vLLM guided-json — exactly what natural_llm hard-sets as
         # response_format for an accepted structural composite) cannot resolve them.
         # Collect the defs up and strip them from the children so the refs resolve.
-        # This is the composite analog of the factory $defs-hoist at base.py:303. (#R5-5)
+        # This is the composite analog of the factory $defs-hoist at base.py:303.
         defs: dict = {}
         cleaned = []
         for _s in sub:
@@ -641,7 +641,7 @@ def _make_composite_wrapper(
                         # branches (e.g. each branch defines its own `Item`).
                         # first-wins would silently point THIS branch's $ref at the
                         # OTHER branch's def, so the schema would misdescribe this
-                        # branch (schema disagrees with validate(); #H7). Rename this
+                        # branch (schema disagrees with validate();). Rename this
                         # branch's def to a fresh key and rewrite this branch's refs
                         # to it, so both shapes coexist and each $ref resolves to the
                         # right one.

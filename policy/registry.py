@@ -11,14 +11,16 @@ helpers duck-type on the policy objects (`._rewrite`, `._edit`, `._p_source`,
 ...), which works identically for the `_FunctionPolicy` proxy and the real
 class policy.
 
-Two sets gate the LLM-default extensions added by the Phase 2 plan:
-  * `_IMMUTABLE_POLICIES`  — names whose proxy/class refuses _rewrite/_edit/
-    _insert/_delete_lines/_remove and whose `__main__` binding Guard A
-    rejects and Guard C restores.
-  * `_UNDUPLICABLE_POLICIES` — names that `duplicate_policy` refuses to fork.
-The PREFIX bootstrap fills both with the LLM-default names at boot. Kept
-distinct (even though they coincide in v1) so future immutable-but-duplicable
-defaults can land without re-plumbing.
+One set gates the seal extensions:
+  * `_SEALED_POLICIES` — the SEALED policy NAMES: their proxy/class refuses
+    _rewrite/_edit/_insert/_delete_lines/_remove, `duplicate_policy` refuses to
+    fork them, Guard A rejects rebinding their `__main__` name, and Guard C
+    restores it. "Sealed" = immutable AND un-duplicable (one concept).
+The PREFIX bootstrap fills it via `_seal`: the LLM-loop defaults, plus a
+metaparam's sealed extras, plus (in future) any policy PLM itself seals. This is
+DISTINCT from `defaults._LLM_DEFAULT_POLICIES` (the BLESS set — those defaults
+also get raw-primitive access); `_SEALED_POLICIES` is a SUPERSET that is only
+sealed, never blessed by virtue of membership.
 """
 
 from __future__ import annotations
@@ -33,10 +35,9 @@ _MISSING = object()                 # sentinel: shared with guard (it imports th
 # Module-level (NOT __main__) so ordinary cell code can't hold/mutate these by
 # name. Bootstrap populates them via `_seal` after the LLM defaults install;
 # they are rebuilt from scratch on each boot, so no snapshot is needed. They
-# carry the immutable/un-duplicable NAMES used by the name-based checks (Guard A,
-# duplicate_policy); the per-OBJECT truth is the policy's `_p_immutable` flag.
-_IMMUTABLE_POLICIES: set = set()
-_UNDUPLICABLE_POLICIES: set = set()
+# carry the SEALED (immutable + un-duplicable) NAMES used by the name-based checks
+# (Guard A, duplicate_policy); the per-OBJECT truth is the policy's `_p_immutable` flag.
+_SEALED_POLICIES: set = set()
 
 
 # --- the single policy store + its default-policy protection ------------------
@@ -166,8 +167,7 @@ def _seal(name: str) -> None:
             p._p_immutable = True                     # idempotent (proxy allows re-set to True)
         except Exception:
             pass
-    _IMMUTABLE_POLICIES.add(name)
-    _UNDUPLICABLE_POLICIES.add(name)
+    _SEALED_POLICIES.add(name)
 
 
 def _main() -> dict:
@@ -197,7 +197,7 @@ def _sync() -> None:
     """
     g = _main()
     for n in list(_PLM_POLICIES):
-        if n in _IMMUTABLE_POLICIES:
+        if n in _SEALED_POLICIES:
             continue                       # immutable: registry-canonical, never evict
         if n not in g:
             _PLM_POLICIES.pop(n, None)
@@ -281,7 +281,7 @@ def duplicate_policy(name: str, new_name: str):
 
     Refuses (with a `_policy_note`, no raise) when:
       * `name` is not registered.
-      * `name` is in `_UNDUPLICABLE_POLICIES` (the LLM defaults — model-access base).
+      * `name` is in `_SEALED_POLICIES` (the LLM defaults — model-access base).
       * `new_name` fails the shared `@policy` name rule (`_reserved_name_reason`):
         not a valid identifier, a reserved kernel name, or a kernel-internal
         prefix (`__` / `_repl` / `_REPL`) — the same names `@policy` rejects.
@@ -292,7 +292,7 @@ def duplicate_policy(name: str, new_name: str):
     body to the OLD name are NOT rewritten — they continue to resolve to the
     original at call time (predictable + simple; if the copy should
     self-reference, `_edit(...)` it after). The fresh proxy is mutable (not
-    in `_IMMUTABLE_POLICIES`).
+    in `_SEALED_POLICIES`).
     """
     from .edits import _compute_rename
     from .proxy import _policy_note
@@ -304,9 +304,9 @@ def duplicate_policy(name: str, new_name: str):
         # raise) — the _duplicate/_class_duplicate proxy wrappers rely on it.
         _policy_note(f"duplicate: {name!r} is not a registered policy")
         return None
-    if name in _UNDUPLICABLE_POLICIES:
+    if name in _SEALED_POLICIES:
         _policy_note(
-            f"{name!r} is un-duplicable (model-access base); cannot duplicate"
+            f"{name!r} is sealed (immutable + un-duplicable); cannot duplicate"
         )
         return None
     # Pre-check the SAME name rule `@policy` enforces, so a name it would later

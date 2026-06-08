@@ -202,11 +202,11 @@ def base_verifier(messages):
         def _compiles(s):                            # the proposed edit must be valid python
             compile(s, "<verifier-edit>", "exec")
         EditCode = Constraint.field(
-            instance_of=str, predicate=_compiles,
+            is_instance_of=str, predicate=_compiles,
             description="python that edits the `trajectory` list in place "
                         "(append/insert/rewrite/delete/reorder); '' for no edit",
         )
-        Approval = Constraint.field(instance_of=bool)
+        Approval = Constraint.field(is_instance_of=bool)
 
         # react_llm #1 — PROPOSE the edit as code (reads a COPY; does NOT apply it).
         # A proposer that can't produce a valid edit (or never RETURNs) just means

@@ -47,6 +47,9 @@ def _reserved_name_reason(name: str) -> str | None:
         return f"{name!r} is not a string name"           # guard BEFORE .isidentifier()
     if not name.isidentifier():                           # e.g. lambdas -> '<lambda>'
         return f"{name!r} is not a valid identifier (needs a named def/class)"
+    import keyword                                         # 'class'/'if'/'match'... ARE identifiers but
+    if keyword.iskeyword(name) or keyword.issoftkeyword(name):   # re-exec'ing them as a `def NAME` is a
+        return f"{name!r} is a Python keyword"             # SyntaxError -> refuse gently here, not deep in install
     if name in _RESERVED:
         return f"{name!r} is a reserved kernel name"
     # Kernel-internal prefixes are filtered by the snapshot collector, so such a
@@ -81,7 +84,7 @@ def policy(obj):
     # and reading its source is pure waste (could even raise spuriously on an
     # unreadable body). Covers BOTH same-kind (would funnel to _rewrite's gate
     # anyway) AND the kind-change path below that would otherwise pop+recreate and
-    # clobber the default. One note, no half-work. (#R5-7)
+    # clobber the default. One note, no half-work.
     _existing0 = _PLM_POLICIES.get(name)
     if _existing0 is not None and getattr(_existing0, "_p_immutable", False):
         _policy_note(
@@ -91,8 +94,8 @@ def policy(obj):
         main_globals[name] = _existing0                   # keep the canonical binding
         return _existing0
 
+    _reject_async(obj)                                    # SYNCHRONOUS repl: async REFUSED (sync generators OK)
     _warn_if_captures_locals(obj)                         # closures don't survive re-exec
-    _warn_if_async_or_generator(obj)                      # the repl is synchronous
     # Functions use inspect.getsource (cell_file unused); classes need their
     # origin file to read the cell from linecache (no co_firstlineno to use).
     cell_file = None if inspect.isfunction(obj) else _class_origin_filename(obj)
@@ -101,7 +104,7 @@ def policy(obj):
     # NB: do NOT write linecache[stable] here. The same-kind in-place path re-syncs
     # linecache itself inside `_rewrite`/`_rewrite_class_policy`; only the
     # FRESH-install path (new policy or kind change) needs the slot populated here
-    # — written just before its exec below (#4). (The immutable-default refusal,
+    # — written just before its exec below. (The immutable-default refusal,
     # which must NOT touch this slot, already returned above, so there is no
     # rejected source that could poison the <policy-{name}> slot.)
 
@@ -209,23 +212,29 @@ def _warn_if_captures_locals(obj):
             f"unless they exist as REPL globals. Reference REPL globals or inline.")
 
 
-def _warn_if_async_or_generator(obj):
-    # the PLM repl is SYNCHRONOUS. An async/generator policy is NOT covered by the
-    # recursion-depth cap (the `with _policy_call(...)` boundary exits before the
-    # coroutine/generator BODY runs) and does not compose with the depth/budget model.
-    # Sync is the contract; `parallel(...)` owns concurrency, and threading/
-    # multiprocessing are likewise unsupported in cells (they break the depth ContextVar
-    # propagation and the subprocess-cleanup the kernel relies on). Warn (don't refuse)
-    # so an authored async/generator policy is not a silent surprise.
-    if inspect.isasyncgenfunction(obj):
-        kind = "async generator"
-    elif inspect.iscoroutinefunction(obj):
-        kind = "async (coroutine)"
-    elif inspect.isgeneratorfunction(obj):
-        kind = "generator"
-    else:
-        return
-    _policy_note(
-        f"@policy {obj.__name__!r} is an {kind} function; the PLM repl is SYNCHRONOUS, so "
-        f"it is NOT covered by the recursion-depth cap and does not compose with the "
-        f"depth/budget model. Use a plain `def` (and `parallel(...)` for concurrency).")
+def _reject_async(obj):
+    # The PLM repl is SYNCHRONOUS, so an `async def` policy is REFUSED: a coroutine / async
+    # generator returns a promise and runs its body via an event loop OUTSIDE the policy-call
+    # depth cap and the LLM-depth/budget model — it cannot compose with the sync REPL at all.
+    # Applies to a function AND to any async method on a @policy CLASS (e.g. an async __call__).
+    # SYNC generators are ALLOWED: they're a useful authoring tool and run DEPTH-CORRECTLY (the
+    # proxy re-enters the policy-call boundary around each `next()` — see proxy._depth_tracked_gen),
+    # so threading/multiprocessing remain the only unsupported concurrency (use `parallel(...)`).
+    def _async_kind(fn):
+        if inspect.isasyncgenfunction(fn):
+            return "async generator"
+        if inspect.iscoroutinefunction(fn):
+            return "async (coroutine)"
+        return None
+    if inspect.isfunction(obj):
+        offenders = [(obj.__name__, _async_kind(obj))] if _async_kind(obj) else []
+    else:                                                  # a @policy CLASS -> check its methods
+        offenders = [(fn.__name__, k) for v in vars(obj).values()
+                     for fn in _iter_funcs(v) if (k := _async_kind(fn))]
+    if offenders:
+        _detail = ", ".join(f"{n} ({k})" for n, k in offenders)
+        raise TypeError(
+            f"@policy {obj.__name__!r}: {_detail} is async — the PLM repl is SYNCHRONOUS and "
+            f"does NOT support async policies (a coroutine runs outside the depth-cap / budget "
+            f"model). Use a plain `def`; `parallel(...)` handles concurrency. (Sync generators "
+            f"are fine and run depth-correctly.)")

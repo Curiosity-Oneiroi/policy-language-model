@@ -31,7 +31,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Callable, Dict, Optional, Tuple
 
 
-# ===== sealed-namespace helpers — the react_llm sub-LLM ns is a CONTAINMENT boundary (D1) =====
+# ===== sealed-namespace helpers — the react_llm sub-LLM ns is a CONTAINMENT boundary =====
 #
 # A sub-LLM's ns must hold ONLY `__builtins__` + `RETURN` + deliberate grants. Two
 # leaks made that a fiction: a FULL `builtins` module (so `__import__('sys').modules
@@ -56,17 +56,32 @@ class _REPLReturn(BaseException):
         self.value = value
 
 
-# Builtins a sealed sub-LLM must NOT get: module import + code-eval + filesystem.
-_UNSAFE_BUILTINS = frozenset({"__import__", "eval", "exec", "compile", "open"})
+# Builtins a sealed sub-LLM must NOT get. Two reasons, both about keeping the AUTOMATED loop
+# intact (this is not a security boundary — see the module note above):
+#   * import / code-eval / filesystem (`__import__`/`eval`/`exec`/`compile`/`open`) — reach OUT;
+#   * `exit`/`quit` — raise SystemExit, a BaseException that sails PAST the react loop's
+#     `except Exception` net and destroys the whole sub-agent run with no tool-result
+#     round-trip to self-correct (a model emits `exit()` readily to "end its turn");
+#   * `breakpoint`/`input` — drop into pdb / block reading stdin, HANGING the kernel until the
+#     cell-timeout SIGKILLs it (there is no human / TTY in an automated run).
+# Denied -> the sub-LLM gets a NameError, which IS captured into output and self-correctable.
+# `help`/`copyright`/`credits`/`license` are deliberately LEFT IN: site-injected, but harmless
+# print/pagers — they neither escape nor hang the loop.
+_UNSAFE_BUILTINS = frozenset({
+    "__import__", "eval", "exec", "compile", "open",
+    "exit", "quit",
+    "breakpoint", "input",
+})
 
 
 def safe_builtins() -> Dict[str, Any]:
-    """A curated `__builtins__` dict for a sealed namespace: every builtin EXCEPT the
-    out-of-sandbox ones (`__import__`/`eval`/`exec`/`compile`/`open`). `print`/`len`/
-    `range`/`dict`/`class`-machinery all work; `import os` raises ImportError (the
-    sub-LLM gets capabilities only via deliberate kwargs grants, never ambiently — a
-    GRANTED callable still imports fine, since it runs in its OWN module globals). A
-    fresh dict per call so a cell mutating it cannot poison the next run."""
+    """A curated `__builtins__` dict for a sealed namespace: every builtin EXCEPT those in
+    `_UNSAFE_BUILTINS` (import/code-eval/filesystem + the loop-breakers exit/quit/breakpoint/
+    input). `print`/`len`/`range`/`dict`/`class`-machinery all work; `import os` raises
+    ImportError and `exit()` raises NameError (the sub-LLM gets capabilities only via
+    deliberate kwargs grants, never ambiently — a GRANTED callable still imports fine, since it
+    runs in its OWN module globals). A fresh dict per call so a cell mutating it cannot poison
+    the next run."""
     import builtins
     return {n: getattr(builtins, n) for n in dir(builtins) if n not in _UNSAFE_BUILTINS}
 

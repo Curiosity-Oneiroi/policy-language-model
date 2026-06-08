@@ -118,7 +118,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
 
         # Shape guard: `constraint` must actually be a Constraint (class or
         # composite). Otherwise json_schema()/validate() below would raise a raw
-        # AttributeError; fail fast with a clear message instead (#R4-5).
+        # AttributeError; fail fast with a clear message instead.
         if not callable(getattr(constraint, "json_schema", None)):
             raise TypeError(
                 "natural_llm: `constraint` must be a Constraint class or composite "
@@ -191,8 +191,8 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         # Budget exhausted: ALWAYS surface a clear budget-exhaustion
         # ConstraintViolation to the CALLER (PLM / a policy / a function),
         # chaining the last error so its detail is preserved. Constraint.validate()
-        # now always raises ConstraintViolation (#R4-2), so there is no raw error to
-        # special-case — we add the exhaustion context uniformly (#5).
+        # now always raises ConstraintViolation, so there is no raw error to
+        # special-case — we add the exhaustion context uniformly.
         raise ConstraintViolation(
             f"natural_llm: budget exhausted ({1 + rb} attempts); last validation "
             f"error {type(last_err).__name__}: {last_err}"

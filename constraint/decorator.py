@@ -90,8 +90,13 @@ def get_description(fn_or_obj) -> str | None:
     (classmethod/staticmethod/bound method), checking each layer — so it finds the
     description no matter which layer it was attached to or whether pydantic has
     unwrapped the function yet. Order-independent, matching `@constraint`."""
-    for layer in _descend(fn_or_obj):
-        d = getattr(layer, _DESCRIPTION_ATTR, None)
-        if d is not None:
-            return d
+    try:
+        for layer in _descend(fn_or_obj):
+            d = getattr(layer, _DESCRIPTION_ATTR, None)
+            if d is not None:
+                return d
+    except Exception:
+        return None          # a malformed object (a .wrapped/.__func__ getter raising) -> no description,
+                             # never propagate: a description is optional metadata and this is read on
+                             # arbitrary authored members. Protects EVERY caller, not just describe()'s walk.
     return None

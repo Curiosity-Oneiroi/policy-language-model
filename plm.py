@@ -47,18 +47,68 @@ class PLMTaskFailure(RuntimeError):
 @dataclass
 class PLMMetaParameters:
     system_prompt: str
-    extra_policies: dict[str, str] | None = None
+    extra_policies: dict[str, str] | None = None         # mutable + duplicable (normal)
+    sealed_policies: dict[str, str] | None = None        # immutable + un-duplicable (sealed, NOT blessed)
 
     def __post_init__(self) -> None:
-        ep = self.extra_policies
-        if ep is not None and not (
-            isinstance(ep, dict)
-            and all(isinstance(k, str) and isinstance(v, str) for k, v in ep.items())
-        ):
-            raise TypeError(
-                "PLMMetaParameters.extra_policies must be a dict[str, str] "
-                "(policy name -> @policy source) or None"
+        for _attr in ("extra_policies", "sealed_policies"):
+            _v = getattr(self, _attr)
+            if _v is not None and not (
+                isinstance(_v, dict)
+                and all(isinstance(k, str) and isinstance(s, str) for k, s in _v.items())
+            ):
+                raise TypeError(
+                    f"PLMMetaParameters.{_attr} must be a dict[str, str] "
+                    f"(policy name -> @policy source) or None"
+                )
+        # A name in BOTH buckets is ambiguous (mutable vs sealed) — reject.
+        if self.extra_policies and self.sealed_policies:
+            _dup = sorted(set(self.extra_policies) & set(self.sealed_policies))
+            if _dup:
+                raise ValueError(
+                    f"PLMMetaParameters: policy name(s) {_dup} appear in BOTH extra_policies "
+                    f"(mutable) and sealed_policies (immutable) — put each in exactly one"
+                )
+
+    @classmethod
+    def from_dir(cls, path: Any) -> "PLMMetaParameters":
+        """Load a metaparam FOLDER:
+
+            <path>/
+              system_prompt.md            # (or .txt) — the system prompt (required)
+              policies/
+                sealed/  <name>.py        # immutable + un-duplicable (NOT blessed)
+                mutable/ <name>.py        # mutable + duplicable (normal)
+
+        Each `.py` is one `@policy def <name>(...)`; the file STEM is the policy name
+        (files starting with `_` are skipped as helpers). Either policies subfolder may
+        be absent. Point PLM at one such folder per call — multiple folders under a
+        common root act as a library of selectable metaparams.
+        """
+        import pathlib
+        base = pathlib.Path(path)
+        if not base.is_dir():
+            raise FileNotFoundError(f"PLMMetaParameters.from_dir: not a directory: {base}")
+        sp = next((base / f for f in ("system_prompt.md", "system_prompt.txt") if (base / f).is_file()), None)
+        if sp is None:
+            raise FileNotFoundError(
+                f"PLMMetaParameters.from_dir: missing system_prompt.md (or .txt) in {base}"
             )
+
+        def _load(sub: str) -> dict[str, str]:
+            out: dict[str, str] = {}
+            pdir = base / "policies" / sub
+            if pdir.is_dir():
+                for f in sorted(pdir.glob("*.py")):
+                    if not f.name.startswith("_"):       # skip helper/private files
+                        out[f.stem] = f.read_text(encoding="utf-8")
+            return out
+
+        return cls(
+            system_prompt=sp.read_text(encoding="utf-8"),
+            extra_policies=_load("mutable") or None,
+            sealed_policies=_load("sealed") or None,
+        )
 
 
 class PLM:
@@ -122,7 +172,7 @@ class PLM:
         # kernel sub-LLM. OpenAIBackend.from_spec already reads the key; without it
         # here, an explicit `use_responses_api=` set against the model-name
         # auto-detection silently flips in-kernel. The hasattr guard no-ops it for
-        # the other backends (they lack the attr). (#R6-5)
+        # the other backends (they lack the attr).
         for attr in ("api_key", "base_url", "max_context_length", "use_responses_api"):
             if hasattr(mb, attr):
                 spec[attr] = getattr(mb, attr)
@@ -130,6 +180,8 @@ class PLM:
 
         if getattr(self.metaparams, "extra_policies", None):
             repl_env["_PLM_EXTRA_POLICIES"] = json.dumps(self.metaparams.extra_policies)
+        if getattr(self.metaparams, "sealed_policies", None):
+            repl_env["_PLM_SEALED_EXTRA_POLICIES"] = json.dumps(self.metaparams.sealed_policies)
 
         # Append the chosen backend's runtime SDK dep so the kernel's per-session
         # uv venv can `import plm.model_backend.<x>` and call it successfully.
@@ -219,6 +271,13 @@ class PLM:
                     continue
 
                 tool_call = tool_calls[0]
+                # PLM emitted parallel tool_calls; the root loop runs ONLY the first. Surface the
+                # nudge in PLM's OWN tool result (its message stream) so PLM self-corrects to one
+                # python call per turn — mirrors react_llm's note to its sub-LLM: each model's
+                # coaching stays in its own stream, never leaks across levels.
+                _parallel_note = (
+                    "[plm] you emitted " + str(len(tool_calls)) + " tool_calls; only the FIRST ran "
+                    "— send ONE `python` call per turn.\n\n") if len(tool_calls) > 1 else ""
                 tname = tool_call["function"]["name"]
 
                 raw_args = tool_call["function"].get("arguments")
@@ -314,7 +373,7 @@ class PLM:
                             (exec_result.get("stderr") or "").rstrip()
                             + "\n\n" + parsed_or_err + "\n"
                         )
-                        out = _format_repl_output(augmented)
+                        out = _parallel_note + _format_repl_output(augmented)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
@@ -337,7 +396,7 @@ class PLM:
                             "tool_result": out[:500],
                         })
                 else:
-                    out = _format_repl_output(exec_result)
+                    out = _parallel_note + _format_repl_output(exec_result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],

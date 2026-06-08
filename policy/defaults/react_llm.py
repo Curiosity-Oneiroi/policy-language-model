@@ -179,6 +179,16 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     objects = [] if objects is None else objects
     generate_kwargs = {} if generate_kwargs is None else generate_kwargs
 
+    # `generate_kwargs` is splat into `backend.generate(msgs, tools=tools, **generate_kwargs)`,
+    # which already passes `messages` (positionally) and `tools` — a colliding key would raise a
+    # cryptic `TypeError: got multiple values for keyword argument`. Reject it up front with a
+    # clear message (model params like temperature/max_tokens go here; tool grants via kwargs).
+    _reserved_gk = {"messages", "tools"} & set(generate_kwargs)
+    if _reserved_gk:
+        raise ValueError(
+            f"generate_kwargs may not contain {sorted(_reserved_gk)} — react_llm passes "
+            f"`messages` and `tools` itself; put backend params (temperature, max_tokens, ...) here")
+
     # ---- kwargs validation (bulletproof) ---------------------------------
     # `kwargs` is splat into the model's exec namespace below so each key
     # becomes a direct local name (ergonomic for the model — no
@@ -230,19 +240,24 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
 
     def _norm(m):
         # DEEP-copy the message dicts so this policy never mutates the CALLER's own
-        # dicts (R-F6) — react_llm appends new turns, and a verifier mutates `msgs` in
+        # dicts — react_llm appends new turns, and a verifier mutates `msgs` in
         # place; either way the caller's `messages` must stay untouched.
         import copy
         if isinstance(m, str):
             return [{"role": "user", "content": m}]
-        if isinstance(m, dict):
-            return [copy.deepcopy(m)]
         try:
-            return [copy.deepcopy(x) for x in m]
+            _items = [m] if isinstance(m, dict) else list(m)   # TypeError here = not a valid shape
         except TypeError:
             raise TypeError(
                 "react_llm: messages must be a str, a message dict, or an iterable of "
                 f"message dicts; got {type(m).__name__}")
+        try:
+            return [copy.deepcopy(x) for x in _items]
+        except Exception as _norm_copy_exc:                     # a message holds an un-copyable value
+            raise TypeError(                                    # (a lock/handle/etc.) -> clear, not generic
+                "react_llm: a message could not be copied ("
+                + type(_norm_copy_exc).__name__ + ": " + str(_norm_copy_exc)
+                + "); messages must be plain JSON-like dicts") from _norm_copy_exc
 
     def _exec(code, ns, round_no):
         """Run the model's code in the sub-agent's OWN repl namespace `ns`.
@@ -301,7 +316,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
                 # a wrong-typed value): surface it through the model's normal stderr capture
                 # — it lands in the tool result, the model self-corrects next turn, and
                 # `term` stays None so the loop continues within budget (never crashes the
-                # react loop). Use the SHARED formatter (R-F8) so react's diagnostic matches
+                # react loop). Use the SHARED formatter so react's diagnostic matches
                 # natural_llm's clear "RETURN value failed ... Required ... Fix the object"
                 # form rather than a hand-rolled describe()+traceback.
                 from plm._react_helper import (
@@ -366,25 +381,28 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     return_budget = _coerce_budget(return_budget, 5)
     
     with llm_call(depth):                               # voluntary lowering (no-op if depth=None)
-        check_depth_or_raise()                          # depth gate FIRST (D-A2): a clear LLMDepthExceeded, not a backend-spec error
+        check_depth_or_raise()                          # depth gate FIRST: a clear LLMDepthExceeded, not a backend-spec error
         backend = _make_backend()
         for _round in range(max_turns + return_budget):
             check_depth_or_raise()                      # policy owns the depth gate
             resp = backend.generate(msgs, tools=tools, **generate_kwargs)
-            if not isinstance(resp, dict):                  # malformed backend response -> empty turn (R-F4)
+            if not isinstance(resp, dict):                  # malformed backend response -> empty turn
                 resp = {}
             content = resp.get("content") or ""
             reasoning = resp.get("reasoning") or ""
             tool_calls = resp.get("tool_calls") or []
-            if isinstance(tool_calls, dict):                # a single call returned bare -> wrap it (R-F3)
+            if isinstance(tool_calls, dict):                # a single call returned bare -> wrap it
                 tool_calls = [tool_calls]
             elif not isinstance(tool_calls, list):          # any other malformed shape -> none
                 tool_calls = []
             msgs.append({"role": "assistant", "content": content,
                          "reasoning": reasoning,
-                         # Record ONLY the executed+answered call (tool_calls[0]);
-                         # storing extra calls leaves their ids unanswered.
-                         "tool_calls": (tool_calls[:1] or None)})
+                         # Record ONLY the executed+answered call (tool_calls[0]), and ONLY if
+                         # it is a dict: a non-dict first element (from a non-conformant provider)
+                         # stored here would crash the NEXT round's backend history sanitizer;
+                         # the R-F1 guard below still answers it + retries. (storing extra calls
+                         # would also leave their ids unanswered.)
+                         "tool_calls": ([tool_calls[0]] if tool_calls and isinstance(tool_calls[0], dict) else None)})
 
             if not tool_calls:
                 # Text-only turn: append assistant message above and continue.
@@ -396,20 +414,20 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             tc = tool_calls[0]
             if not isinstance(tc, dict):
                 # Malformed tool_call entry (str/int/None): answer with a clear error
-                # (no id to echo) and take another round rather than crashing. (R-F1)
+                # (no id to echo) and take another round rather than crashing.
                 msgs.append({"role": "tool", "tool_call_id": "",
                              "content": f"error: malformed tool_call ({type(tc).__name__}); "
                                         f"emit a single `python` call"})
                 continue
             _fn = tc.get("function")
-            _fn = _fn if isinstance(_fn, dict) else {}      # `function: null` / malformed -> {} (R-F2)
+            _fn = _fn if isinstance(_fn, dict) else {}      # `function: null` / malformed -> {}
             tname = _fn.get("name")
             if tname != "python":
                 # react_llm only offers the python tool. A backend that calls
                 # anything else gets a clear error back (its id IS answered, so
                 # history stays well-formed) and another round — mirroring the
                 # root loop's guard (plm.py) rather than silently exec'ing "".
-                msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "",
                              "content": f"error: tool {tname!r} not supported (only `python`)"})
                 continue
             args_raw = _fn.get("arguments") or "{}"
@@ -420,13 +438,13 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             except Exception:
                 # Any parse failure -> {} (not just JSONDecodeError): a huge integer
                 # literal raises ValueError (int_max_str_digits) and deeply-nested
-                # JSON raises RecursionError, neither a JSONDecodeError (#H13/#H14).
+                # JSON raises RecursionError, neither a JSONDecodeError.
                 targs = {}
             code = targs.get("code", "")
             if not isinstance(code, str):
                 # `code` present but not a string (null/number/object): clear error +
-                # retry, not a confusing AttributeError from fence-stripping. (R-F5)
-                msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                # retry, not a confusing AttributeError from fence-stripping.
+                msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "",
                              "content": "error: `code` must be a string of Python source"})
                 continue
 
@@ -445,7 +463,14 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             except Exception as e:                      # any other failure -> stderr back to the model
                 out = f"stderr:\n{type(e).__name__}: {e}"
 
-            msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": out})
+            if len(tool_calls) > 1:
+                # The SUB-LLM emitted parallel tool_calls; react runs ONLY the first. Surface the
+                # nudge in the SUB-LLM's OWN tool result (its message stream) so it self-corrects
+                # to one call per turn — NOT to PLM's stderr (this is the sub-agent's business,
+                # not the meta-reasoner's).
+                out = ("[react_llm] you emitted " + str(len(tool_calls)) + " tool_calls; only the "
+                       "FIRST ran — send ONE `python` call per turn.\n\n" + out)
+            msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "", "content": out})
             if term == "return":                        # RETURN(value) succeeded (constraint passed
                 return val                              # or there was no constraint) — done.
 

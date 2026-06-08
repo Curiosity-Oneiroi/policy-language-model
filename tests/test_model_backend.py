@@ -113,7 +113,7 @@ def test_vllm_spec_round_trips_api_key():
     """#R6-3: VLLMBackend must expose self.api_key so PLM's spec-builder hasattr
     loop round-trips an authenticated vLLM key — it previously stored only
     base_url, silently dropping the key on the in-kernel from_spec round-trip
-    (the #R4-1 credential fix covered OpenAI/Anthropic/Slate but missed VLLM)."""
+    (the credential fix covered OpenAI/Anthropic/Slate but missed VLLM)."""
     VLLMBackend = getattr(importlib.import_module("plm.model_backend.vllm_backend"), "VLLMBackend")
     be = VLLMBackend(base_url="http://vllm.invalid:9999/v1", model="m",
                      api_key="VLLM_SECRET", max_context_override=4096)   # override -> no probe
@@ -143,6 +143,27 @@ def test_openai_spec_round_trips_use_responses_api():
     assert rebuilt.use_responses_api is True           # preserved (not re-auto-detected to False)
 
 
+def test_openai_reasoning_classifier_consistent_across_sites():
+    """O6: the `use_responses_api` auto-detect and the `_is_reasoning_model` property must NEVER
+    disagree, and must cover o2/o4/o5+ + uppercase + a `provider/` prefix. Before, the auto-detect
+    used a literal ["o1","o3","gpt-5"] substring list (missed o2/o4, mishandled prefixes) while the
+    property used an anchored case-sensitive regex — so an o4-mini/proxied id got routed down the
+    wrong API path (temperature -> 400, or a missing reasoning dict)."""
+    mod = importlib.import_module("plm.model_backend.openai_backend")
+    OpenAIBackend, _is = mod.OpenAIBackend, mod._is_reasoning_model_name
+    reasoning = ["o1", "o3", "o4-mini", "o2", "O1-preview", "openai/o3-mini", "azure/gpt-5", "gpt-5"]
+    non = ["gpt-4o", "gpt-4", "gpt-3.5-turbo", "claude-3"]
+    for m in reasoning:
+        b = OpenAIBackend(model=m, base_url="http://x", api_key="x")
+        assert b.use_responses_api is True and b._is_reasoning_model is True, m
+    for m in non:
+        b = OpenAIBackend(model=m, base_url="http://x", api_key="x")
+        assert b.use_responses_api is False and b._is_reasoning_model is False, m
+    for m in reasoning + non:                          # one shared classifier -> can never disagree
+        b = OpenAIBackend(model=m, base_url="http://x", api_key="x")
+        assert b.use_responses_api == b._is_reasoning_model == _is(m), m
+
+
 def test_sanitize_strips_verifier_role_messages():
     """role 'verifier' is a PRIVATE trajectory channel — the shared
     `_sanitize_messages_for_api` drops it entirely so it never reaches the provider
@@ -157,3 +178,15 @@ def test_sanitize_strips_verifier_role_messages():
     out = be._sanitize_messages_for_api(msgs)
     assert [m["role"] for m in out] == ["user", "assistant"]            # verifier dropped
     assert all("private verifier note" not in (m.get("content") or "") for m in out)
+
+
+def test_sanitize_history_drops_nondict_tool_call():
+    """M4 (defense-in-depth): the shared `_sanitize_message_history` must DROP a malformed
+    (non-dict) tool_call instead of crashing on `tc.copy()` — so ANY backend survives a
+    non-conformant tool_call that reached history from any source (not only react's storage)."""
+    OpenAIBackend = getattr(importlib.import_module("plm.model_backend.openai_backend"), "OpenAIBackend")
+    be = OpenAIBackend(model="m", api_key="x")
+    msgs = [{"role": "assistant", "content": "",
+             "tool_calls": ["BAD", 42, {"id": "1", "function": {"name": "f"}}]}]
+    out = be._sanitize_message_history(msgs, {})                        # must not raise
+    assert [type(tc).__name__ for tc in out[0]["tool_calls"]] == ["dict"]   # non-dicts dropped, dict kept
