@@ -182,7 +182,15 @@ def _is_sealed_obj(obj) -> bool:
     flag faithfully mirrors the seal. A CLASS policy is a RAW type whose `_p_immutable` is freely
     writable (no __setattr__ freeze on a type) — so the gates must NOT trust that flag alone. They
     fall back to this registry record, which a cell can't reach as a plain global and which is keyed
-    by identity (so flipping `_p_immutable` OR rebinding `__name__` can't dodge it)."""
+    by identity (so flipping `_p_immutable` OR rebinding `__name__` can't dodge it).
+
+    Guards `obj is None` FIRST: callers pass `dict.get(_PLM_POLICIES, key)` (None for an absent key),
+    and `dict.get` ALSO returns None for a sealed name missing from the registry — so without this
+    guard a None argument would alias a (hypothetical) dangling sealed name and wrongly return True.
+    The invariant `_SEALED_POLICIES ⊆ keys(_PLM_POLICIES)` holds today, so this is a foot-gun guard,
+    not a live-bug fix — but it makes the predicate airtight regardless of future callers."""
+    if obj is None:
+        return False
     for _n in _SEALED_POLICIES:
         if dict.get(_PLM_POLICIES, _n) is obj:
             return True

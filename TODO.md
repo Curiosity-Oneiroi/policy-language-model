@@ -223,9 +223,14 @@ the re-run contract so PLM doesn't try to inspect crash survivors or expect part
 
 ## LIMIT-NC3-2 — RESOLVED: super() in a constraint is rejected at definition
 
-**Resolution (chosen over making it dill-survivable):** a `super()`-using method on a Constraint is
+**Resolution (chosen over making it dill-survivable):** a `super()`-calling method on a Constraint is
 now REJECTED at class definition with a clear error — `_ConstraintMeta.__init__` scans the class's
-own methods and refuses any that carry a bare-`super()` `__class__` free-var. A Constraint is a FLAT
+own methods and refuses any whose own bytecode loads `super` (`'super' in co_names`). That catches
+BOTH zero-arg `super()` and explicit `super(C, self)`, and — unlike a `'__class__' in co_freevars`
+check — does NOT false-positive on a method whose NESTED helper uses super (F5). The rarer residual
+`__class__`-cell cases the narrower check intentionally allows (a nested-helper super, a bare
+`__class__` reference) are handled defensively by `from_recipe`'s cell-rebind, which is therefore
+NOT dead code (F3). A Constraint is a FLAT
 structural validator (fields + @field/@model_validator + predicates), NOT an OOP inheritance
 hierarchy; `super()` implies inheriting + delegating to a parent constraint, which the model doesn't
 support (and which couldn't survive crash-restart anyway — the method's `__class__` cell can't

@@ -2561,6 +2561,16 @@ def test_nc34_facade_factory_kwargs_deepcopied():
     assert "GBP" not in c.describe()
 
 
+def test_f6_field_kwargs_copy_tolerates_non_deepcopyable_value():
+    """F6: NC3-4's deepcopy must not turn an exotic, non-deepcopyable kwarg value into a
+    construction-time crash. `_safe_copy_kwargs` falls back to the reference per-value — a crash is
+    strictly worse than the rare residual aliasing for such a value."""
+    import threading
+    from plm.constraint import Constraint
+    Constraint.field(one_of=[threading.Lock()])      # must NOT raise (old shallow dict didn't; bare deepcopy did)
+    assert Constraint.field(one_of=["USD", "EUR"]).validate("USD") == "USD"   # normal case still fine
+
+
 def test_nc31_recursive_constraint_recipe_no_stack_overflow():
     """NC3-1: `to_recipe` on a self-recursive structural Constraint (a field annotation pointing
     back at the class) must NOT infinite-recurse. The cycle guard breaks it: the cyclic field keeps
@@ -2578,6 +2588,27 @@ def test_nc31_recursive_constraint_recipe_no_stack_overflow():
     assert r is None or r[0] == "structural"
 
 
+def test_f7_recipe_cycle_guard_isolated_per_context():
+    """F7: the recipe-recursion cycle guard is a per-context ContextVar, not a shared module set —
+    so concurrent `parallel()` branches (each runs via `copy_context().run(...)` in a thread pool)
+    recipe-ing the SAME class don't collide (a shared set would let one branch see another's
+    mid-build id as a spurious cycle and drop a valid recipe). Mirrors parallel()'s exact model."""
+    from contextvars import copy_context
+    from concurrent.futures import ThreadPoolExecutor
+    from plm.constraint import Constraint
+    from plm.constraint.snapshot import to_recipe
+
+    class Money(Constraint):
+        amount: int
+
+    def _run():
+        return to_recipe(Money)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = [f.result() for f in [pool.submit(copy_context().run, _run) for _ in range(64)]]
+    assert all(r and r[0] == "structural" for r in results)      # 0 spurious-None
+
+
 def test_nc32_super_in_constraint_rejected_at_definition():
     """NC3-2 (resolved via the constraint contract): a Constraint is a FLAT structural validator
     (fields + validators + predicates), NOT an inheritance hierarchy. A method using bare super()
@@ -2591,7 +2622,23 @@ def test_nc32_super_in_constraint_rejected_at_definition():
         class S(Constraint):
             x: int
             def who(self):
-                return super().__repr_name__()      # bare super -> rejected at the class statement
+                return super().__repr_name__()      # zero-arg super -> rejected at the class statement
+
+    with pytest.raises(TypeError, match="super"):    # F5: EXPLICIT super(C, self) is rejected too
+        class E(Constraint):
+            x: int
+            def who(self):
+                return super(Constraint, self).model_dump()
+
+    # F5: a method whose NESTED helper does NOT call super is allowed (no false positive from the
+    # old `__class__`-freevar check, which the `'super' in co_names` discriminator avoids).
+    class Helped(Constraint):
+        x: int
+        def label(self):
+            def _fmt(v):
+                return f"x={v}"
+            return _fmt(self.x)
+    assert Helped(x=3).label() == "x=3"
 
     class Money(Constraint):                         # a normal structural constraint is unaffected
         amount: int

@@ -49,6 +49,7 @@ regardless — so it is left documented rather than worked around.
 from __future__ import annotations
 
 import typing
+from contextvars import ContextVar
 from typing import Annotated, Any, List, Optional, Tuple, get_args, get_origin
 
 _CHILD_KINDS = ("field", "composite", "structural")
@@ -152,7 +153,14 @@ def _spec_to_value(s: Any) -> Any:
     return s
 
 
-_RECIPE_IN_PROGRESS: set = set()    # ids of constraint classes whose recipe is mid-build (cycle guard)
+# The recipe-recursion stack (ids of constraint classes mid-build), as a ContextVar — NOT a module
+# set and NOT threading.local. `parallel()` runs each branch via `copy_context().run(...)`, which
+# snapshots ContextVars, so a ContextVar set inside a branch is isolated to that branch; a shared
+# module set would instead let two branches recipe-ing the SAME class collide (one wrongly seeing
+# the other's id as a cycle and dropping a valid constraint). This matches PLM's existing
+# concurrency idiom (the depth gates `_POLICY_CALL_DEPTH`/`_LLM_DEPTH` are ContextVars). `threading`
+# is unsupported in the kernel, so threading.local is out anyway.
+_RECIPE_IN_PROGRESS: "ContextVar[Optional[set]]" = ContextVar("_recipe_in_progress", default=None)
 
 
 def to_recipe(c: Any) -> Optional[Tuple]:
@@ -164,16 +172,22 @@ def to_recipe(c: Any) -> Optional[Tuple]:
     back at the class) would otherwise recurse `_ann_to_spec -> to_recipe -> ...` forever and blow
     the stack. When a class is reached again while its OWN recipe is still building, we return None
     (a cyclic constraint can't flatten to a finite recipe) — the field then keeps its live
-    annotation, so the dumps-probe drops the whole (unpicklable) recipe cleanly. (NC3-1)"""
+    annotation, so the dumps-probe drops the whole (unpicklable) recipe cleanly. The
+    in-progress stack lives in a per-context ContextVar so concurrent `parallel()` branches don't
+    share it; add/discard per id balance out, so the stack is empty between top-level calls."""
     if not isinstance(c, type):
         return None
-    if id(c) in _RECIPE_IN_PROGRESS:
+    _seen = _RECIPE_IN_PROGRESS.get()
+    if _seen is None:                                # first call in THIS context -> fresh stack
+        _seen = set()
+        _RECIPE_IN_PROGRESS.set(_seen)
+    if id(c) in _seen:
         return None
-    _RECIPE_IN_PROGRESS.add(id(c))
+    _seen.add(id(c))
     try:
         return _to_recipe_build(c)
     finally:
-        _RECIPE_IN_PROGRESS.discard(id(c))
+        _seen.discard(id(c))
 
 
 def _to_recipe_build(c: Any) -> Optional[Tuple]:

@@ -425,13 +425,18 @@ class PythonReplSession:
         # instead of resurrecting this torn-down session.
         self._closed = True
 
-        # if a spawn is in flight, shut its listener so a blocked `accept()` wakes IMMEDIATELY
-        # (it then sees `_closed` and aborts) instead of spinning the full 30s connect timeout — the
-        # killpg below kills the not-yet-connected kernel but does NOT unblock the accept on its own.
+        # If a spawn is in flight, wake a blocked `accept()` IMMEDIATELY (it then sees `_closed` and
+        # aborts) instead of spinning the full 30s connect timeout — the killpg below kills the
+        # not-yet-connected kernel but does NOT unblock the accept on its own. The wake MUST be
+        # `shutdown(SHUT_RDWR)`, NOT `close()`: on Linux closing a socket does NOT interrupt a thread
+        # already blocked in accept() (it spins the timeout, then raises EBADF) — only shutdown does.
+        # close() after is still needed to release the fd.
         _listener = getattr(self, "_listener", None)
         if _listener is not None:
             with suppress(OSError):
-                _listener.close()
+                _listener.shutdown(socket.SHUT_RDWR)   # actually wakes the blocked accept()
+            with suppress(OSError):
+                _listener.close()                      # release the fd (a no-op-ish after shutdown)
 
         # Teardown must be SERIALIZED with the worker (it holds _io_lock for a whole cell), so
         # we never touch shared state (_proc / pipes / pid box) concurrently. A

@@ -147,10 +147,24 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
 
         # HARD-SET the schema on response_format — the constraint defines the output,
         # so it ALWAYS wins (we do NOT let a caller-passed response_format override it).
-        # NO try/except — if json_schema() fails on a non-factory constraint, that's a
-        # real bug we want surfaced (the LLM has nothing to converge on without the
-        # schema, so silently retrying would be busy-work).
-        schema = constraint.json_schema()
+        # A constraint with NO JSON-schema representation — an `is_instance_of=`/predicate rule,
+        # INCLUDING one hidden inside a struct field built via `Constraint.field(...)` (which the
+        # `_contains_factory` guard above can't see, as it walks only `&|^~` composites, not struct
+        # field annotations) — is, like a factory, something the model can't converge on. Surface it
+        # as the SAME clear TypeError instead of an uncaught PydanticInvalidForJsonSchema crash.
+        # General: catches ANY non-exportable schema, not just is_instance_of.
+        from pydantic.errors import PydanticInvalidForJsonSchema
+        try:
+            schema = constraint.json_schema()
+        except PydanticInvalidForJsonSchema as e:
+            raise TypeError(
+                f"natural_llm: constraint {getattr(constraint, '__name__', repr(constraint))!r} "
+                f"has no JSON-schema representation ({e}) — e.g. an `is_instance_of=`/predicate rule "
+                f"(possibly inside a struct field built via `Constraint.field(...)`) compiles to a "
+                f"pydantic is-instance schema that can't be exported, so the model has nothing to "
+                f"converge on. Use a purely structural Constraint, or route predicate/isinstance "
+                f"validation through `react_llm(..., constraint=C)`."
+            ) from e
         gk = dict(generate_kwargs)
         gk["response_format"] = {"type": "json_schema",
                                  "json_schema": {"name": "answer", "schema": schema}}

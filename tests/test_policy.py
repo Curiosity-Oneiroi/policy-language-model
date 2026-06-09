@@ -882,6 +882,26 @@ def test_nr31_respawn_result_signals_not_executed():
         s.close()
 
 
+def test_f4_root_loop_survives_malformed_tool_calls():
+    """F4: PLM's root loop must not CRASH on a non-conformant backend's tool_calls — it now mirrors
+    react_llm's guards (normalize shape, isinstance(tc, dict), isinstance(function, dict), reply a
+    user-turn for a non-dict tc). A shape that used to crash PLM.__call__ raw (the outer try has no
+    `except`) now re-prompts and exhausts the budget gracefully (PLMTaskFailure), no TypeError/
+    KeyError. `["junk"]` is the worst case — it hit the bare `tool_call["function"]` subscript."""
+    import asyncio
+    from plm.plm import PLM, PLMMetaParameters, PLMTaskFailure
+
+    class _FakeBackend:
+        model = "fake-model"
+        async def generate(self, messages=None, tools=None, **kw):
+            return {"content": "", "tool_calls": ["junk"]}      # malformed every round
+
+    plm = PLM(model_backend=_FakeBackend(),
+              metaparams=PLMMetaParameters(system_prompt="sys"), max_turns=1, return_budget=1)
+    with pytest.raises(PLMTaskFailure):                          # graceful budget-exhaust, NOT a crash
+        asyncio.run(plm([{"role": "user", "content": "go"}]))
+
+
 def test_int_generator_policies_survive_crash_restart():
     """M3: EVERY generator-policy shape survives a hard respawn AND stays depth-correct after —
     a function generator, a class generator __call__, a class generator method, and nesting

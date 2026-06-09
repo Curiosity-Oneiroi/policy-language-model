@@ -299,12 +299,18 @@ class PLM:
                 plm_ctx["main_turns"] = plm_ctx.get("main_turns", 0) + 1
 
                 tool_calls = response.get("tool_calls") or []
+                if isinstance(tool_calls, dict):                  # a single call returned bare -> wrap
+                    tool_calls = [tool_calls]
+                elif not isinstance(tool_calls, list):            # any other malformed shape -> none
+                    tool_calls = []
 
                 messages.append({
                     "role": "assistant",
                     "content": content,
                     "reasoning": reasoning,
-                    "tool_calls": (tool_calls[:1] or None),
+                    # Store ONLY the executed+answered call, and ONLY if it's a dict — a non-dict
+                    # entry would corrupt the next round's history sanitizer. Mirrors react_llm.
+                    "tool_calls": ([tool_calls[0]] if tool_calls and isinstance(tool_calls[0], dict) else None),
                     "_timestamp": time.time(),
                 })
 
@@ -322,9 +328,24 @@ class PLM:
                 _parallel_note = (
                     "[plm] you emitted " + str(len(tool_calls)) + " tool_calls; only the FIRST ran "
                     "— send ONE `python` call per turn.\n\n") if len(tool_calls) > 1 else ""
-                tname = tool_call["function"]["name"]
 
-                raw_args = tool_call["function"].get("arguments")
+                if not isinstance(tool_call, dict):
+                    # Malformed first tool_call from a non-conformant backend: the assistant turn
+                    # stored tool_calls=None for it, so reply as a USER turn (NOT an orphan `tool`).
+                    # Mirrors react_llm's hardening; the root loop's outer try has no except,
+                    # so without this a bare-subscript below would crash PLM.__call__ raw.
+                    messages.append({"role": "user",
+                                     "content": _parallel_note + f"[error] malformed tool_call "
+                                                f"({type(tool_call).__name__}); emit a single `python` tool call"})
+                    metrics["tool_calls"].append({
+                        "tool_name": None, "tool_status": "malformed_tool_call",
+                        "tool_result": f"malformed tool_call ({type(tool_call).__name__})"})
+                    continue
+                _fn = tool_call.get("function")
+                _fn = _fn if isinstance(_fn, dict) else {}        # `function: null`/malformed -> {} (mirror react)
+                tname = _fn.get("name")
+
+                raw_args = _fn.get("arguments")
                 if isinstance(raw_args, dict):
                     targs = raw_args
                 elif isinstance(raw_args, str):
@@ -333,7 +354,7 @@ class PLM:
                     except Exception:
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call["id"],
+                            "tool_call_id": tool_call.get("id") or "",
                             "content": _parallel_note + f"error: invalid JSON arguments for tool {tname!r}",
                         })
                         metrics["tool_calls"].append({
@@ -344,7 +365,7 @@ class PLM:
                 else:
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.get("id") or "",
                         "content": _parallel_note + f"error: invalid arguments for tool {tname!r}",
                     })
                     metrics["tool_calls"].append({
@@ -357,7 +378,7 @@ class PLM:
                 if tname != "python":
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.get("id") or "",
                         "content": _parallel_note + f"error: tool {tname!r} not supported (only `python`)",
                     })
                     metrics["tool_calls"].append({
@@ -369,7 +390,7 @@ class PLM:
                 if not isinstance(targs, dict):
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.get("id") or "",
                         "content": _parallel_note + f"error: arguments for tool {tname!r} must be a JSON object",
                     })
                     metrics["tool_calls"].append({
@@ -384,7 +405,7 @@ class PLM:
                 except SyntaxError as e:
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.get("id") or "",
                         "content": _parallel_note + f"stderr:\n{e}",
                     })
                     metrics["tool_calls"].append({
@@ -420,7 +441,7 @@ class PLM:
                         out = _parallel_note + _format_repl_output(augmented)
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call["id"],
+                            "tool_call_id": tool_call.get("id") or "",
                             "content": out,
                         })
                         metrics["tool_calls"].append({
@@ -432,7 +453,7 @@ class PLM:
                         out = _format_repl_output(exec_result)
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call["id"],
+                            "tool_call_id": tool_call.get("id") or "",
                             "content": out + "\n[PLM] RETURN accepted; task terminating.",
                         })
                         metrics["tool_calls"].append({
@@ -443,7 +464,7 @@ class PLM:
                     out = _parallel_note + _format_repl_output(exec_result)
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
+                        "tool_call_id": tool_call.get("id") or "",
                         "content": out,
                     })
                     metrics["tool_calls"].append({

@@ -429,6 +429,36 @@ def test_8_natural_llm_constraint_passes(defaults_installed, stub_backend):
     assert len(stub_backend.calls) == 1
 
 
+def test_f1_natural_llm_rejects_non_json_schema_constraint(defaults_installed, stub_backend):
+    """F1: a constraint with NO JSON-schema representation — e.g. a struct embedding a
+    `Constraint.field(is_instance_of=...)` field — slips natural_llm's `_contains_factory` guard (it
+    only walks composites, not struct fields), and `is_instance_schema` has no JSON schema. natural_llm
+    must raise a CLEAR TypeError (like the factory case), NOT an uncaught PydanticInvalidForJsonSchema
+    crash, and make NO generate call."""
+    from plm.constraint import Constraint
+
+    class S(Constraint):
+        x: Constraint.field(is_instance_of=int)
+
+    nl = _PLM_POLICIES["natural_llm"]
+    with pytest.raises(TypeError, match="no JSON-schema representation"):
+        nl("give me x", constraint=S)
+    assert len(stub_backend.calls) == 0          # crashed at setup, before any generate
+
+
+def test_f8_is_sealed_obj_none_is_false():
+    """F8: `_is_sealed_obj(None)` must be False. Callers pass `dict.get(registry, key)` (None for an
+    absent key); `dict.get` ALSO returns None for a sealed name missing from the registry — so
+    without the `obj is None` guard a None arg could alias a dangling sealed name and wrongly report
+    sealed. (Invariant holds today; this keeps the predicate airtight for any future caller.)"""
+    from plm.policy.registry import _is_sealed_obj, _SEALED_POLICIES
+    _SEALED_POLICIES.add("__ghost_unregistered__")       # a sealed NAME with NO registry entry
+    try:
+        assert _is_sealed_obj(None) is False
+    finally:
+        _SEALED_POLICIES.discard("__ghost_unregistered__")
+
+
 def test_9_natural_llm_retry_then_pass(defaults_installed, stub_backend):
     """Fails twice then passes → 3 generates; retry messages contain BOTH
     describe() text AND the violation; failed answer kept in history."""

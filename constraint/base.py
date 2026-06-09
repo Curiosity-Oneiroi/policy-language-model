@@ -133,6 +133,21 @@ class ConstraintViolation(ValueError):
 _PydanticMeta: type = type(pd.BaseModel)
 
 
+def _safe_copy_kwargs(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a factory-kwargs dict, deep-copying each value to avoid the facade aliasing inner's
+    mutable values — but PER VALUE, falling back to the original reference for any value
+    that is NOT deepcopyable (a lock / file handle / live resource). A construction-time crash is
+    strictly worse than the rare residual aliasing for such an exotic value, and one non-copyable
+    value must not cost the others their deep copy."""
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        try:
+            out[k] = copy.deepcopy(v)
+        except Exception:
+            out[k] = v
+    return out
+
+
 class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
     """Metaclass enabling `Cls1 & Cls2`, `Cls1 | Cls2`, `~Cls`, `Cls1 ^ Cls2`
     at the class level."""
@@ -144,20 +159,26 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
         # can't disturb it.
         super().__init__(*args, **kwargs)
         # A Constraint is a FLAT structural validator — fields + @field/@model_validator +
-        # predicates — NOT an OOP inheritance hierarchy. A method using bare `super()` implies
-        # inheriting from + delegating to a parent constraint, which is unsupported: it doesn't fit
-        # the model AND can't survive crash-restart (the method's hidden `__class__` cell can't
-        # dill-pickle). Reject it at DEFINITION with a clear message instead of failing mysteriously
-        # later. None of the library's own classes (base / field / composite) use bare super(), so
-        # this only ever fires on a misuse. (Constraint contract; supersedes the NC3-2 limitation.)
+        # predicates — NOT an OOP inheritance hierarchy. A method that CALLS `super()` is delegating
+        # to a parent constraint, which is unsupported: it doesn't fit the model AND its hidden
+        # `__class__` cell can't dill-pickle. Reject it at DEFINITION with a clear message instead of
+        # failing mysteriously later. None of the library's own classes (base / field / composite)
+        # call super(), so this only fires on a misuse. (Constraint contract; supersedes)
+        #
+        # Detection: `'super' in co_names` — does THIS method load the `super` builtin? This catches
+        # BOTH zero-arg `super()` and explicit `super(C, self)`, and — unlike `'__class__' in
+        # co_freevars` — does NOT false-positive on a method whose NESTED helper uses super (that
+        # super lives in the nested code object, not this method's co_names). The rarer residual
+        # `__class__`-cell cases the narrower check intentionally allows (a nested-helper super, a
+        # bare `__class__` reference) are handled defensively by `from_recipe`'s cell-rebind.
         import types as _types
         for _k, _v in vars(cls).items():
             _fn = _v.__func__ if isinstance(_v, (classmethod, staticmethod)) else _v
             # Gate on FunctionType (a pure type check) BEFORE touching `.__code__`: a pathological
             # class member with a raising __getattr__ must NOT break constraint definition (NC-8).
-            if isinstance(_fn, _types.FunctionType) and "__class__" in _fn.__code__.co_freevars:
+            if isinstance(_fn, _types.FunctionType) and "super" in _fn.__code__.co_names:
                 raise TypeError(
-                    f"Constraint {cls.__name__!r}: method {_k!r} uses super(), which constraints do "
+                    f"Constraint {cls.__name__!r}: method {_k!r} calls super(), which constraints do "
                     f"NOT support — a Constraint is a flat structural validator (fields + validators "
                     f"+ predicates), not an inheritance hierarchy. Remove the super()/inheritance."
                 )
@@ -314,9 +335,11 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             # `kwargs`: inner captured them AFTER materializing one-shot iterables, whereas the
             # raw `kwargs` here hold ALREADY-EXHAUSTED generators (one_of/coercers/...), so a
             # raw copy would recipe an empty/garbage sequence.
-            # deepcopy (not dict()): a shallow copy aliases the inner's mutable VALUES (e.g. the
-            # `one_of` list), so mutating the facade's copy would silently change inner's. (NC3-4)
-            "_constraint_factory_kwargs": copy.deepcopy(inner._constraint_factory_kwargs),
+            # per-value deepcopy (not a shallow dict()): a shallow copy aliases the inner's mutable
+            # VALUES (e.g. the `one_of` list), so mutating the facade's copy would silently change
+            # inner's. `_safe_copy_kwargs` falls back to the reference for a non-deepcopyable
+            # value so an exotic kwarg can't crash construction .
+            "_constraint_factory_kwargs": _safe_copy_kwargs(inner._constraint_factory_kwargs),
             "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
         }
         return _ConstraintMeta("_FieldConstraint", (Constraint,), ns)
