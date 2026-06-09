@@ -148,6 +148,25 @@ def _safe_copy_kwargs(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _calls_super_builtin(code: Any) -> bool:
+    """True iff `code` loads the `super` BUILTIN as a global/name/free var — i.e. the method itself
+    calls `super()` (zero-arg) or `super(C, self)` (explicit). Precise, with NO gotchas:
+      * an ATTRIBUTE/method named `super` (`n.super`, `n.super()`) is a LOAD_ATTR/LOAD_METHOD -> NOT
+        flagged (allowed);
+      * a LOCAL named `super` (`super = ...; super()`) is a LOAD_FAST -> NOT flagged (it shadows the
+        builtin, isn't inheritance);
+      * a different name (`fsuper`, `super_helper`) -> exact `argval == "super"` -> NOT flagged;
+      * a NESTED helper's `super()` lives in its OWN code object (co_consts), not in `code`'s
+        instruction stream -> NOT flagged (no false-positive on the enclosing method).
+    Replaces a `'super' in co_names` membership test, which wrongly flagged `n.super` (co_names also
+    holds LOAD_ATTR names)."""
+    import dis as _dis
+    for _ins in _dis.get_instructions(code):
+        if _ins.opname in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF") and _ins.argval == "super":
+            return True
+    return False
+
+
 class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
     """Metaclass enabling `Cls1 & Cls2`, `Cls1 | Cls2`, `~Cls`, `Cls1 ^ Cls2`
     at the class level."""
@@ -165,18 +184,20 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
         # failing mysteriously later. None of the library's own classes (base / field / composite)
         # call super(), so this only fires on a misuse. (Constraint contract; supersedes)
         #
-        # Detection: `'super' in co_names` — does THIS method load the `super` builtin? This catches
-        # BOTH zero-arg `super()` and explicit `super(C, self)`, and — unlike `'__class__' in
-        # co_freevars` — does NOT false-positive on a method whose NESTED helper uses super (that
-        # super lives in the nested code object, not this method's co_names). The rarer residual
-        # `__class__`-cell cases the narrower check intentionally allows (a nested-helper super, a
-        # bare `__class__` reference) are handled defensively by `from_recipe`'s cell-rebind.
+        # Detection: `_calls_super_builtin` — does THIS method LOAD the `super` builtin (global/name/
+        # free var)? Catches BOTH zero-arg `super()` and explicit `super(C, self)`. It does NOT
+        # false-positive on an ATTRIBUTE/field named `super` (`n.super` — LOAD_ATTR), a LOCAL named
+        # `super`, a different name (`fsuper`/`super_x`), or a NESTED helper's super (its own code
+        # object). An earlier `'super' in co_names` test wrongly flagged `n.super` (co_names also
+        # holds attribute names). The rarer residual `__class__`-cell cases the check intentionally
+        # allows (a nested-helper super, a bare `__class__` reference) are handled defensively by
+        # `from_recipe`'s cell-rebind. (F35)
         import types as _types
         for _k, _v in vars(cls).items():
             _fn = _v.__func__ if isinstance(_v, (classmethod, staticmethod)) else _v
             # Gate on FunctionType (a pure type check) BEFORE touching `.__code__`: a pathological
             # class member with a raising __getattr__ must NOT break constraint definition (NC-8).
-            if isinstance(_fn, _types.FunctionType) and "super" in _fn.__code__.co_names:
+            if isinstance(_fn, _types.FunctionType) and _calls_super_builtin(_fn.__code__):
                 raise TypeError(
                     f"Constraint {cls.__name__!r}: method {_k!r} calls super(), which constraints do "
                     f"NOT support — a Constraint is a flat structural validator (fields + validators "

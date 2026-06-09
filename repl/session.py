@@ -507,7 +507,19 @@ class PythonReplSession:
             )
 
             self._listener = listener         # expose so close() can shut it to UNBLOCK accept
+            # Airtight close()/spawn handshake. close() does, in order: set `_closed=True`,
+            # then `shutdown(self._listener)`. We assign `self._listener` ABOVE, then RE-CHECK
+            # `_closed` HERE before blocking. Every interleaving is now covered:
+            #   * close() ran fully before us  -> we see `_closed` here -> abort (never block);
+            #   * close() runs after our assign -> it finds the listener and shutdown() wakes accept;
+            #   * close() read `_listener` as None (before our assign) -> it had already set `_closed`
+            #     (set BEFORE its read), so this check catches it -> abort.
+            # i.e. close() can't slip between "listener visible" and "we're blocked" without either
+            # waking the accept or being seen here. (Previously close() could read None then we'd
+            # block uninterruptibly for the full 30s.)
             listener.settimeout(30.0)
+            if getattr(self, "_closed", False):
+                raise RuntimeError("PLM kernel spawn aborted: session is closing")
             try:
                 client_sock, _ = listener.accept()
             except OSError:                       # socket.timeout IS an OSError subclass; an OSError
@@ -651,7 +663,15 @@ class PythonReplSession:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise _CellTimeout(partial=consumed > 0)
-                    rlist, _, _ = select.select([resp_fd], [], [], remaining)
+                    try:
+                        rlist, _, _ = select.select([resp_fd], [], [], remaining)
+                    except ValueError as e:
+                        # select() raises ValueError for an fd >= FD_SETSIZE (1023). Convert at the
+                        # source to a _FrameDecodeError (already in execute_cell's respawn except
+                        # tuples) so a high-fd kernel triggers a clean respawn instead of escaping
+                        # uncaught — rather than broadening those tuples to ALL ValueErrors. (select-fd)
+                        raise _FrameDecodeError(
+                            f"response fd {resp_fd} out of select() range; transport unusable") from e
                     if not rlist:
                         raise _CellTimeout(partial=consumed > 0)
                 chunk = self._resp_r.read(n - len(buf))

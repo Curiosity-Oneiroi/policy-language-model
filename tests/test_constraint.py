@@ -2631,7 +2631,7 @@ def test_nc32_super_in_constraint_rejected_at_definition():
                 return super(Constraint, self).model_dump()
 
     # F5: a method whose NESTED helper does NOT call super is allowed (no false positive from the
-    # old `__class__`-freevar check, which the `'super' in co_names` discriminator avoids).
+    # old `__class__`-freevar check, which the bytecode-scan discriminator avoids).
     class Helped(Constraint):
         x: int
         def label(self):
@@ -2639,6 +2639,19 @@ def test_nc32_super_in_constraint_rejected_at_definition():
                 return f"x={v}"
             return _fmt(self.x)
     assert Helped(x=3).label() == "x=3"
+
+    # F35: a method that reads an ATTRIBUTE/field named `super` (LOAD_ATTR, not the super BUILTIN)
+    # must be ALLOWED — the bytecode scan only flags `super` loaded as a global/name/free var. A
+    # `'super' in co_names` membership test wrongly rejected this (co_names also holds attr names).
+    from pydantic import field_validator
+    class HasSuperField(Constraint):
+        node: object
+        @field_validator("node")
+        @classmethod
+        def _v(cls, n):
+            _ = getattr(n, "super", None)            # also exercise: a value with a `super` member
+            return n
+    assert HasSuperField(node=object()).node is not None
 
     class Money(Constraint):                         # a normal structural constraint is unaffected
         amount: int

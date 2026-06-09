@@ -23,7 +23,7 @@ from .proxy import (
     _policy_note,
     _rewrite_class_policy,
 )
-from .registry import _PLM_POLICIES
+from .registry import _PLM_POLICIES, _is_default
 
 
 _RESERVED = frozenset({
@@ -87,7 +87,11 @@ def policy(obj):
     # anyway) AND the kind-change path below that would otherwise pop+recreate and
     # clobber the default. One note, no half-work.
     _existing0 = _PLM_POLICIES.get(name)
-    if _existing0 is not None and getattr(_existing0, "_p_immutable", False):
+    # `_is_default` (not the bare `_p_immutable` flag) so a tampered sealed CLASS policy — whose raw
+    # `_p_immutable` a cell can flip — is still caught here, via the un-spoofable `_is_sealed_obj`
+    # registry anchor. Without this the kind-change path below could pop+recreate a sealed class as
+    # an attacker function in __main__ for the rest of the cell.
+    if _existing0 is not None and _is_default(_existing0):
         _policy_note(
             f"@policy {name!r}: immutable default policy; re-decoration ignored. "
             f"Use `duplicate_policy({name!r}, '<new_name>')` to fork it."

@@ -153,13 +153,15 @@ def _spec_to_value(s: Any) -> Any:
     return s
 
 
-# The recipe-recursion stack (ids of constraint classes mid-build), as a ContextVar — NOT a module
-# set and NOT threading.local. `parallel()` runs each branch via `copy_context().run(...)`, which
-# snapshots ContextVars, so a ContextVar set inside a branch is isolated to that branch; a shared
-# module set would instead let two branches recipe-ing the SAME class collide (one wrongly seeing
-# the other's id as a cycle and dropping a valid constraint). This matches PLM's existing
-# concurrency idiom (the depth gates `_POLICY_CALL_DEPTH`/`_LLM_DEPTH` are ContextVars). `threading`
-# is unsupported in the kernel, so threading.local is out anyway.
+# The recipe-recursion stack (ids of constraint classes mid-build), used ONLY to break a cycle on a
+# self-recursive constraint (a field typed as the constraint itself) so `to_recipe` doesn't recurse
+# forever. `to_recipe` runs ONLY in the SYNCHRONOUS crash-restart snapshot loop (repl/prefix.py,
+# between cells) — never inside a `parallel()` branch or a thread — so it only needs to break
+# recursion WITHIN one single-threaded call tree; the per-id add/discard balance keeps the stack
+# empty between top-level calls. Kept as a ContextVar (not a module global) merely so it can't be a
+# process-global shared across unrelated top-level snapshots — it is NOT a parallel-branch isolation
+# guarantee (copy_context() would share the set by reference, but that case can't arise: to_recipe
+# is never run concurrently).
 _RECIPE_IN_PROGRESS: "ContextVar[Optional[set]]" = ContextVar("_recipe_in_progress", default=None)
 
 
@@ -307,11 +309,15 @@ def from_recipe(recipe: Tuple) -> Any:
         for key, mode, vfields, func in fvs:
             ns[key] = field_validator(*vfields, mode=mode)(func)
         new_cls = type(name, (Constraint,), ns)
-        # Re-bind zero-arg `super()` in any captured method to the REBUILT class. A method that
-        # uses bare `super()` carries a `__class__` free-var cell that, at capture time, pointed at
-        # the ORIGINAL (now-dead) class; left alone it raises "obj is not an instance or subtype of
-        # type" on the rebuilt instances. The cell is identified by the `__class__` free-var and
-        # (Py3.7+) is writable. Covers methods/classmethods/staticmethods + validators. (NC3-2)
+        # Re-bind any captured method's `__class__` free-var cell to the REBUILT class. A method that
+        # carries such a cell (at capture time it pointed at the ORIGINAL, now-dead class) otherwise
+        # raises "obj is not an instance or subtype of type" on the rebuilt instances. NOTE: a method
+        # that itself CALLS super() can no longer reach here — the metaclass rejects it at definition
+        # (constraint/base.py `_calls_super_builtin`, F35). What DOES still reach here are the
+        # residual `__class__`-cell cases that check intentionally allows: a method whose NESTED
+        # helper uses super(), or one that references bare `__class__`. The cell is identified by the
+        # `__class__` free-var and (Py3.7+) is writable. Covers methods/classmethods/staticmethods +
+        # validators. (NC3-2; the defensive complement to the F35 reject — see base.py.)
         for _fn in (*(_v for (_kind, _v) in extras.values()), *(f for *_h, f in mvs),
                     *(f for *_h, f in fvs)):
             _code = getattr(_fn, "__code__", None)

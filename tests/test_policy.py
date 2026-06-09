@@ -883,23 +883,30 @@ def test_nr31_respawn_result_signals_not_executed():
 
 
 def test_f4_root_loop_survives_malformed_tool_calls():
-    """F4: PLM's root loop must not CRASH on a non-conformant backend's tool_calls — it now mirrors
-    react_llm's guards (normalize shape, isinstance(tc, dict), isinstance(function, dict), reply a
-    user-turn for a non-dict tc). A shape that used to crash PLM.__call__ raw (the outer try has no
-    `except`) now re-prompts and exhausts the budget gracefully (PLMTaskFailure), no TypeError/
-    KeyError. `["junk"]` is the worst case — it hit the bare `tool_call["function"]` subscript."""
+    """F4 + PLM1: PLM's root loop must not CRASH on a non-conformant backend's tool_calls — it now
+    mirrors react_llm's guards (normalize shape, isinstance(tc, dict), isinstance(function, dict),
+    isinstance(code, str), reply a user-turn for a non-dict tc). Shapes that used to crash
+    PLM.__call__ raw (the outer try has no `except`) now re-prompt and exhaust the budget gracefully
+    (PLMTaskFailure), no TypeError/KeyError/AttributeError. `["junk"]` hit the bare
+    `tool_call["function"]` subscript (F4); a non-string `code` arg hit `_strip_code_fences` (PLM1)."""
     import asyncio
     from plm.plm import PLM, PLMMetaParameters, PLMTaskFailure
 
-    class _FakeBackend:
-        model = "fake-model"
-        async def generate(self, messages=None, tools=None, **kw):
-            return {"content": "", "tool_calls": ["junk"]}      # malformed every round
+    shapes = [
+        ["junk"],                                                            # F4: non-dict tc
+        [{"id": "1", "function": {"name": "python", "arguments": '{"code": 123}'}}],  # PLM1: non-string code
+    ]
+    for shape in shapes:
+        class _FakeBackend:
+            model = "fake-model"
+            def __init__(self, s): self._s = s
+            async def generate(self, messages=None, tools=None, **kw):
+                return {"content": "", "tool_calls": self._s}    # malformed every round
 
-    plm = PLM(model_backend=_FakeBackend(),
-              metaparams=PLMMetaParameters(system_prompt="sys"), max_turns=1, return_budget=1)
-    with pytest.raises(PLMTaskFailure):                          # graceful budget-exhaust, NOT a crash
-        asyncio.run(plm([{"role": "user", "content": "go"}]))
+        plm = PLM(model_backend=_FakeBackend(shape),
+                  metaparams=PLMMetaParameters(system_prompt="sys"), max_turns=1, return_budget=1)
+        with pytest.raises(PLMTaskFailure):                      # graceful budget-exhaust, NOT a crash
+            asyncio.run(plm([{"role": "user", "content": "go"}]))
 
 
 def test_int_generator_policies_survive_crash_restart():
@@ -1624,6 +1631,10 @@ def test_int_sealed_class_extra_resists_flag_flip():
         assert r["stdout"].strip() == "True"                                               # remove blocked
         r2 = s.execute_cell("duplicate_policy('Locked','Fork'); print('Fork' in list_policies())")
         assert r2["stdout"].strip() == "False"                                             # duplicate blocked
+        # R4: RE-DECORATION (@policy on the same name, the kind-change path) is also blocked even with
+        # the flag flipped — the decorator pre-check now uses _is_default (the _is_sealed_obj anchor).
+        s.execute_cell("@policy\nclass Locked:\n    def __call__(self, x):\n        return 777\n")
+        assert s.execute_cell("print(Locked()(5))")["stdout"].strip() == "10"              # re-decoration ignored
         # no false positive: a NORMAL class policy is still mutable
         s.execute_cell("@policy\nclass Free:\n    def __call__(self, x):\n        return x + 1")
         s.execute_cell("Free._rewrite('class Free:\\n    def __call__(self, x):\\n        return x + 100\\n')")

@@ -400,6 +400,19 @@ class PLM:
                     continue
 
                 raw_code = targs.get("code", "")
+                if not isinstance(raw_code, str):
+                    # non-string `code` (null/number/object): clear error + retry, NOT a raw
+                    # AttributeError from `_strip_code_fences`
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id") or "",
+                        "content": _parallel_note + "error: `code` must be a string of Python source",
+                    })
+                    metrics["tool_calls"].append({
+                        "tool_name": tname, "tool_status": "code_arg_invalid",
+                        "tool_result": "error: `code` must be a string of Python source",
+                    })
+                    continue
                 try:
                     code = _strip_code_fences(raw_code)
                 except SyntaxError as e:
