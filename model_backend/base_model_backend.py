@@ -101,7 +101,8 @@ class BaseModelBackend(ModelBackend):
             # keep role + content even if None (content: None is valid on a tool-call-only
             # assistant turn).
             out.append({k: v for k, v in msg.items()
-                        if k in allowed and (v is not None or k in ("role", "content"))})
+                        if k in allowed and (v is not None or k in ("role", "content")
+                                             or (role == "tool" and k == "tool_call_id"))})  # NB3-7
         return out
 
     # -------------------------------------------------------------------------
@@ -195,7 +196,7 @@ class BaseModelBackend(ModelBackend):
                     if not isinstance(tc, dict):          # defense: drop a malformed (non-dict)
                         continue                          # tool_call instead of crashing on .copy()
                     tc_copy = tc.copy()
-                    if tc_copy.get("function") and tc_copy["function"].get("name"):
+                    if isinstance(tc_copy.get("function"), dict) and tc_copy["function"].get("name"):  # NB3-2
                         original_name = tc_copy["function"]["name"]
                         sanitized_name = self._sanitize_tool_name(original_name)
                         if sanitized_name not in tool_name_mapping:
@@ -203,7 +204,9 @@ class BaseModelBackend(ModelBackend):
                         tc_copy["function"] = tc_copy["function"].copy()
                         tc_copy["function"]["name"] = sanitized_name
                     sanitized_tool_calls.append(tc_copy)
-                msg_copy["tool_calls"] = sanitized_tool_calls
+                # `or None`: if every tool_call was malformed and dropped, an EMPTY array is rejected
+                # by Chat-Completions ("tool_calls must be non-empty"); None omits the key. (NB3-1)
+                msg_copy["tool_calls"] = sanitized_tool_calls or None
             sanitized_messages.append(msg_copy)
         return sanitized_messages
 

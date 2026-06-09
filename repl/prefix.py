@@ -142,6 +142,7 @@ def _repl_collect_vars():
     _blocked = _repl_ks.INJECTED or _REPL_INJECTED or _builtins.set()
     _snap = {}
     _constraint_recipes = {}
+    _constraint_dropped = []                                  # names dropped at snapshot time
     for _k, _v in _builtins.list(_builtins.globals().items()):
         if _k in _blocked or _k.startswith(("__", "_repl", "_REPL")):
             continue
@@ -157,12 +158,19 @@ def _repl_collect_vars():
                 _rec = _repl_constraint_to_recipe(_v)
             except Exception:
                 _rec = None
+            _ok = False
             if _rec is not None:
                 try:
                     _dill.dumps(_rec)                      # the recipe itself must pickle
                     _constraint_recipes[_k] = _rec
+                    _ok = True
                 except Exception:
                     pass                                    # unpicklable recipe -> drop
+            if not _ok:
+                # to_recipe returned None/raised, OR the recipe didn't pickle: the constraint is
+                # dropped from the snapshot. Record the NAME so the post-restart rehydrate can SAY
+                # so (else a downstream cell hits a surprise NameError with no cause). (NR3-8)
+                _constraint_dropped.append(_k)
             continue
         try:
             _probe = _dill.dumps(_v)
@@ -199,6 +207,8 @@ def _repl_collect_vars():
         _snap["_PLM_POLICY_SOURCES"] = _pol_sources
     if _constraint_recipes:
         _snap["_CONSTRAINT_RECIPES"] = _constraint_recipes
+    if _constraint_dropped:
+        _snap["_CONSTRAINT_DROPPED"] = _constraint_dropped     # surfaced by the rehydrate note
     try:
         return _dill.dumps(_snap)
     except Exception:
@@ -248,9 +258,12 @@ _REPL_INJECTED = {
 # constraint surface, ...) AND module aliases (`_dill`/`_sys`/`_traceback`/`_io`/...),
 # captured ONCE post-freeze. The KERNEL_LOOP's post-cell guard restores any a cell rebinds
 # or deletes — so a granted helper can't be clobbered for the next cell (the same
-# protection immutable policies get via _post_cell_guard), AND a cell rebinding a module
-# the snapshot / frame-I/O helpers read as bare globals can't silently break them;
-# modules are immutable, so restoring them is safe). EXCLUDES reseeded state like
+# protection immutable policies get via _post_cell_guard), AND a cell REBINDING a module the
+# snapshot / frame-I/O helpers read as bare globals (`_dill = None`) is restored by reference.
+# NOTE restoring BY REFERENCE undoes a rebind but NOT an attr MUTATION (`_dill.dumps =
+# ...`) — that residual path degrades gracefully (the snapshot's own try/except drops to "no
+# snapshot this round", never corrupting state); a full fix captures the bound methods at boot.
+# EXCLUDES reseeded state like
 # `plm_messages` (a per-round list) and in-place registries (`_PLM_POLICIES`/`REGISTRY` —
 # non-callable, non-module), since restoring those to a boot value would wipe live state.
 # `_REPL`-prefixed -> not snapshotted, re-derived (fresh) each boot.
@@ -346,15 +359,25 @@ if not isinstance(_repl_sealed_extras, dict):
     _repl_sealed_extras = {}
 _repl_sealed_extra_names = []
 for _repl_pn, _repl_ps in _repl_sealed_extras.items():
-    if _repl_pn in _repl_llm_defaults:                  # can't shadow a sealed DEFAULT
-        _repl_stderr_buf.write("[boot] sealed extra " + repr(_repl_pn) + " collides with a sealed "
-                               "default name; ignored. Rename it.\n")
-        continue
+    # Seal the names ACTUALLY REGISTERED by the install, not the dict key: the key is just the
+    # source's transport label (from_dir uses the FILE STEM, which need not equal the policy's
+    # `def`/`class` name). Sealing the install DELTA anchors the seal to reality — so a file named
+    # `auth.py` defining `def authenticate(...)` correctly seals `authenticate` (not the phantom
+    # `auth`), a non-@policy source seals nothing (delta empty), and a source shadowing a sealed
+    # default registers no new name (the rewrite gate refuses it) so it's a no-op here too.
+    _repl_before_names = _builtins.set(_PLM_POLICIES)
     try:
         _repl_install(_repl_ps, "<policy-bootstrap-" + _repl_pn + ">")
-        _repl_sealed_extra_names.append(_repl_pn)
     except BaseException:
         _traceback.print_exc()                  # a sealed extra must NOT brick boot either
+        continue
+    _repl_new_names = [_repl_nn for _repl_nn in _builtins.list(_PLM_POLICIES)
+                       if _repl_nn not in _repl_before_names]
+    if not _repl_new_names:
+        _repl_stderr_buf.write("[boot] sealed extra " + repr(_repl_pn) + " registered no NEW policy "
+                               "(not @policy-decorated, or its name collides with an existing "
+                               "policy); nothing sealed for it.\n")
+    _repl_sealed_extra_names.extend(_repl_new_names)
 
 # Seal the LLM-loop defaults (_LLM_DEFAULT_POLICIES — natural_llm / react_llm /
 # react_llm_verifier) AND the user sealed extras: `_seal` sets the intrinsic

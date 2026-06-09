@@ -47,9 +47,10 @@ def _reserved_name_reason(name: str) -> str | None:
         return f"{name!r} is not a string name"           # guard BEFORE .isidentifier()
     if not name.isidentifier():                           # e.g. lambdas -> '<lambda>'
         return f"{name!r} is not a valid identifier (needs a named def/class)"
-    import keyword                                         # 'class'/'if'/'match'... ARE identifiers but
-    if keyword.iskeyword(name) or keyword.issoftkeyword(name):   # re-exec'ing them as a `def NAME` is a
-        return f"{name!r} is a Python keyword"             # SyntaxError -> refuse gently here, not deep in install
+    import keyword                                         # HARD keywords ('class'/'if'/...) ARE identifiers
+    if keyword.iskeyword(name):                            # but `def NAME` on one is a SyntaxError -> refuse
+        return f"{name!r} is a Python keyword"             # gently here. SOFT keywords (match/case/type/_) are
+                                                           # VALID def/class names, so they are NOT rejected (NP3-6).
     if name in _RESERVED:
         return f"{name!r} is a reserved kernel name"
     # Kernel-internal prefixes are filtered by the snapshot collector, so such a
@@ -228,9 +229,21 @@ def _reject_async(obj):
         return None
     if inspect.isfunction(obj):
         offenders = [(obj.__name__, _async_kind(obj))] if _async_kind(obj) else []
-    else:                                                  # a @policy CLASS -> check its methods
-        offenders = [(fn.__name__, k) for v in vars(obj).values()
-                     for fn in _iter_funcs(v) if (k := _async_kind(fn))]
+    else:                                                  # a @policy CLASS -> check its RESOLVED methods
+        # Walk the whole MRO, not just the class's own __dict__, so an async method INHERITED from a
+        # base (e.g. a subclass that doesn't override an async `__call__`) is still refused — else it
+        # runs an un-awaited coroutine outside the depth model. Take the FIRST occurrence of each name
+        # (normal MRO resolution) so a sync OVERRIDE of an inherited async method reads as sync — no
+        # false positive. (NP3-5)
+        _seen, offenders = set(), []
+        for _klass in getattr(obj, "__mro__", (obj,)):
+            for _aname, v in vars(_klass).items():
+                if _aname in _seen:
+                    continue
+                _seen.add(_aname)
+                for fn in _iter_funcs(v):
+                    if (k := _async_kind(fn)):
+                        offenders.append((fn.__name__, k))
     if offenders:
         _detail = ", ".join(f"{n} ({k})" for n, k in offenders)
         raise TypeError(

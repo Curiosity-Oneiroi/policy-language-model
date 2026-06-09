@@ -86,6 +86,10 @@ def _compute_child_pythonpath(inherited: str = "") -> str:
         paths = list(getattr(plm, "__path__", []) or [])
         if paths:
             raw.append(str(Path(paths[0]).parent))  # the dir that makes `import plm` work
+        else:                                        # empty __path__ -> nothing prepended; warn
+            import warnings                          # rather than silently leave the child unable to
+            warnings.warn("plm.__path__ was empty — the child may fail `import plm`; "   # `import plm`
+                          "relying on the inherited PYTHONPATH.", stacklevel=2)
     except (ImportError, AttributeError, IndexError, OSError) as e:
         # Don't SILENTLY drop the path on an unrelated error — the child would later fail
         # `import plm` with no hint. Narrow the catch + warn, then rely on `inherited`.
@@ -282,6 +286,17 @@ class PythonReplSession:
 
     # ---- public API -------------------------------------------------------
 
+    @staticmethod
+    def _respawn_result(pre: str, note: str) -> dict[str, Any]:
+        """The SINGLE envelope returned after a kill+respawn. The cell did NOT complete normally, so
+        it ALWAYS carries `executed: False` (structured signal a caller can branch on) plus a clear
+        RE-RUN note in stderr. One builder => the several respawn paths in `execute_cell` can't drift
+        in shape or in whether they set the flag, the way they had."""
+        return {
+            "type": "result", "return_obj": None, "executed": False,
+            "stdout": "", "stderr": pre + note,
+        }
+
     def execute_cell(
         self,
         code: str,
@@ -339,11 +354,9 @@ class PythonReplSession:
                     # could even decode wrong. Don't retry on this socket; respawn
                     # directly (prior state is preserved via the cached snapshot).
                     self._kill_and_respawn()
-                    return {
-                        "type": "result", "return_obj": None,
-                        "stdout": "",
-                        "stderr": _pre + f"[child timed out after {self._cell_timeout}s; prior state preserved]\n",
-                    }
+                    return self._respawn_result(
+                        _pre, f"[child timed out after {self._cell_timeout}s; restarted with prior "
+                              f"state preserved — this cell may have only partially executed. RE-RUN it.]\n")
                 # Clean frame boundary (nothing of the next frame consumed yet):
                 # try a graceful SIGINT so the SESSION can survive — the kernel
                 # catches it and writes a clean interrupted-result frame, which we
@@ -355,28 +368,21 @@ class PythonReplSession:
                     envelope = self._read_frame_with_timeout(self._sigint_grace)
                 except (_CellTimeout, _FrameDecodeError, EOFError, BrokenPipeError, struct.error):
                     self._kill_and_respawn()
-                    return {
-                        "type": "result", "return_obj": None,
-                        "stdout": "",
-                        "stderr": _pre + f"[child timed out after {self._cell_timeout}s; prior state preserved]\n",
-                    }
+                    return self._respawn_result(
+                        _pre, f"[child timed out after {self._cell_timeout}s; restarted with prior "
+                              f"state preserved — this cell may have only partially executed. RE-RUN it.]\n")
             except (_FrameDecodeError, EOFError, BrokenPipeError, struct.error):
                 self._kill_and_respawn()
-                return {
-                    "type": "result", "return_obj": None, "executed": False,   # caller can detect a non-run
-                    "stdout": "",
-                    "stderr": _pre + "[the kernel exited/desynced before returning a result, so "
-                                     "this cell may NOT have executed (or only partially) — it was "
-                                     "restarted with prior state preserved. RE-RUN this cell.]\n",
-                }
+                return self._respawn_result(
+                    _pre, "[the kernel exited/desynced before returning a result, so this cell may "
+                          "NOT have executed (or only partially) — it was restarted with prior state "
+                          "preserved. RE-RUN this cell.]\n")
 
             if envelope.get("type") == "boot_error":
                 self._kill_and_respawn()
-                return {
-                    "type": "result", "return_obj": None,
-                    "stdout": "",
-                    "stderr": _pre + f"[kernel boot_error]\n{envelope.get('traceback', '')}",
-                }
+                return self._respawn_result(
+                    _pre, f"[kernel boot_error — this cell did NOT execute; the kernel was restarted "
+                          f"with prior state preserved. RE-RUN this cell.]\n{envelope.get('traceback', '')}")
 
         etype = envelope.get("type") or "result"
         # Cache the vars snapshot for crash-restart rehydrate. Never surfaced. Keep the
@@ -418,6 +424,14 @@ class PythonReplSession:
         # flag (set first, so the kill-that-wakes-it happens-after) makes that respawn a no-op
         # instead of resurrecting this torn-down session.
         self._closed = True
+
+        # if a spawn is in flight, shut its listener so a blocked `accept()` wakes IMMEDIATELY
+        # (it then sees `_closed` and aborts) instead of spinning the full 30s connect timeout — the
+        # killpg below kills the not-yet-connected kernel but does NOT unblock the accept on its own.
+        _listener = getattr(self, "_listener", None)
+        if _listener is not None:
+            with suppress(OSError):
+                _listener.close()
 
         # Teardown must be SERIALIZED with the worker (it holds _io_lock for a whole cell), so
         # we never touch shared state (_proc / pipes / pid box) concurrently. A
@@ -487,10 +501,15 @@ class PythonReplSession:
                 start_new_session=True,                           # own session/pgrp: killable as a group, terminal Ctrl-C doesn't hit it
             )
 
+            self._listener = listener         # expose so close() can shut it to UNBLOCK accept
             listener.settimeout(30.0)
             try:
                 client_sock, _ = listener.accept()
-            except socket.timeout:
+            except OSError:                       # socket.timeout IS an OSError subclass; an OSError
+                # here can ALSO be close() shutting the listener to unblock us — in that case don't
+                # spin the full 30s and don't report a spurious connect-timeout.
+                if getattr(self, "_closed", False):
+                    raise RuntimeError("PLM kernel spawn aborted: session is closing") from None
                 self._kill_silently()
                 stderr_cap.seek(0)
                 _err = stderr_cap.read().decode("utf-8", "replace").strip()
@@ -502,6 +521,7 @@ class PythonReplSession:
                        " The kernel produced no stderr before the handshake.")
                 )
         finally:
+            self._listener = None
             listener.close()
             stderr_cap.close()
             with suppress(FileNotFoundError, OSError):

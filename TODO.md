@@ -177,11 +177,13 @@ side-effect-free). Comment lives in `policy/decorator.py`.
 
 ## P-F3 / P-F5 — policy-core micro-gaps (latent / undetectable)
 
-**P-F3 (latent):** a class policy's immutability is bypassable via `cls._p_immutable =
-False` (class policies have no `__setattr__` guard like function-policy proxies do). v1
-ships NO immutable *class* default, so the gate has nothing to protect yet. **If picked
-up:** protect via a metaclass once sealed, or gate the class mutators on BOTH
-`cls._p_immutable` AND `cls.__name__ in _IMMUTABLE_POLICIES`.
+**P-F3 (RESOLVED by NP3-1):** a class policy's immutability used to be bypassable via
+`cls._p_immutable = False` (class policies are raw types with no `__setattr__` guard like the
+function-policy proxy has). This became reachable once metaparams shipped sealed CLASS extras.
+FIXED: the seal mutation gates AND `registry._is_default` now anchor to the canonical seal record
+by OBJECT IDENTITY (`registry._is_sealed_obj`, membership of `_SEALED_POLICIES`), so flipping the
+writable flag — or renaming `__name__` — can't un-seal, for BOTH function and class policies. The
+per-object flag is now a fast-path cache, not the authority; no metaclass needed.
 
 **P-F5 (undetectable at decorate time):** `@policy` doesn't note when it shadows a
 pre-existing non-policy global of the same name — but the `def`/`class` statement overwrites
@@ -192,3 +194,66 @@ up:** detect at the cell-audit level (pre-exec), not in the decorator.
 cleaned up by `_sync` is the registry being correctly STRICT — @policy/_install_policy_source
 are the only install surfaces (they bind both the registry and __main__). Documented in the
 `_sync` docstring; nothing to fix. -->
+
+## DOC-NC3-3 — document that constraints do NOT coerce
+
+**What to document (README + Constraint docstrings):** `is_instance_of` — and the constraint
+type checks generally — are a STRICT `isinstance` check with **NO coercion**. A value must
+already be the exact type: `is_instance_of=float` rejects an `int` (no `5`→`5.0`),
+`is_instance_of=<Model>` rejects a `dict` (no build-from-dict), `is_instance_of=int` rejects a
+`bool`, and a subclass instance is returned UNCHANGED (never flattened to its base). Callers must
+not expect pydantic-style coercion — pass the value already in the target type.
+
+**Why a TODO (not code):** the behavior is correct + tested as of NC3-3 (`_strict_base` uses
+`pydantic_core.is_instance_schema`); only the user-facing docs need the explicit "no coercion"
+statement so the contract is discoverable without reading `constraint/base.py`.
+
+## DOC-NR3-1 — document the cell-crash contract: RE-RUN, don't trust crash survivors
+
+**What to document (README + kernel/REPL contract):** if a REPL cell crashes or times out
+mid-run, the kernel is respawned from the LAST SNAPSHOT (taken at the end of the previous
+*successful* cell), and the result carries `executed: False` + a "RE-RUN this cell" note. The
+contract for PLM/the model is: **re-run the cell.** Do NOT reason about "what state the crashed
+cell left behind" — the in-flight cell's partial effects are gone; only the pre-crash snapshot
+survives. State is always restored to the last clean boundary, never a partial mid-cell state.
+
+**Why a TODO (not code):** the behavior is implemented + tested as of NR3-1 (`_respawn_result`
+sets `executed: False` on every respawn path with a RE-RUN note); only the docs need to spell out
+the re-run contract so PLM doesn't try to inspect crash survivors or expect partial state.
+
+## LIMIT-NC3-2 — RESOLVED: super() in a constraint is rejected at definition
+
+**Resolution (chosen over making it dill-survivable):** a `super()`-using method on a Constraint is
+now REJECTED at class definition with a clear error — `_ConstraintMeta.__init__` scans the class's
+own methods and refuses any that carry a bare-`super()` `__class__` free-var. A Constraint is a FLAT
+structural validator (fields + @field/@model_validator + predicates), NOT an OOP inheritance
+hierarchy; `super()` implies inheriting + delegating to a parent constraint, which the model doesn't
+support (and which couldn't survive crash-restart anyway — the method's `__class__` cell can't
+dill-pickle). So the crash-restart-drop case is now UNREACHABLE: you can't define such a constraint.
+
+**Notes:** the scan runs in `__init__` (NOT `__new__`) — pydantic resolves forward refs by walking
+frames in its metaclass `__new__`, so an extra `__new__` would break nested/forward-ref constraints;
+`__init__` runs after that. It gates on `FunctionType` before touching `.__code__`, so a pathological
+class member (raising `__getattr__`) can't break definition (NC-8). Field-only INHERITANCE
+(`class B(A)` with no super() methods) is NOT rejected — pydantic flattens inherited fields into
+`model_fields`, which the recipe already handles. The NC3-2 `from_recipe` cell-rebind is kept as a
+cheap defensive backstop for a method monkey-patched onto a class AFTER definition (bypasses the
+metaclass), but the primary guarantee is now the definition-time reject.
+
+## LIMIT-NR3-5 — Guard C+ restores modules by reference (attr-mutation not undone)
+
+**What:** `_REPL_INJECTED_CANON` (repl/prefix.py) restores kernel-internal modules a cell may have
+REBOUND (`_dill = None`) — by reference. That undoes a rebind but NOT an attr MUTATION
+(`_dill.dumps = lambda: b""`): the module object is identity-unchanged, so the poisoned attr
+persists into the next cell's snapshot/frame-I/O.
+
+**Why deferred (LOW, graceful):** the snapshot/frame-I/O paths are wrapped in try/except and degrade
+to "no snapshot this round" rather than corrupting state, and the trust model is cell-trust ==
+parent-trust (see D6/S-F6), so a cell deliberately poisoning a module attr is within the accepted
+boundary. A full fix is broad: capture the bound methods kernel internals actually use
+(`_dill_dumps = dill.dumps`, ...) at boot and call THOSE, so a later `module.attr =` can't reach
+them. Deferred as disproportionate to a LOW by-inspection gap; the comment at the CANON now states
+the real behavior.
+
+**If picked up:** boot-capture the kernel-internal module methods (dill/pickle/struct/io/linecache)
+as `_repl_`-prefixed bound references and use them throughout the snapshot + frame-I/O helpers.

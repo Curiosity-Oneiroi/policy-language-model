@@ -190,3 +190,22 @@ def test_sanitize_history_drops_nondict_tool_call():
              "tool_calls": ["BAD", 42, {"id": "1", "function": {"name": "f"}}]}]
     out = be._sanitize_message_history(msgs, {})                        # must not raise
     assert [type(tc).__name__ for tc in out[0]["tool_calls"]] == ["dict"]   # non-dicts dropped, dict kept
+
+
+def test_nb3_low_sanitizer_and_classifier_edges():
+    """NB3-1/2/3/7 (round-3 LOW): history-sanitizer + classifier hardening.
+      NB3-1 ALL-malformed tool_calls -> None (an empty [] is rejected by Chat-Completions);
+      NB3-2 a dict tool_call with a non-dict `function` doesn't crash the sanitizer;
+      NB3-7 a `tool` message keeps tool_call_id even when None (required field, not a droppable opt);
+      NB3-3 a fine-tune id `ft:<base>:...` classifies by its BASE model."""
+    mod = importlib.import_module("plm.model_backend.openai_backend")
+    be = mod.OpenAIBackend(model="m", api_key="x")
+    assert be._sanitize_message_history(                                    # NB3-1
+        [{"role": "assistant", "content": "", "tool_calls": ["x", 5]}], {})[0]["tool_calls"] is None
+    assert be._sanitize_message_history(                                    # NB3-2 (no crash)
+        [{"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": "oops"}]}], {}
+    )[0]["tool_calls"][0]["id"] == "1"
+    assert "tool_call_id" in be._sanitize_messages_for_api(                 # NB3-7
+        [{"role": "tool", "tool_call_id": None, "content": "r"}])[0]
+    assert mod._is_reasoning_model_name("ft:o3-mini:org::abc") is True      # NB3-3
+    assert mod._is_reasoning_model_name("ft:gpt-4o:org::abc") is False

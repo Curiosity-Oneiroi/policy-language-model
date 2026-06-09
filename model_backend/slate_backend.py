@@ -471,6 +471,8 @@ class SlateBackend(BaseModelBackend):
                         payload = json.loads("\n".join(data_lines))
                     except json.JSONDecodeError:
                         return
+                    if not isinstance(payload, dict):   # NB3-5: a non-object data line (`data: 0`, a JSON
+                        return                          # array/number) has no .get() — skip, don't crash _flush
                     if event in ("text", "message"):   # "message" = SSE default (no `event:` line) -> content
                         chunk = payload.get("chunk")
                         if chunk:
@@ -501,12 +503,12 @@ class SlateBackend(BaseModelBackend):
                         # despite the system message, and any 2nd+ tool call after
                         # we've already accepted one.
                         if wants_python:
-                            if tool_calls_out:
-                                # already accepted a tool call this turn — drop
-                                return
                             if tname not in ("terminal", ""):
                                 # non-terminal native tool — not connected here, drop
                                 return
+                            # NB3-6: do NOT drop a 2nd+ terminal call here — let every terminal call
+                            # flow so PLM's root loop sees >1 tool_calls, trims to the first, AND
+                            # emits the parallel-tool-call nudge (single source of truth, plm.py).
 
                         # Slate's worker enforces its native tool registry, so
                         # PLM's `python` calls come back as `terminal(operation=

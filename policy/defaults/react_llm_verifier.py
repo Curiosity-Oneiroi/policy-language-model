@@ -474,11 +474,14 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                 # --- model emitted a tool call: verify it's `python`, then parse/exec/RETURN ---
                 tc = tool_calls[0]
                 if not isinstance(tc, dict):
-                    # Malformed tool_call entry (str/int/None): clear error (no id to echo),
-                    # then fall through to the verifier hook (this round is non-terminal).
-                    msgs.append({"role": "tool", "tool_call_id": "",
-                                 "content": f"error: malformed tool_call ({type(tc).__name__}); "
-                                            f"emit a single `python` call"})
+                    # Malformed tool_call (str/int/None): the assistant turn stored tool_calls=None
+                    # for it (M4), so there is NO tool_call to answer — a `tool` reply would be a
+                    # wire-format ORPHAN (tool message with no matching tool_call) and the NEXT
+                    # request 400s. Send the error as a USER turn instead, then fall through to the
+                    # verifier hook (this round is non-terminal).
+                    msgs.append({"role": "user",
+                                 "content": f"[error] malformed tool_call ({type(tc).__name__}); "
+                                            f"emit a single `python` tool call"})
                 else:
                     _fn = tc.get("function")
                     _fn = _fn if isinstance(_fn, dict) else {}   # `function: null` / malformed -> {}

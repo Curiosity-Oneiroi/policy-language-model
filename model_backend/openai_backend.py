@@ -15,8 +15,14 @@ _UNSUPPORTED_REASONING_PARAMS = {"temperature", "top_p", "presence_penalty", "fr
 
 def _normalize_model_name(model: Optional[str]) -> str:
     """Strip a `provider/` routing prefix (LiteLLM/OpenRouter/Azure: `openai/o3-mini`,
-    `azure/gpt-5`) and lowercase, so reasoning-model detection is robust to casing + prefixes."""
-    return (model or "").split("/")[-1].lower()
+    `azure/gpt-5`) and lowercase, so reasoning-model detection is robust to casing + prefixes.
+    Also unwrap an OpenAI fine-tune id `ft:<base-model>:<org>::<id>` to its BASE model, so a
+    fine-tune of a reasoning model is still classified as reasoning (NB3-3)."""
+    m = (model or "").split("/")[-1].lower()
+    if m.startswith("ft:"):
+        parts = m.split(":")
+        m = parts[1] if len(parts) > 1 else m
+    return m
 
 
 def _is_reasoning_model_name(model: Optional[str]) -> bool:

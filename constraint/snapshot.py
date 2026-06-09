@@ -152,10 +152,32 @@ def _spec_to_value(s: Any) -> Any:
     return s
 
 
+_RECIPE_IN_PROGRESS: set = set()    # ids of constraint classes whose recipe is mid-build (cycle guard)
+
+
 def to_recipe(c: Any) -> Optional[Tuple]:
     """A picklable recipe that `from_recipe` rebuilds into the same constraint, or None for
     a non-constraint (left alone) / a constraint we can't recipe (the caller then drops it
-    rather than keep an un-loadable value)."""
+    rather than keep an un-loadable value).
+
+    Cycle-guarded: a self-/mutually-recursive structural Constraint (a field annotation pointing
+    back at the class) would otherwise recurse `_ann_to_spec -> to_recipe -> ...` forever and blow
+    the stack. When a class is reached again while its OWN recipe is still building, we return None
+    (a cyclic constraint can't flatten to a finite recipe) — the field then keeps its live
+    annotation, so the dumps-probe drops the whole (unpicklable) recipe cleanly. (NC3-1)"""
+    if not isinstance(c, type):
+        return None
+    if id(c) in _RECIPE_IN_PROGRESS:
+        return None
+    _RECIPE_IN_PROGRESS.add(id(c))
+    try:
+        return _to_recipe_build(c)
+    finally:
+        _RECIPE_IN_PROGRESS.discard(id(c))
+
+
+def _to_recipe_build(c: Any) -> Optional[Tuple]:
+    """Recipe body — always reached through the cycle-guarded public `to_recipe`."""
     if not isinstance(c, type):
         return None
     if getattr(c, "_constraint_is_composite", False):
@@ -270,5 +292,20 @@ def from_recipe(recipe: Tuple) -> Any:
             ns[key] = model_validator(mode=mode)(func)
         for key, mode, vfields, func in fvs:
             ns[key] = field_validator(*vfields, mode=mode)(func)
-        return type(name, (Constraint,), ns)
+        new_cls = type(name, (Constraint,), ns)
+        # Re-bind zero-arg `super()` in any captured method to the REBUILT class. A method that
+        # uses bare `super()` carries a `__class__` free-var cell that, at capture time, pointed at
+        # the ORIGINAL (now-dead) class; left alone it raises "obj is not an instance or subtype of
+        # type" on the rebuilt instances. The cell is identified by the `__class__` free-var and
+        # (Py3.7+) is writable. Covers methods/classmethods/staticmethods + validators. (NC3-2)
+        for _fn in (*(_v for (_kind, _v) in extras.values()), *(f for *_h, f in mvs),
+                    *(f for *_h, f in fvs)):
+            _code = getattr(_fn, "__code__", None)
+            _closure = getattr(_fn, "__closure__", None)
+            if _code is not None and _closure and "__class__" in _code.co_freevars:
+                try:
+                    _closure[_code.co_freevars.index("__class__")].cell_contents = new_cls
+                except Exception:
+                    pass
+        return new_cls
     raise ValueError(f"unknown constraint recipe kind {recipe[0]!r}")

@@ -60,6 +60,7 @@ from .edits import (
 )
 from .registry import (
     _PLM_POLICIES,
+    _is_sealed_obj,
     _main,
 )
 
@@ -127,7 +128,13 @@ def _depth_tracked_gen(name, gen):
     It is a TRANSPARENT delegator: the FULL generator protocol — `next()`/`send()`/`throw()`/
     `close()` — is forwarded to `gen`, and `gen`'s `return` value (StopIteration.value) is
     preserved, so a generator policy behaves EXACTLY like its undecorated generator, only
-    depth-counted."""
+    depth-counted.
+
+    ONE inherent edge: an EXPLICIT `throw(GeneratorExit)` is treated as `close()`. At the
+    delegation `yield` a thrown GeneratorExit is INDISTINGUISHABLE from a real `close()`, and
+    forwarding-then-yielding would violate close() semantics (Python raises "generator ignored
+    GeneratorExit"). This is vanishingly rare — GeneratorExit is the close mechanism, not a value
+    callers throw — and matches how `yield from` behaves in practice."""
     to_send, to_throw = None, None
     while True:
         with _policy_call(name):
@@ -232,7 +239,7 @@ class _FunctionPolicy:
         # Guard A (pre-reject) and Guard C (restore canonical), and the registry
         # store refuses to pop a default — this catches the explicit
         # `proxy._remove()` call too.
-        if getattr(self, "_p_immutable", False):
+        if getattr(self, "_p_immutable", False) or _is_sealed_obj(self):
             _policy_note(
                 f"{self._p_name!r} is immutable; cannot remove. "
                 f"It is part of the LLM-default base."
@@ -254,7 +261,7 @@ class _FunctionPolicy:
         # `_edit`/`_insert`/`_delete_lines` (they funnel through `_rewrite`)
         # and `@policy` re-decoration of a default (the decorator's
         # same-kind path calls `_rewrite` on the existing proxy).
-        if getattr(self, "_p_immutable", False):
+        if getattr(self, "_p_immutable", False) or _is_sealed_obj(self):
             _policy_note(
                 f"{self._p_name!r} is immutable; source unchanged. "
                 f"Use `duplicate_policy({self._p_name!r}, '<new_name>')` "
@@ -301,9 +308,14 @@ class _FunctionPolicy:
         new_obj = ns[new_name]
         # The repl is SYNCHRONOUS: refuse an async rewrite too (not just at @policy decoration),
         # so EDIT/INSERT/DELETE — which all funnel here — can't sneak a coroutine past the
-        # depth/budget model. Raises BEFORE the swap, so the old (sync) policy is kept intact.
+        # depth/budget model. SOFT-refuse (note + return, like every other rewrite rejection above),
+        # before the swap, so the old (sync) policy is kept intact.
         from .decorator import _reject_async        # lazy: proxy <- decorator import cycle
-        _reject_async(new_obj)
+        try:
+            _reject_async(new_obj)
+        except TypeError as _ae:
+            _policy_note(f"{self._p_name}._rewrite: {_ae}; source unchanged")
+            return
         old_name, old_filename = self._p_name, self._p_filename
         self._inner, self._p_source = new_obj, new_source
         self._p_version += 1
@@ -435,7 +447,7 @@ def _class_remove(cls):
     # Immutability check: refuse to remove an immutable class policy. v1 has
     # no immutable class default, but v1.5 may; keep the gate here so adding
     # one later doesn't require touching this method.
-    if getattr(cls, "_p_immutable", False):
+    if getattr(cls, "_p_immutable", False) or _is_sealed_obj(cls):
         _policy_note(
             f"{cls.__name__!r} is immutable; cannot remove. "
             f"It is part of the LLM-default base."
@@ -457,7 +469,7 @@ def _class_duplicate(cls, new_name):
 
 def _rewrite_class_policy(cls, new_source):
     # Immutability gate: refuse to rewrite a DEFAULT class policy.
-    if getattr(cls, "_p_immutable", False):
+    if getattr(cls, "_p_immutable", False) or _is_sealed_obj(cls):
         _policy_note(
             f"{cls.__name__!r} is immutable; source unchanged. "
             f"Use `duplicate_policy({cls.__name__!r}, '<new_name>')` "
@@ -498,9 +510,14 @@ def _rewrite_class_policy(cls, new_source):
         return
     new_cls = ns[new_name]
     # Refuse a rewrite that introduces an async method (e.g. an async __call__) — same sync
-    # contract as @policy decoration; raises before any swap, leaving the old class intact.
+    # contract as @policy decoration. SOFT-refuse (note + return, like the rejections above), before
+    # any swap, leaving the old class intact.
     from .decorator import _reject_async        # lazy: proxy <- decorator import cycle
-    _reject_async(new_cls)
+    try:
+        _reject_async(new_cls)
+    except TypeError as _ae:
+        _policy_note(f"{cls.__name__}._rewrite: {_ae}; source unchanged")
+        return
 
     # Structural checks FIRST (can't mutate metaclass/slots/incompatible bases in
     # place) -> fall back to remove+recreate, leaving cls.__dict__ untouched. Pass

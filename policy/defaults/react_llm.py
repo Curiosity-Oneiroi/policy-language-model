@@ -413,11 +413,13 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             # --- model emitted a tool call: verify it's `python`, parse, exec, handle RETURN ---
             tc = tool_calls[0]
             if not isinstance(tc, dict):
-                # Malformed tool_call entry (str/int/None): answer with a clear error
-                # (no id to echo) and take another round rather than crashing.
-                msgs.append({"role": "tool", "tool_call_id": "",
-                             "content": f"error: malformed tool_call ({type(tc).__name__}); "
-                                        f"emit a single `python` call"})
+                # Malformed tool_call (str/int/None): the assistant turn stored tool_calls=None for it
+                # (M4), so there is NO tool_call to answer — a `tool` reply would be a wire-format
+                # ORPHAN (a tool message with no matching tool_call) and the NEXT request 400s. Send
+                # the error as a USER turn instead; the model sees it and retries.
+                msgs.append({"role": "user",
+                             "content": f"[error] malformed tool_call ({type(tc).__name__}); "
+                                        f"emit a single `python` tool call"})
                 continue
             _fn = tc.get("function")
             _fn = _fn if isinstance(_fn, dict) else {}      # `function: null` / malformed -> {}

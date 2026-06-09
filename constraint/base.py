@@ -106,8 +106,10 @@ from typing import (
     get_origin,
 )
 
+import copy
 import pydantic as pd
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
+from pydantic_core import core_schema
 from typing_extensions import Annotated
 
 from .decorator import _DESCRIPTION_ATTR, get_description
@@ -134,6 +136,31 @@ _PydanticMeta: type = type(pd.BaseModel)
 class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
     """Metaclass enabling `Cls1 & Cls2`, `Cls1 | Cls2`, `~Cls`, `Cls1 ^ Cls2`
     at the class level."""
+
+    def __init__(cls, *args, **kwargs):
+        # Done in __init__, NOT __new__: pydantic resolves forward references by walking the call
+        # frames in its metaclass `__new__`, so an extra `__new__` here shifts that frame and breaks
+        # nested/forward-ref constraints. `__init__` runs AFTER the class is fully built, so the scan
+        # can't disturb it.
+        super().__init__(*args, **kwargs)
+        # A Constraint is a FLAT structural validator — fields + @field/@model_validator +
+        # predicates — NOT an OOP inheritance hierarchy. A method using bare `super()` implies
+        # inheriting from + delegating to a parent constraint, which is unsupported: it doesn't fit
+        # the model AND can't survive crash-restart (the method's hidden `__class__` cell can't
+        # dill-pickle). Reject it at DEFINITION with a clear message instead of failing mysteriously
+        # later. None of the library's own classes (base / field / composite) use bare super(), so
+        # this only ever fires on a misuse. (Constraint contract; supersedes the NC3-2 limitation.)
+        import types as _types
+        for _k, _v in vars(cls).items():
+            _fn = _v.__func__ if isinstance(_v, (classmethod, staticmethod)) else _v
+            # Gate on FunctionType (a pure type check) BEFORE touching `.__code__`: a pathological
+            # class member with a raising __getattr__ must NOT break constraint definition (NC-8).
+            if isinstance(_fn, _types.FunctionType) and "__class__" in _fn.__code__.co_freevars:
+                raise TypeError(
+                    f"Constraint {cls.__name__!r}: method {_k!r} uses super(), which constraints do "
+                    f"NOT support — a Constraint is a flat structural validator (fields + validators "
+                    f"+ predicates), not an inheritance hierarchy. Remove the super()/inheritance."
+                )
 
     def __and__(cls, other: type) -> type:
         from .algebra import _and
@@ -174,7 +201,13 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
 
     Subclass for structural constraints (fields + pydantic validators), or call
     `Constraint.field(...)` for a value/field rule — the single public authoring
-    entry for non-structural constraints."""
+    entry for non-structural constraints.
+
+    A Constraint is a FLAT structural validator — fields + `@field_validator` /
+    `@model_validator` + predicates. It is NOT an OOP inheritance hierarchy: a
+    method using bare `super()` (delegating to a parent constraint) is REJECTED at
+    definition. Constraints stay simple and self-contained; compose them with
+    `& | ^ ~` or nest one as another's field type instead of subclassing+super()."""
 
     model_config = pd.ConfigDict(arbitrary_types_allowed=True)
 
@@ -281,7 +314,9 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             # `kwargs`: inner captured them AFTER materializing one-shot iterables, whereas the
             # raw `kwargs` here hold ALREADY-EXHAUSTED generators (one_of/coercers/...), so a
             # raw copy would recipe an empty/garbage sequence.
-            "_constraint_factory_kwargs": dict(inner._constraint_factory_kwargs),
+            # deepcopy (not dict()): a shallow copy aliases the inner's mutable VALUES (e.g. the
+            # `one_of` list), so mutating the facade's copy would silently change inner's. (NC3-4)
+            "_constraint_factory_kwargs": copy.deepcopy(inner._constraint_factory_kwargs),
             "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
         }
         return _ConstraintMeta("_FieldConstraint", (Constraint,), ns)
@@ -774,21 +809,49 @@ def _build_factory(**kwargs: Any) -> Type[Constraint]:
     return cls  # type: ignore[return-value]
 
 
-def _strict_base(target_cls: Any) -> Any:
-    """Annotation for `is_instance_of=target_cls` that does NOT coerce.
+def _reject_bool_for_int(v):
+    # bool IS an int subclass in Python, but `is_instance_of=int` must reject it (use
+    # `is_instance_of=bool` for booleans) — preserves the documented strict-int intent.
+    if isinstance(v, bool):
+        raise ValueError("strictly an instance of int (a bool is not accepted; use is_instance_of=bool)")
+    return v
 
-    For a coercible type (int/float/str/bytes/bool, containers, std-lib types) pydantic's
-    `Strict()` turns off coercion — so `is_instance_of=int` rejects "5", 5.0 AND True (a bool is
-    not a real int). For an ARBITRARY class pydantic uses an is-instance schema that `Strict()`
-    can't annotate (and which never coerces anyway), so we fall back to the plain type — already
-    an isinstance-only check. Probing a tiny TypeAdapter is the robust way to tell the two apart
-    without enumerating every coercible std-lib type."""
-    ann = Annotated[target_cls, pd.Strict()]
+
+class _IsInstanceOf:
+    """Pydantic schema marker: validate `isinstance(v, target)` with NO coercion, returning the
+    value UNCHANGED. `pydantic_core.is_instance_schema` is the airtight primitive — unlike
+    pydantic's `Strict()` it does NOT promote int->float, build a model from a dict, or strip a
+    subclass instance to its base. The only carve-out is the int/bool distinction above."""
+    __slots__ = ("target",)
+
+    def __init__(self, target):
+        self.target = target
+
+    def __get_pydantic_core_schema__(self, source, handler):
+        base = core_schema.is_instance_schema(self.target)
+        if self.target is int:
+            return core_schema.no_info_after_validator_function(_reject_bool_for_int, base)
+        return base
+
+
+def _strict_base(target_cls: Any) -> Any:
+    """Annotation for `is_instance_of=target_cls`: a TRUE isinstance check with NO coercion.
+
+    For a plain class we use an is-instance core schema (`_IsInstanceOf`): `is_instance_of=int`
+    rejects "5", 5.0 and True; `is_instance_of=float` rejects an int (NO promotion); a pydantic
+    model rejects a dict (NO build-from-dict); and a subclass instance passes through UNCHANGED
+    (NO flatten-to-base). pydantic's `Strict()` did none of those last three reliably (NC3-3).
+
+    For a NON-class target (a typing generic like `List[int]`, a Union, ...) `isinstance` cannot
+    apply, so we keep pydantic's strict validation (no scalar coercion) as the prior fallback."""
+    if isinstance(target_cls, type):
+        return Annotated[target_cls, _IsInstanceOf(target_cls)]
     try:
-        pd.TypeAdapter(ann)              # builds the schema eagerly; raises if Strict can't apply
+        ann = Annotated[target_cls, pd.Strict()]
+        pd.TypeAdapter(ann)              # builds eagerly; raises if Strict can't apply
         return ann
     except Exception:
-        return target_cls                # is-instance schema (arbitrary class): plain == isinstance
+        return target_cls                # last-resort: plain annotation (isinstance-only)
 
 
 def _interpret_kwargs(

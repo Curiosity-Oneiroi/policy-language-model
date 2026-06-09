@@ -44,6 +44,25 @@ class PLMTaskFailure(RuntimeError):
     pass
 
 
+def _policy_def_name(source: str, where: str) -> str:
+    """A policy's NAME is intrinsic to its SOURCE — the single top-level @policy def/class name —
+    never a filename or dict key (those are only transport labels). Parse `source` and return that
+    name, raising a clear error unless it is exactly one top-level def/class."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise ValueError(f"PLMMetaParameters: {where}: source is not valid Python ({e})")
+    defs = [n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    if len(defs) != 1:
+        raise ValueError(
+            f"PLMMetaParameters: {where}: a policy is exactly ONE top-level def/class "
+            f"(found {len(defs)}); the policy name comes from that def/class, not the filename/key"
+        )
+    return defs[0].name
+
+
 @dataclass
 class PLMMetaParameters:
     system_prompt: str
@@ -51,6 +70,11 @@ class PLMMetaParameters:
     sealed_policies: dict[str, str] | None = None        # immutable + un-duplicable (sealed, NOT blessed)
 
     def __post_init__(self) -> None:
+        if not (self.system_prompt or "").strip():       # NP3-8: empty/whitespace system prompt is
+            import warnings                               # almost always a mistake (e.g. an empty
+            warnings.warn(                                # system_prompt.md) — PLM would run with NO
+                "PLMMetaParameters: system_prompt is empty/whitespace-only — PLM will run with no "
+                "system instructions; provide a non-empty system prompt.", stacklevel=2)
         for _attr in ("extra_policies", "sealed_policies"):
             _v = getattr(self, _attr)
             if _v is not None and not (
@@ -61,7 +85,26 @@ class PLMMetaParameters:
                     f"PLMMetaParameters.{_attr} must be a dict[str, str] "
                     f"(policy name -> @policy source) or None"
                 )
-        # A name in BOTH buckets is ambiguous (mutable vs sealed) — reject.
+        # Re-key both buckets by the REAL policy name (the @policy def/class name parsed from each
+        # source), NEVER the dict key / file stem the caller or from_dir supplied. A policy's name
+        # is intrinsic to its def/class; a filename or param key is only a transport label, and
+        # trusting it silently mis-registers / mis-seals (this is the API-side half of NP3-4; the
+        # kernel seals the install delta as the matching backstop). Also catches two same-name files.
+        for _attr in ("extra_policies", "sealed_policies"):
+            _bucket = getattr(self, _attr)
+            if not _bucket:
+                continue
+            _canon: dict[str, str] = {}
+            for _k, _src in _bucket.items():
+                _name = _policy_def_name(_src, f"{_attr}[{_k!r}]")
+                if _name in _canon:
+                    raise ValueError(
+                        f"PLMMetaParameters.{_attr}: two policies both define {_name!r} "
+                        f"(the name comes from the def/class, so they collide)"
+                    )
+                _canon[_name] = _src
+            setattr(self, _attr, _canon)
+        # A name in BOTH buckets is ambiguous (mutable vs sealed) — reject (REAL names now).
         if self.extra_policies and self.sealed_policies:
             _dup = sorted(set(self.extra_policies) & set(self.sealed_policies))
             if _dup:
@@ -80,10 +123,11 @@ class PLMMetaParameters:
                 sealed/  <name>.py        # immutable + un-duplicable (NOT blessed)
                 mutable/ <name>.py        # mutable + duplicable (normal)
 
-        Each `.py` is one `@policy def <name>(...)`; the file STEM is the policy name
-        (files starting with `_` are skipped as helpers). Either policies subfolder may
-        be absent. Point PLM at one such folder per call — multiple folders under a
-        common root act as a library of selectable metaparams.
+        Each `.py` is one `@policy def/class <name>(...)`; the policy NAME comes from that
+        def/class — the filename is only a label (a file `auth.py` defining `authenticate`
+        registers `authenticate`). Files starting with `_` are skipped as helpers. Either
+        policies subfolder may be absent. Point PLM at one such folder per call — multiple
+        folders under a common root act as a library of selectable metaparams.
         """
         import pathlib
         base = pathlib.Path(path)
@@ -290,7 +334,7 @@ class PLM:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
-                            "content": f"error: invalid JSON arguments for tool {tname!r}",
+                            "content": _parallel_note + f"error: invalid JSON arguments for tool {tname!r}",
                         })
                         metrics["tool_calls"].append({
                             "tool_name": tname, "tool_status": "code_arg_invalid",
@@ -301,7 +345,7 @@ class PLM:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": f"error: invalid arguments for tool {tname!r}",
+                        "content": _parallel_note + f"error: invalid arguments for tool {tname!r}",
                     })
                     metrics["tool_calls"].append({
                         "tool_name": tname, "tool_status": "code_arg_invalid",
@@ -314,7 +358,7 @@ class PLM:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": f"error: tool {tname!r} not supported (only `python`)",
+                        "content": _parallel_note + f"error: tool {tname!r} not supported (only `python`)",
                     })
                     metrics["tool_calls"].append({
                         "tool_name": tname, "tool_status": "code_arg_invalid",
@@ -326,7 +370,7 @@ class PLM:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": f"error: arguments for tool {tname!r} must be a JSON object",
+                        "content": _parallel_note + f"error: arguments for tool {tname!r} must be a JSON object",
                     })
                     metrics["tool_calls"].append({
                         "tool_name": tname, "tool_status": "code_arg_invalid",
@@ -341,7 +385,7 @@ class PLM:
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": f"stderr:\n{e}",
+                        "content": _parallel_note + f"stderr:\n{e}",
                     })
                     metrics["tool_calls"].append({
                         "tool_name": tname, "tool_status": "code_arg_invalid",

@@ -2552,6 +2552,52 @@ def test_crash_restart_recipe_namespace_fidelity():
     assert not rejects(A2, {"amount": 5})
 
 
+def test_nc34_facade_factory_kwargs_deepcopied():
+    """NC3-4: a field facade's `_constraint_factory_kwargs` must DEEP-copy the inner's, not alias
+    its mutable list values — mutating the facade's copy must not leak into the constraint."""
+    from plm.constraint import Constraint
+    c = Constraint.field(one_of=["USD", "EUR"])
+    c._constraint_factory_kwargs["one_of"].append("GBP")
+    assert "GBP" not in c.describe()
+
+
+def test_nc31_recursive_constraint_recipe_no_stack_overflow():
+    """NC3-1: `to_recipe` on a self-recursive structural Constraint (a field annotation pointing
+    back at the class) must NOT infinite-recurse. The cycle guard breaks it: the cyclic field keeps
+    its live annotation (so the recipe is later dropped cleanly by the dumps-probe), but the call
+    itself returns instead of blowing the stack with RecursionError."""
+    from typing import Optional
+    from plm.constraint import Constraint
+    from plm.constraint.snapshot import to_recipe
+
+    class Node(Constraint):
+        val: int
+        nxt: "Optional[Node]" = None
+    Node.model_rebuild()
+    r = to_recipe(Node)                              # returns without RecursionError
+    assert r is None or r[0] == "structural"
+
+
+def test_nc32_super_in_constraint_rejected_at_definition():
+    """NC3-2 (resolved via the constraint contract): a Constraint is a FLAT structural validator
+    (fields + validators + predicates), NOT an inheritance hierarchy. A method using bare super()
+    is REJECTED at DEFINITION with a clear error — rather than failing mysteriously on a recipe
+    round-trip / silently dropping on crash-restart. The library's own base/field/composite classes
+    use no bare super(), so this only ever fires on misuse; normal constraints are unaffected."""
+    from plm.constraint import Constraint
+    from plm.constraint.snapshot import to_recipe, from_recipe
+
+    with pytest.raises(TypeError, match="super"):
+        class S(Constraint):
+            x: int
+            def who(self):
+                return super().__repr_name__()      # bare super -> rejected at the class statement
+
+    class Money(Constraint):                         # a normal structural constraint is unaffected
+        amount: int
+    assert from_recipe(to_recipe(Money))(amount=5).amount == 5      # ...and still round-trips
+
+
 def test_all_constraint_shapes_rehydrate_via_recipe():
     """EXHAUSTIVE: every constraint shape, all four ops (& | ^ ~) and their combinations, and
     every structural feature must round-trip through `to_recipe -> from_recipe` and BEHAVE
@@ -2723,6 +2769,18 @@ def test_is_instance_of_is_strict_no_coercion():
     assert cw.validate(w) is w
     with pytest.raises(ConstraintViolation):
         cw.validate("x")
+
+    # NC3-3: pydantic Strict() left THREE coercions open; the is-instance schema closes them.
+    with pytest.raises(ConstraintViolation):
+        of(is_instance_of=float).validate(5)          # int is NOT promoted to float
+    class P(Constraint):
+        name: str
+    with pytest.raises(ConstraintViolation):
+        of(is_instance_of=P).validate({"name": "x"})  # a dict is NOT built into the model
+    class MyInt(int):
+        pass
+    mi = MyInt(7)
+    assert of(is_instance_of=int).validate(mi) is mi  # a subclass instance passes through UNCHANGED
 
     with pytest.raises(Exception):                    # old name removed
         of(instance_of=int)

@@ -686,6 +686,11 @@ def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stu
     asst = [m for m in round2_msgs if m.get("role") == "assistant"][-1]
     assert asst.get("tool_calls") is None                       # malformed element NOT stored
     assert "not-a-dict" not in str(round2_msgs)                 # nowhere in the stored history
+    # ND3-1: the error reply is a USER turn, NOT an orphan `tool` message (a tool message with no
+    # matching preceding tool_call) — the orphan would 400 the next real-backend request.
+    assert not any(m.get("role") == "tool" and not m.get("tool_call_id") for m in round2_msgs)
+    assert any(m.get("role") == "user" and "malformed tool_call" in (m.get("content") or "")
+               for m in round2_msgs)
 
 
 def test_react_deepcopy_caller_messages_not_mutated(defaults_installed, stub_backend):
@@ -1954,14 +1959,42 @@ def test_d7_async_refused_generators_allowed(defaults_installed):
 
     assert list(seq()) == [0, 1, 4]
 
-    # a rewrite that introduces async is ALSO refused; the old sync policy is kept intact
+    # a rewrite that introduces async is ALSO refused — SOFT-refused (note + return, like every
+    # other rewrite rejection; NP3-3), NOT a raise — so the old sync policy is kept intact.
     @policy
     def keep():
         return 1
 
-    with pytest.raises(TypeError, match="SYNCHRONOUS"):
-        keep._rewrite("async def keep():\n    return 9\n")
-    assert keep() == 1
+    keep._rewrite("async def keep():\n    return 9\n")     # soft-refused (no exception)
+    assert keep() == 1                                     # old sync policy kept intact
+
+
+def test_np35_inherited_async_method_refused():
+    """NP3-5: `_reject_async` scans the whole MRO, not just the class's own __dict__ — so an async
+    method INHERITED from a base (e.g. a subclass that doesn't override an async `__call__`) is
+    still refused, while a SYNC override of an inherited async method is allowed (no false positive).
+    Tested at the function level (a @policy class can't re-exec against a test-local base)."""
+    from plm.policy.decorator import _reject_async
+
+    class _AsyncBase:
+        async def __call__(self, x):
+            return x
+
+    with pytest.raises(TypeError, match="SYNCHRONOUS|async"):
+        _reject_async(type("Inherits", (_AsyncBase,), {}))          # inherits async __call__
+
+    _reject_async(type("Overrides", (_AsyncBase,), {"__call__": lambda self, x: x}))  # sync override -> ok
+    _reject_async(type("Plain", (), {"__call__": lambda self, x: x}))                  # plain sync -> ok
+
+
+def test_np36_soft_keywords_are_valid_policy_names():
+    """NP3-6: SOFT keywords (match/case/type/_) ARE valid def/class names, so they must be accepted
+    as policy names. HARD keywords (class/if/return) stay refused (`def class` is a SyntaxError)."""
+    from plm.policy.decorator import _reserved_name_reason
+    for ok in ("match", "case", "type", "_"):
+        assert _reserved_name_reason(ok) is None, ok
+    for bad in ("class", "if", "return"):
+        assert _reserved_name_reason(bad) is not None, bad
 
 
 def test_generator_policy_depth_correct_all_permutations():

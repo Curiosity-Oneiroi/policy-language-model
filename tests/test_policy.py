@@ -175,8 +175,7 @@ def test_argcount_change_and_async_rewrite_refused():
         return s
     predict._rewrite("def predict(s, n):\n    return s * n\n")         # sync argcount change works
     assert predict("a", 3) == "aaa"
-    with pytest.raises(TypeError, match="SYNCHRONOUS"):
-        predict._rewrite("async def predict(s, n):\n    return s * n\n")
+    predict._rewrite("async def predict(s, n):\n    return s * n\n")   # async rewrite SOFT-refused (NP3-3)
     assert predict("a", 3) == "aaa"                                    # unchanged + still sync
 
 
@@ -865,6 +864,24 @@ def test_frame_length_cap_rejects_oversize():
     assert "_REPL_MAX_FRAME = 2 * 1024 ** 3" in KERNEL_BOOTSTRAP          # parent + kernel caps agree
 
 
+def test_nr31_respawn_result_signals_not_executed():
+    """NR3-1: every kill+respawn path returns ONE consistent envelope (built by `_respawn_result`)
+    carrying executed=False + a RE-RUN note — so a caller can detect a non-run, and the paths can't
+    drift in shape again (previously only the EOF path set the flag)."""
+    from plm.repl import PythonReplSession
+    # unit: the single builder always sets the flag
+    env = PythonReplSession._respawn_result("PRE", "[note]\n")
+    assert env["executed"] is False and env["stderr"] == "PRE[note]\n" and env["return_obj"] is None
+    # integration: a kernel that exits before returning a result -> respawn path sets it
+    s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0, sigint_grace=2.0)
+    try:
+        r = s.execute_cell("import os as _o\n_o._exit(0)")
+        assert r.get("executed") is False and "RE-RUN" in r.get("stderr", "")
+        assert s.execute_cell("print(2 + 2)")["stdout"].strip() == "4"     # respawned + usable
+    finally:
+        s.close()
+
+
 def test_int_generator_policies_survive_crash_restart():
     """M3: EVERY generator-policy shape survives a hard respawn AND stays depth-correct after —
     a function generator, a class generator __call__, a class generator method, and nesting
@@ -1500,6 +1517,23 @@ def test_metaparams_name_in_both_buckets_rejected():
                           sealed_policies={"foo": "@policy\ndef foo(): ...\n"})
 
 
+def test_metaparams_name_comes_from_def_not_key():
+    """NP3-4 (API side): a policy's name is the @policy def/class name parsed from its source,
+    NEVER the dict key / file stem. PLMMetaParameters re-keys both buckets to the real name,
+    detects two same-named policies, and rejects a source that isn't exactly one top-level def."""
+    from plm.plm import PLMMetaParameters as MP
+    mp = MP(system_prompt="x", sealed_policies={"auth": "@policy\ndef authenticate(x):\n    return x\n"})
+    assert list(mp.sealed_policies) == ["authenticate"]            # key 'auth' re-keyed to def name
+    mp2 = MP(system_prompt="x",
+             extra_policies={"k": "@policy\nclass Doubler:\n    def __call__(self, x):\n        return x * 2\n"})
+    assert list(mp2.extra_policies) == ["Doubler"]                 # class name too
+    with pytest.raises(ValueError, match="exactly ONE top-level"):
+        MP(system_prompt="x", extra_policies={"x": "y = 5\n"})     # no def/class
+    with pytest.raises(ValueError, match="both define"):           # two files, same def name
+        MP(system_prompt="x", extra_policies={"a": "@policy\ndef h(x):\n    return x\n",
+                                              "b": "@policy\ndef h(x):\n    return x\n"})
+
+
 def test_int_sealed_extra_policy_locked_unduplicable_unblessed():
     """metaparams policies/sealed/: a sealed extra installs immutable + un-duplicable + NOT blessed
     (no raw LLM-primitive access), survives crash-restart still sealed; a mutable extra stays
@@ -1539,6 +1573,97 @@ def test_int_sealed_extra_policy_locked_unduplicable_unblessed():
         assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"
         s.execute_cell("locked._rewrite('def locked(x):\\n    return 0\\n')")
         assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"              # still immutable
+    finally:
+        s.close()
+
+
+def test_int_sealed_class_extra_resists_flag_flip():
+    """NP3-1: a sealed CLASS extra is a raw type whose `_p_immutable` is freely writable (unlike a
+    function proxy, which write-locks it). The seal gates + `_is_default` must anchor to the
+    canonical registry (`_is_sealed_obj`, identity-based), so flipping the flag cannot un-seal it —
+    rewrite, remove, AND duplicate stay refused. Normal class policies remain fully mutable."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    import json
+    env = {"_PLM_SEALED_EXTRA_POLICIES": json.dumps({
+        "Locked": "@policy\nclass Locked:\n    def __call__(self, x):\n        return x * 2\n"})}
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0,
+                              sigint_grace=2.0, env=env)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        assert s.execute_cell("print(Locked()(5))")["stdout"].strip() == "10"
+        s.execute_cell("Locked._p_immutable = False")                    # the attack: flip the writable flag
+        assert s.execute_cell("print(Locked._p_immutable)")["stdout"].strip() == "False"   # flag DID flip...
+        s.execute_cell("Locked._rewrite('class Locked:\\n    def __call__(self, x):\\n        return 999\\n')")
+        assert s.execute_cell("print(Locked()(5))")["stdout"].strip() == "10"              # ...but rewrite blocked
+        r = s.execute_cell("Locked._remove(); print('Locked' in list_policies())")
+        assert r["stdout"].strip() == "True"                                               # remove blocked
+        r2 = s.execute_cell("duplicate_policy('Locked','Fork'); print('Fork' in list_policies())")
+        assert r2["stdout"].strip() == "False"                                             # duplicate blocked
+        # no false positive: a NORMAL class policy is still mutable
+        s.execute_cell("@policy\nclass Free:\n    def __call__(self, x):\n        return x + 1")
+        s.execute_cell("Free._rewrite('class Free:\\n    def __call__(self, x):\\n        return x + 100\\n')")
+        assert s.execute_cell("print(Free()(5))")["stdout"].strip() == "105"
+    finally:
+        s.close()
+
+
+def test_int_sealed_extra_seals_real_name_not_stem():
+    """NP3-4: from_dir keys sealed_policies by FILE STEM, but @policy registers by the def-name.
+    The kernel seals the names ACTUALLY installed (the install delta), not the transport key — so a
+    file `auth.py` defining `def authenticate(...)` seals `authenticate`, never the phantom `auth`."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    import json
+    env = {"_PLM_SEALED_EXTRA_POLICIES": json.dumps({       # key 'auth' != def-name 'authenticate'
+        "auth": "@policy\ndef authenticate(x):\n    return x * 2\n"})}
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0,
+                              sigint_grace=2.0, env=env)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        assert s.execute_cell("print('authenticate' in list_policies())")["stdout"].strip() == "True"
+        assert s.execute_cell("print('auth' in list_policies())")["stdout"].strip() == "False"   # no phantom
+        s.execute_cell("authenticate._rewrite('def authenticate(x):\\n    return 999\\n')")
+        assert s.execute_cell("print(authenticate(5))")["stdout"].strip() == "10"                 # real name sealed
+        r = s.execute_cell("duplicate_policy('authenticate','f'); print('f' in list_policies())")
+        assert r["stdout"].strip() == "False"                                                     # un-duplicable
+    finally:
+        s.close()
+
+
+def test_int_sealed_extra_poison_force_restored_on_rehydrate():
+    """NR3-7: the rehydrate subscript-poisoning defense force-restores EVERY sealed policy from its
+    fresh-PREFIX v0 — `_SEALED_POLICIES`, not just `_LLM_DEFAULT_POLICIES`. A sealed EXTRA whose
+    registry entry was poisoned (via `dict.__setitem__`, which bypasses the store's protection and
+    Guard A) must come back as v0 after crash-restart."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    import json
+    env = {"_PLM_SEALED_EXTRA_POLICIES": json.dumps({
+        "locked": "@policy\ndef locked(x):\n    return x * 2\n"})}
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0,
+                              sigint_grace=2.0, env=env)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel: {e}")
+    try:
+        assert s.execute_cell("print(locked(5))")["stdout"].strip() == "10"
+        s.execute_cell("dict.__setitem__(_PLM_POLICIES, 'locked', lambda x: 999)")    # poison
+        assert s.execute_cell("print(_PLM_POLICIES['locked'](5))")["stdout"].strip() == "999"
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")                                # crash
+        assert s.kernel_epoch > ep
+        assert s.execute_cell("print(_PLM_POLICIES['locked'](5))")["stdout"].strip() == "10"  # v0 restored
     finally:
         s.close()
 

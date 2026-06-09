@@ -75,8 +75,12 @@ def _unsealed():
 
 
 def _is_default(value) -> bool:
-    """True iff `value` is a DEFAULT (immutable) policy — intrinsic to the object."""
-    return getattr(value, "_p_immutable", False) is True
+    """True iff `value` is a DEFAULT (sealed) policy. Anchored to the canonical seal record by
+    IDENTITY (`_is_sealed_obj`), not only the per-object `_p_immutable` flag: a class policy is a
+    raw type whose flag is freely writable, so trusting the flag alone would let a flipped flag
+    defeat the store's default-protection and Guard C's canonical restore. The write-locked flag on
+    function proxies remains the fast path; the registry anchor is the un-spoofable backstop."""
+    return getattr(value, "_p_immutable", False) is True or _is_sealed_obj(value)
 
 
 class _PolicyStore(dict):
@@ -168,6 +172,21 @@ def _seal(name: str) -> None:
         except Exception:
             pass
     _SEALED_POLICIES.add(name)
+
+
+def _is_sealed_obj(obj) -> bool:
+    """Canonical seal check, by OBJECT IDENTITY: True iff `obj` is the registered policy for some
+    name in `_SEALED_POLICIES`. This is the un-spoofable anchor the mutation gates use.
+
+    A FUNCTION policy's `_p_immutable` flag is write-locked by `_FunctionPolicy.__setattr__`, so the
+    flag faithfully mirrors the seal. A CLASS policy is a RAW type whose `_p_immutable` is freely
+    writable (no __setattr__ freeze on a type) — so the gates must NOT trust that flag alone. They
+    fall back to this registry record, which a cell can't reach as a plain global and which is keyed
+    by identity (so flipping `_p_immutable` OR rebinding `__name__` can't dodge it)."""
+    for _n in _SEALED_POLICIES:
+        if dict.get(_PLM_POLICIES, _n) is obj:
+            return True
+    return False
 
 
 def _main() -> dict:
@@ -270,7 +289,20 @@ def _install_policy_source(full_src: str, slot: str) -> None:
     """
     _linecache.cache[slot] = (len(full_src), None, full_src.splitlines(True), slot)
     g = _main()
-    exec(compile(full_src, slot, "exec"), g, g)        # @policy resolves via __main__ globals
+    try:
+        exec(compile(full_src, slot, "exec"), g, g)    # @policy resolves via __main__ globals
+    except BaseException as _e:
+        # Capture the SOURCE-rich traceback as a note WHILE the slot is still in linecache, then
+        # drop the slot before re-raising — so a failed install surfaces full source AND never leaks
+        # a linecache entry (repeated failed `duplicate_policy` names would otherwise accumulate one
+        # slot each for the kernel's lifetime). The note rides along on the exception.
+        import traceback as _tb
+        try:
+            _e.add_note("install source traceback:\n" + _tb.format_exc())
+        except Exception:
+            pass
+        _linecache.cache.pop(slot, None)
+        raise
     _linecache.cache.pop(slot, None)                   # success: drop the transient install slot
 
 

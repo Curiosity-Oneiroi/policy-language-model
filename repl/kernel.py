@@ -62,6 +62,13 @@ def _repl_write_frame(obj):
     _repl_resp_out.write(body)
 
 
+def _repl_clip(_s, _n=240):
+    # Bound ONE diagnostic piece (an exception repr, a name list) so a single huge object can't eat
+    # the whole rehydrate-note budget — every failure then gets a fair, short mention.
+    _s = _builtins.str(_s)
+    return _s if _builtins.len(_s) <= _n else (_s[:_n] + "…[+" + _builtins.str(_builtins.len(_s) - _n) + " chars]")
+
+
 def _repl_reset_buffers():
     global _repl_stdout_buf, _repl_stderr_buf
     _repl_stdout_buf = _io.StringIO()
@@ -126,6 +133,16 @@ while True:
             # were snapshotted as RECIPES — popped here so they don't reach globals().update;
             # replayed back into __main__ after the reconcile (mirrors the policy-source path).
             _repl_constraint_recipes = _repl_restored.pop("_CONSTRAINT_RECIPES", None) or {}
+            # Constraints the SNAPSHOT had to drop (un-recipe-able / unpicklable recipe) — recorded
+            # at snapshot time so we can name them now, else a downstream cell hits a surprise
+            # NameError with no cause. (the snapshot-side counterpart of the replay note.)
+            _repl_constraint_dropped = _repl_restored.pop("_CONSTRAINT_DROPPED", None) or []
+            if _repl_constraint_dropped:
+                _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                    "[rehydrate] " + _builtins.str(_builtins.len(_repl_constraint_dropped))
+                    + " constraint(s) could not be snapshotted (un-recipe-able or unpicklable), so "
+                    + "they did NOT survive restart: "
+                    + _repl_clip(_builtins.sorted(_repl_constraint_dropped)) + "; ")
 
             # === Phase 2: subscript-poisoning closure ===
             # Discard the snapshot's copies of immutable LLM defaults and keep
@@ -137,9 +154,8 @@ while True:
             # the snapshot. We keep the existing "snapshot is canonical for
             # mutables" semantic (PLM-deleted extras stay deleted) BUT force the
             # LLM defaults to come from on-disk source.
-            from plm.policy.defaults import _LLM_DEFAULT_POLICIES as _repl_llm_defaults
             from plm.policy.defaults import _bless_llm_callers as _repl_bless_after
-            from plm.policy.registry import _unsealed as _repl_unsealed
+            from plm.policy.registry import _unsealed as _repl_unsealed, _SEALED_POLICIES as _repl_sealed
 
             # Snapshot the FRESH-PREFIX boot policies (name -> proxy) BEFORE the
             # registry reset below, so orphaned __main__ bindings can be reaped
@@ -150,36 +166,36 @@ while True:
             }
 
             if "_PLM_POLICIES" in _repl_restored:
-                _repl_saved_defaults = {
-                    n: _PLM_POLICIES[n] for n in _repl_llm_defaults if n in _PLM_POLICIES
+                # Force-restore EVERY sealed policy (the LLM defaults AND a metaparam's sealed extras
+                # — `_SEALED_POLICIES`, not just the blessed `_LLM_DEFAULT_POLICIES`) to its fresh
+                # PREFIX v0. A sealed policy must never come from the snapshot: a prior cell could have
+                # poisoned `_PLM_POLICIES["<sealed>"] = evil` via a Subscript target Guard A skips, and
+                # that copy round-trips through dill. Restricting this to the LLM defaults left sealed
+                # extras poisonable across crash-restart (NR3-7).
+                _repl_saved_sealed = {
+                    n: _PLM_POLICIES[n] for n in _repl_sealed if n in _PLM_POLICIES
                 }
-                # The registry protects default entries during normal cell exec;
-                # this is a harness-owned full reset, so drop the seal for it. The
-                # protected store would also reject the snapshot's poisoned default
-                # copies, but `_unsealed` keeps this path explicit + force-restores
-                # the freshly-installed v0 defaults regardless of what the snapshot
-                # carried.
+                # The registry protects sealed entries during normal cell exec; this is a
+                # harness-owned full reset, so drop the seal for it. `_unsealed` keeps this path
+                # explicit + force-restores the freshly-installed v0 regardless of the snapshot.
                 with _repl_unsealed():
                     _PLM_POLICIES.clear()
                     _PLM_POLICIES.update(_repl_restored.pop("_PLM_POLICIES"))
-                    _PLM_POLICIES.update(_repl_saved_defaults)  # force-overwrite back to v0
+                    _PLM_POLICIES.update(_repl_saved_sealed)    # force-overwrite back to v0
 
             _builtins.globals().update(_repl_restored)
 
-            # Force-rebind LLM-default names in __main__ to the registry's v0
-            # proxies. REQUIRED because the snapshot contains
-            # `natural_llm`/`react_llm` as __main__ globals (they're NOT in
-            # _REPL_INJECTED), so globals().update(...) above would otherwise
-            # overwrite PREFIX's v0 binding with the snapshot's OLD/poisoned
-            # proxy — leaving _PLM_POLICIES (v0) inconsistent with __main__
-            # (OLD). All `natural_llm(...)` calls from cells look up
-            # __main__["natural_llm"], so this rebind is what guarantees PLM
-            # hits v0. (Known limitation, documented in the plan: a cell-level
-            # alias like `f = natural_llm` rehydrates pointing at the OLD
-            # proxy via dill identity-preservation; PLM should look up via
-            # the global at call time, not cache the reference.)
+            # Force-rebind every SEALED name in __main__ to the registry's v0 proxy. REQUIRED because
+            # the snapshot carries sealed policies (`natural_llm`/`react_llm`/a sealed extra) as
+            # __main__ globals (they're NOT in _REPL_INJECTED), so globals().update(...) above would
+            # otherwise overwrite PREFIX's v0 binding with the snapshot's OLD/poisoned proxy — leaving
+            # _PLM_POLICIES (v0) inconsistent with __main__ (OLD). All `<sealed>(...)` calls from cells
+            # look up __main__["<sealed>"], so this rebind is what guarantees PLM hits v0. (Known
+            # limitation, documented in the plan: a cell-level alias like `f = natural_llm` rehydrates
+            # pointing at the OLD proxy via dill identity-preservation; PLM should look up via the
+            # global at call time, not cache the reference.)
             _repl_g = _builtins.globals()
-            for _repl_dn in _repl_llm_defaults:
+            for _repl_dn in _repl_sealed:
                 if _repl_dn in _PLM_POLICIES:
                     _repl_g[_repl_dn] = _PLM_POLICIES[_repl_dn]
 
@@ -222,7 +238,7 @@ while True:
                         # body fails to re-exec on respawn must NOT vanish silently.
                         _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
                             "[rehydrate] policy " + _repl_pn + " not replayed: "
-                            + _builtins.repr(_repl_reinstall_exc) + "; ")
+                            + _repl_clip(_builtins.repr(_repl_reinstall_exc)) + "; ")
 
             # Replay constraint RECIPES (CALL-built constraints that couldn't dill-pickle)
             # back into __main__, rebuilding via from_recipe. Best-effort + surfaced like
@@ -235,7 +251,7 @@ while True:
                     except Exception as _repl_crec_exc:
                         _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
                             "[rehydrate] constraint " + _repl_cn + " not replayed: "
-                            + _builtins.repr(_repl_crec_exc) + "; ")
+                            + _repl_clip(_builtins.repr(_repl_crec_exc)) + "; ")
             elif _repl_constraint_recipes:
                 # Recipes exist but the constraint surface never imported (no pydantic in this
                 # kernel) -> they'd be SILENTLY dropped and downstream cells would hit surprise
@@ -243,7 +259,7 @@ while True:
                 _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
                     "[rehydrate] " + _builtins.str(_builtins.len(_repl_constraint_recipes))
                     + " constraint(s) not replayed (constraint surface unavailable): "
-                    + _builtins.str(_builtins.sorted(_repl_constraint_recipes)) + "; ")
+                    + _repl_clip(_builtins.sorted(_repl_constraint_recipes)) + "; ")
 
             _rebuild_linecache_from_policies()
 
@@ -254,7 +270,10 @@ while True:
             # legitimately rehydrates would get correctly blessed here.
             _repl_bless_after()
         except Exception as _repl_rehydrate_exc:
-            _repl_rehydrate_error = (_repl_rehydrate_error or "") + _builtins.repr(_repl_rehydrate_exc)
+            _repl_rehydrate_error = (_repl_rehydrate_error or "") + _repl_clip(_builtins.repr(_repl_rehydrate_exc))
+        if _repl_rehydrate_error and _builtins.len(_repl_rehydrate_error) > 4096:   #  cap so a
+            _repl_rehydrate_error = ("[...rehydrate notes truncated...]\n"           # pathological respawn
+                                     + _repl_rehydrate_error[-4096:])                # can't balloon to MB
         _repl_write_frame({"type": "ready", "rehydrate_error": _repl_rehydrate_error})
         continue
 
@@ -267,11 +286,12 @@ while True:
     _repl_code = _repl_req["code"]
     _repl_cell_file = f"<cell-{_repl_cell_n}>"
     _repl_cell_n += 1
-    # Reset the capture buffers via the side module (re-imported fresh), so a cell that
-    # rebound the __main__ `_repl_reset_buffers` to a no-op can't leak stdout across cells
-    # . Fall back to the __main__ function if the side module isn't populated.
+    # Reset the capture buffers via the side module (re-imported fresh), so a cell that rebound the
+    # __main__ `_repl_reset_buffers` to a no-op can't leak stdout across cells. NO __main__ fallback:
+    # the `or _repl_reset_buffers` fallback re-opened that exact hole (a cell nulling both the side
+    # attr and the __main__ name). `_repl_ks.reset_buffers` is set once at boot (prefix.py). (NR3-3)
     import plm.repl._kernel_state as _repl_ks
-    (_repl_ks.reset_buffers or _repl_reset_buffers)()
+    _repl_ks.reset_buffers()
     _linecache.cache[_repl_cell_file] = (
         _builtins.len(_repl_code), None, _repl_code.splitlines(True), _repl_cell_file)
 
