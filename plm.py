@@ -277,7 +277,7 @@ class PLM:
         try:
             for _round in range(total_rounds_budget):
 
-                if _round >= self.max_turns - 1:
+                if _round == self.max_turns - 1:
                     messages.append(_build_last_round_reminder(constraint))
 
                 msgs = clone_messages(messages)

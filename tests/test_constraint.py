@@ -2122,7 +2122,7 @@ def test_76_predicate_constraint_descriptions_surface_in_describe():
 
     # single: tagged surfaces its text; untagged falls back
     assert "must be even" in Constraint.field(predicate=is_even).describe()
-    assert Constraint.field(predicate=untagged).describe() == "predicate-checked"
+    assert Constraint.field(predicate=untagged).describe() == "1 predicate(s) checked"
 
     # plural all tagged: each text, no count line
     d = Constraint.field(predicates=[is_even, not_42]).describe()

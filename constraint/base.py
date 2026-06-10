@@ -1393,7 +1393,7 @@ _DESCRIBE_RULES: Tuple[Tuple[str, bool, Callable[[Any], str]], ...] = (
     ("float_ge",    False, lambda v: f"float ge {v}"),
     ("float_lt",    False, lambda v: f"float lt {v}"),
     ("float_le",    False, lambda v: f"float le {v}"),
-    ("is_instance_of", False, lambda v: f"strictly an instance of {v.__name__} (no coercion)"),
+    ("is_instance_of", False, lambda v: f"strictly an instance of {_short(v)} (no coercion)"),
     ("one_of",      False, lambda v: f"one of {list(v)}"),
     ("not_one_of",  False, lambda v: f"not one of {list(v)}"),
     ("str_pattern", False, lambda v: f"matches pattern /{v}/"),
@@ -1413,7 +1413,7 @@ _DESCRIBE_RULES: Tuple[Tuple[str, bool, Callable[[Any], str]], ...] = (
     # type-completing additions:
     ("multiple_of", False, lambda v: f"a multiple of {v}"),
     ("finite",      True,  lambda v: "finite (not nan/inf)"),
-    ("tuple_of",    False, lambda v: (f"tuple of {[_render_elem(x) for x in v]}"
+    ("tuple_of",    False, lambda v: (f"tuple of [{', '.join(_render_elem(x) for x in v)}]"
                                       if isinstance(v, tuple) else f"tuple of [{_render_elem(v)}, ...]")),
     ("set_of",      False, lambda v: f"set of [{_render_elem(v)}]"),
     ("frozenset_of",False, lambda v: f"frozenset of [{_render_elem(v)}]"),
@@ -1429,7 +1429,7 @@ _DESCRIBE_RULES: Tuple[Tuple[str, bool, Callable[[Any], str]], ...] = (
     ("abs_range",   False, lambda v: _range_phrase("|z|", v[0], v[1], ge=True, le=True)),
     ("real_range",  False, lambda v: _range_phrase("Re", v[0], v[1], ge=True, le=True)),
     ("imag_range",  False, lambda v: _range_phrase("Im", v[0], v[1], ge=True, le=True)),
-    ("predicate",   False, lambda v: get_description(v) or "predicate-checked"),
+    ("predicate",   False, lambda v: get_description(v) or "1 predicate(s) checked"),
 )
 
 
@@ -1623,16 +1623,27 @@ def _range_phrase(label: str, lo: Any, hi: Any, *, ge: bool, le: bool) -> str:
 
 
 def _short(t: Any) -> str:
-    """Short type name for description rendering."""
+    """Short type name for description rendering.
+
+    Generic / subscripted types (e.g. `List[int]`, `Optional[int]`, `Tuple[int, ...]`)
+    keep their parametrization — checking get_origin/get_args BEFORE the bare
+    `.__name__` fallback (typing aliases like `List[int]` still expose `__name__`
+    as just "List", which would drop the `[int]` bit).
+    """
     if t is type(None):
         return "None"
-    if hasattr(t, "__name__"):
-        return t.__name__
-    if get_origin(t) is not None:
-        origin = get_origin(t)
-        args = get_args(t)
-        origin_name = getattr(origin, "__name__", repr(origin))
+    origin = get_origin(t)
+    args = get_args(t)
+    if origin is not None:
+        # `_name` covers typing aliases (List/Tuple/Dict/Optional/Union -> "List"/...);
+        # `__name__` covers PEP 585 builtin generics (list[int] -> "list"/...);
+        # repr is the last-resort fallback for exotic forms.
+        origin_name = (getattr(t, "_name", None)
+                       or getattr(origin, "__name__", None)
+                       or repr(origin))
         if args:
             return f"{origin_name}[{', '.join(_short(a) for a in args)}]"
         return origin_name
+    if hasattr(t, "__name__"):
+        return t.__name__
     return repr(t)

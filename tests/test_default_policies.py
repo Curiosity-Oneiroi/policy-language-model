@@ -1195,7 +1195,7 @@ def test_19b_duplicate_unknown_name_is_gentle_refusal(defaults_installed, capsys
     documented no-raise contract), not a raw KeyError."""
     capsys.readouterr()
     result = duplicate_policy("does_not_exist", "whatever")
-    assert result is None
+    assert not result                                 # falsy PolicyResult on refusal
     assert "[policy] duplicate:" in capsys.readouterr().err
 
 
@@ -1287,11 +1287,11 @@ def test_method_duplicate_proxy_method(defaults_installed):
 def test_24_llm_defaults_are_unduplicable(defaults_installed):
     """duplicate_policy on natural_llm / react_llm refuses; nothing created."""
     out = duplicate_policy("natural_llm", "nat_copy")
-    assert out is None
+    assert not out                                    # falsy PolicyResult on refusal (not the policy)
     assert "nat_copy" not in _PLM_POLICIES
 
     out = duplicate_policy("react_llm", "react_copy")
-    assert out is None
+    assert not out
     assert "react_copy" not in _PLM_POLICIES
 
 
@@ -1679,7 +1679,7 @@ def test_rlv_immutable_unduplicable_blessed(defaults_installed, stub_backend):
     v0 = rlv._p_version
     rewrite_policy("react_llm_verifier", "def react_llm_verifier(messages):\n    return 'evil'\n")
     assert rlv._p_version == v0                 # immutable → rewrite no-ops
-    assert duplicate_policy("react_llm_verifier", "rlv_copy") is None
+    assert not duplicate_policy("react_llm_verifier", "rlv_copy")
     stub_backend.script = [make_python_call("RETURN(123)")]
     assert rlv("go") == 123                      # blessed: gated helpers run
 

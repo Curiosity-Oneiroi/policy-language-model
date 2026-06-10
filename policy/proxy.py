@@ -52,6 +52,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .edits import (
+    PolicyOp,
+    PolicyResult,
     _compute_delete,
     _compute_edit,
     _compute_insert,
@@ -70,6 +72,15 @@ def _policy_note(msg: str) -> None:
     # buffer). No dedup, no warnings-filter dependence, no proxy.py:line noise —
     # PLM sees every edit failure, even N within one cell.
     sys.stderr.write(f"[policy] {msg}\n")
+
+
+def _fail(status: "PolicyOp", detail: str) -> "PolicyResult":
+    """Emit the `[policy]` note (the backstop) AND return a descriptive PolicyResult. Returned by the
+    in-place edit/remove methods (whose clean success is None) and `duplicate_policy` (whose clean
+    success is the new policy) ONLY on a problem — so calling code can branch on `r.status`/`r.detail`
+    while an unchecked caller still sees the note. Never returned on a clean success."""
+    _policy_note(detail)
+    return PolicyResult(status, detail)
 
 
 # --- policy-call depth cap (Phase 2) -----------------------------------------
@@ -219,19 +230,43 @@ class _FunctionPolicy:
     # --- edit API (thin wrappers over the shared _compute_* + the _rewrite choke point) ---
 
     def _edit(self, old, new, *, replace_all=False):
+        if not isinstance(old, str) or not isinstance(new, str):
+            return _fail(PolicyOp.BAD_ARGS,
+                         f"{self._p_name}._edit: `old`/`new` must be strings (got "
+                         f"{type(old).__name__}/{type(new).__name__}); nothing changed")
         ns = _compute_edit(self._p_source, old, new, replace_all)
-        if ns is not None:
-            self._rewrite(ns)
+        if ns is None:
+            return _fail(PolicyOp.NO_MATCH,
+                         f"{self._p_name}._edit: {old!r} not found in source; nothing changed")
+        return self._rewrite(ns)
 
     def _insert(self, after_line, content):
+        if not isinstance(content, str):
+            return _fail(PolicyOp.BAD_ARGS,
+                         f"{self._p_name}._insert: `content` must be a string (got "
+                         f"{type(content).__name__}); nothing changed")
+        if not isinstance(after_line, int) or isinstance(after_line, bool) or after_line < 0:
+            return _fail(PolicyOp.BAD_ARGS,
+                         f"{self._p_name}._insert: `after_line` must be a non-negative int (got "
+                         f"{after_line!r}); nothing changed")
         ns = _compute_insert(self._p_source, after_line, content)
-        if ns is not None:
-            self._rewrite(ns)
+        if ns is None:
+            return _fail(PolicyOp.NO_MATCH,
+                         f"{self._p_name}._insert: nothing to insert (empty content); nothing changed")
+        return self._rewrite(ns)
 
     def _delete_lines(self, start, end=None):
+        if (not isinstance(start, int) or isinstance(start, bool)
+                or (end is not None and (not isinstance(end, int) or isinstance(end, bool)))):
+            return _fail(PolicyOp.BAD_ARGS,
+                         f"{self._p_name}._delete_lines: `start`/`end` must be ints (got "
+                         f"{type(start).__name__}/{type(end).__name__}); nothing changed")
         ns = _compute_delete(self._p_source, start, end)
-        if ns is not None:
-            self._rewrite(ns)
+        if ns is None:
+            return _fail(PolicyOp.NO_MATCH,
+                         f"{self._p_name}._delete_lines: lines [{start}, {end}] out of range or no "
+                         f"change; nothing changed")
+        return self._rewrite(ns)
 
     def _remove(self):
         # Immutability check: refuse to remove a default policy. Other
@@ -240,19 +275,17 @@ class _FunctionPolicy:
         # store refuses to pop a default — this catches the explicit
         # `proxy._remove()` call too.
         if getattr(self, "_p_immutable", False) or _is_sealed_obj(self):
-            _policy_note(
-                f"{self._p_name!r} is immutable; cannot remove. "
-                f"It is part of the LLM-default base."
-            )
-            return
+            return _fail(PolicyOp.IMMUTABLE,
+                         f"{self._p_name!r} is immutable; cannot remove. "
+                         f"It is part of the LLM-default base.")
         g = _main()                          # kernel __main__ (where @policy injected)
         g.pop(self._p_name, None)
         _PLM_POLICIES.pop(self._p_name, None)
         linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot
 
     def _duplicate(self, new_name):
-        """Fork this policy under `new_name`. Returns the new mutable copy,
-        or None if duplication is refused (un-duplicable / name taken)."""
+        """Fork this policy under `new_name`. Returns the new mutable copy on success,
+        or a falsy `PolicyResult` (branch on `.status`) if duplication is refused."""
         from .registry import duplicate_policy
         return duplicate_policy(self._p_name, new_name)
 
@@ -262,26 +295,24 @@ class _FunctionPolicy:
         # and `@policy` re-decoration of a default (the decorator's
         # same-kind path calls `_rewrite` on the existing proxy).
         if getattr(self, "_p_immutable", False) or _is_sealed_obj(self):
-            _policy_note(
-                f"{self._p_name!r} is immutable; source unchanged. "
-                f"Use `duplicate_policy({self._p_name!r}, '<new_name>')` "
-                f"to fork it (refused for un-duplicable LLM defaults)."
-            )
-            return
+            return _fail(PolicyOp.IMMUTABLE,
+                         f"{self._p_name!r} is immutable; source unchanged. "
+                         f"Use `duplicate_policy({self._p_name!r}, '<new_name>')` "
+                         f"to fork it (refused for un-duplicable LLM defaults).")
         # Single choke point: @policy-strip, parse, one-def rule, compile+exec,
         # swap _inner, linecache sync (name-tracking filename), version, rename.
         try:
             new_source = _strip_policy_decorator(new_source)  # strip ALSO parses -> keep
             tree = ast.parse(new_source)                      # inside the try (else a
         except SyntaxError as e:                              # SyntaxError escapes via strip)
-            _policy_note(f"{self._p_name}._rewrite: SyntaxError {e}; source unchanged")
-            return
+            return _fail(PolicyOp.SYNTAX_ERROR,
+                         f"{self._p_name}._rewrite: SyntaxError {e}; source unchanged")
         defs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         if len(tree.body) != 1 or not defs:
-            _policy_note(f"{self._p_name}._rewrite: a policy is exactly one top-level "
+            return _fail(PolicyOp.NOT_ONE_DEF,
+                         f"{self._p_name}._rewrite: a policy is exactly one top-level "
                          f"def (got {len(tree.body)} statement(s)); source unchanged. "
                          f"Nest helpers inside the function body; reference REPL globals.")
-            return
         new_name = defs[0].name
         # Rename-collision guard: a rename must not CLOBBER another policy or a
         # kernel-internal name. Without this, `mutable._rewrite("def natural_llm():
@@ -291,20 +322,18 @@ class _FunctionPolicy:
             new_name in _PLM_POLICIES or new_name in (_main().get("_REPL_INJECTED") or ())
             or new_name in _main()                       # also: don't silently clobber a plain global
         ):
-            _policy_note(
-                f"{self._p_name}._rewrite: refusing to rename to {new_name!r} — that name "
-                f"is already a policy, a kernel-internal name, or an existing variable. Edit "
-                f"in place (keep the def name) or rename to a fresh name."
-            )
-            return
+            return _fail(PolicyOp.NAME_TAKEN,
+                         f"{self._p_name}._rewrite: refusing to rename to {new_name!r} — that name "
+                         f"is already a policy, a kernel-internal name, or an existing variable. Edit "
+                         f"in place (keep the def name) or rename to a fresh name.")
         new_filename = f"<policy-{new_name}>"   # filename TRACKS the name -> no stale-slot collision
         cell_globals = _main()                  # re-exec'd fn closes over kernel __main__ (REPL globals)
         ns = {}
         try:
             exec(compile(tree, new_filename, "exec"), cell_globals, ns)  # compile INSIDE the try:
         except Exception as e:                  # catches compile-only SyntaxErrors ast.parse
-            _policy_note(f"{self._p_name}._rewrite: bad source ({e!r}); source unchanged")
-            return                              # accepts (await-in-sync, dup arg, ...) + def errors
+            return _fail(PolicyOp.BAD_SOURCE,    # accepts (await-in-sync, dup arg, ...) + def errors
+                         f"{self._p_name}._rewrite: bad source ({e!r}); source unchanged")
         new_obj = ns[new_name]
         # The repl is SYNCHRONOUS: refuse an async rewrite too (not just at @policy decoration),
         # so EDIT/INSERT/DELETE — which all funnel here — can't sneak a coroutine past the
@@ -314,8 +343,8 @@ class _FunctionPolicy:
         try:
             _reject_async(new_obj)
         except TypeError as _ae:
-            _policy_note(f"{self._p_name}._rewrite: {_ae}; source unchanged")
-            return
+            return _fail(PolicyOp.BAD_SOURCE,
+                         f"{self._p_name}._rewrite: {_ae}; source unchanged")
         old_name, old_filename = self._p_name, self._p_filename
         self._inner, self._p_source = new_obj, new_source
         self._p_version += 1
@@ -448,11 +477,9 @@ def _class_remove(cls):
     # no immutable class default, but v1.5 may; keep the gate here so adding
     # one later doesn't require touching this method.
     if getattr(cls, "_p_immutable", False) or _is_sealed_obj(cls):
-        _policy_note(
-            f"{cls.__name__!r} is immutable; cannot remove. "
-            f"It is part of the LLM-default base."
-        )
-        return
+        return _fail(PolicyOp.IMMUTABLE,
+                     f"{cls.__name__!r} is immutable; cannot remove. "
+                     f"It is part of the LLM-default base.")
     g = _main()
     g.pop(cls.__name__, None)
     _PLM_POLICIES.pop(cls.__name__, None)
@@ -461,8 +488,8 @@ def _class_remove(cls):
 
 
 def _class_duplicate(cls, new_name):
-    """Fork this class policy under `new_name`. Returns the new mutable copy,
-    or None if duplication is refused (un-duplicable / name taken)."""
+    """Fork this class policy under `new_name`. Returns the new mutable copy on success,
+    or a falsy `PolicyResult` (branch on `.status`) if duplication is refused."""
     from .registry import duplicate_policy
     return duplicate_policy(cls.__name__, new_name)
 
@@ -470,23 +497,21 @@ def _class_duplicate(cls, new_name):
 def _rewrite_class_policy(cls, new_source):
     # Immutability gate: refuse to rewrite a DEFAULT class policy.
     if getattr(cls, "_p_immutable", False) or _is_sealed_obj(cls):
-        _policy_note(
-            f"{cls.__name__!r} is immutable; source unchanged. "
-            f"Use `duplicate_policy({cls.__name__!r}, '<new_name>')` "
-            f"to fork it (refused for un-duplicable LLM defaults)."
-        )
-        return
+        return _fail(PolicyOp.IMMUTABLE,
+                     f"{cls.__name__!r} is immutable; source unchanged. "
+                     f"Use `duplicate_policy({cls.__name__!r}, '<new_name>')` "
+                     f"to fork it (refused for un-duplicable LLM defaults).")
     try:
         new_source = _strip_policy_decorator(new_source)   # strip ALSO parses -> keep inside
         tree = ast.parse(new_source)
     except SyntaxError as e:
-        _policy_note(f"{cls.__name__}._rewrite: SyntaxError {e}; source unchanged")
-        return
+        return _fail(PolicyOp.SYNTAX_ERROR,
+                     f"{cls.__name__}._rewrite: SyntaxError {e}; source unchanged")
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.ClassDef):
-        _policy_note(f"{cls.__name__}._rewrite: a policy is exactly one top-level "
+        return _fail(PolicyOp.NOT_ONE_DEF,
+                     f"{cls.__name__}._rewrite: a policy is exactly one top-level "
                      f"class (got {len(tree.body)} statement(s)); source unchanged. "
                      f"Nest helpers/attrs inside the class body; reference REPL globals.")
-        return
     new_name = tree.body[0].name
     # Rename-collision guard (mirrors _FunctionPolicy._rewrite): a rename must not
     # clobber another policy or a kernel-internal name. Edit in place (new_name ==
@@ -495,19 +520,17 @@ def _rewrite_class_policy(cls, new_source):
         new_name in _PLM_POLICIES or new_name in (_main().get("_REPL_INJECTED") or ())
         or new_name in _main()                           # also: don't silently clobber a plain global
     ):
-        _policy_note(
-            f"{cls.__name__}._rewrite: refusing to rename to {new_name!r} — that name "
-            f"is already a policy, a kernel-internal name, or an existing variable. Edit "
-            f"in place or rename to a fresh name."
-        )
-        return
+        return _fail(PolicyOp.NAME_TAKEN,
+                     f"{cls.__name__}._rewrite: refusing to rename to {new_name!r} — that name "
+                     f"is already a policy, a kernel-internal name, or an existing variable. Edit "
+                     f"in place or rename to a fresh name.")
     new_filename = f"<policy-{new_name}>"      # filename tracks name; methods compiled
     ns = {}                                    # under it get the matching co_filename
     try:
         exec(compile(tree, new_filename, "exec"), _main(), ns)
     except Exception as e:                     # compile-only SyntaxError OR class-body error
-        _policy_note(f"{cls.__name__}._rewrite: bad source ({e!r}); source unchanged")
-        return
+        return _fail(PolicyOp.BAD_SOURCE,
+                     f"{cls.__name__}._rewrite: bad source ({e!r}); source unchanged")
     new_cls = ns[new_name]
     # Refuse a rewrite that introduces an async method (e.g. an async __call__) — same sync
     # contract as @policy decoration. SOFT-refuse (note + return, like the rejections above), before
@@ -516,8 +539,8 @@ def _rewrite_class_policy(cls, new_source):
     try:
         _reject_async(new_cls)
     except TypeError as _ae:
-        _policy_note(f"{cls.__name__}._rewrite: {_ae}; source unchanged")
-        return
+        return _fail(PolicyOp.BAD_SOURCE,
+                     f"{cls.__name__}._rewrite: {_ae}; source unchanged")
 
     # Structural checks FIRST (can't mutate metaclass/slots/incompatible bases in
     # place) -> fall back to remove+recreate, leaving cls.__dict__ untouched. Pass

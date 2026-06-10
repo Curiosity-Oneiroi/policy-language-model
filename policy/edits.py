@@ -18,7 +18,66 @@ Two responsibilities:
 from __future__ import annotations
 
 import ast
+import enum
 import textwrap
+from dataclasses import dataclass
+from typing import Any
+
+
+# --- the policy-mutation outcome type (returned only on a problem / caveat) ----
+#
+# A `PolicyResult` is the structured, descriptive replacement for the old "return
+# None + write a note" failure path: it lets the CALLING code branch on what went
+# wrong (`r.status`), read the detail (`r.detail`, the traceback-ish text), and —
+# on a caveat — still receive a produced object (`r.value`). It is returned ONLY
+# when there is something to report; a clean success returns the normal thing
+# (None for the in-place edit/remove methods, the new policy for duplicate_policy)
+# so the success path — and every existing caller that ignores the return — is
+# unchanged. The detail is ALSO emitted as a `[policy]` stderr note (the backstop),
+# so an unchecked caller still sees it.
+
+class PolicyOp(enum.Enum):
+    """Why a policy mutation reported a problem (or a caveat). Descriptive (a class, not a bare
+    int), so calling code can branch precisely: `if r.status is PolicyOp.NO_MATCH: ...`."""
+    # --- hard failures: the operation did NOT apply ---
+    NO_MATCH = "no_match"             # _edit/_insert/_delete matched nothing / produced no change
+    BAD_ARGS = "bad_args"             # wrong-typed / invalid argument (e.g. non-string old/new)
+    SYNTAX_ERROR = "syntax_error"     # new source does not parse
+    NOT_ONE_DEF = "not_one_def"       # new source is not exactly one top-level def/class
+    BAD_SOURCE = "bad_source"         # parses but fails to build (class body / TypeError / async)
+    NAME_TAKEN = "name_taken"         # the target / new name already exists
+    NAME_INVALID = "name_invalid"     # reserved / kernel-internal / otherwise illegal name
+    IMMUTABLE = "immutable"           # target is a sealed/default policy (un-editable, un-duplicable)
+    NOT_FOUND = "not_found"           # the named policy does not exist
+    # --- caveats: the operation APPLIED, but with a consequence worth flagging ---
+    STRUCTURAL_FALLBACK = "structural_fallback"   # edit applied by REPLACING the class (old instances stale)
+
+
+@dataclass(frozen=True)
+class PolicyResult:
+    """Outcome of a policy mutation, returned ONLY when there is something to report (a failure or a
+    caveat). A clean success does NOT produce one — the in-place edit/remove methods return None and
+    `duplicate_policy` returns the new policy, exactly as before.
+
+    Fields: `status` (a `PolicyOp` — the descriptive reason), `detail` (the human/"traceback-ish"
+    message; also written to the cell's stderr as a `[policy]` note so an unchecked caller still sees
+    it), and `value` (a produced object handed back only on a CAVEAT result, else None).
+
+    Always falsy, so the two idioms read naturally:
+        r = predict._edit("old", "new")          # in-place op
+        if r is not None: ...                     #   -> a problem (r.status / r.detail)
+        d = duplicate_policy("a", "b")            # value op
+        if not d: ...                             #   -> a problem; on success `d` is the new policy
+    """
+    status: "PolicyOp"
+    detail: str = ""
+    value: Any = None
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"PolicyResult({self.status.name}" + (f": {self.detail}" if self.detail else "") + ")"
 
 
 # --- @policy decorator detection / stripping (line-based, comment-preserving) ---
@@ -176,11 +235,23 @@ def _compute_rename(src: str, new_name: str) -> str:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     )
     lines = src.splitlines(keepends=True)
-    i = node.lineno - 1                                # node.lineno is 1-based; lines is 0-based
-    lines[i] = _re.sub(
-        r"(\b(?:async\s+def|def|class)\s+)" + _re.escape(node.name) + r"\b",
+    # Span the SIGNATURE (def/class header) — not just `node.lineno` — so a
+    # backslash-continued header (`def \\\n  foo(...)`) where the name lives on
+    # a later line than the `def` keyword is still caught. body[0].lineno is the
+    # first line of the body; the header occupies `[lineno, body_start - 1]`.
+    # `count=1` keeps the rename to the FIRST def-name in the span — i.e. the
+    # outer header — so an inner nested def with the same name is left alone.
+    start = node.lineno - 1
+    body_first_line = node.body[0].lineno if getattr(node, "body", None) else node.lineno
+    end_excl = max(body_first_line - 1, start + 1)
+    block = "".join(lines[start:end_excl])
+    new_block = _re.sub(
+        # `(?:\s|\\)+` between the keyword and the name so a backslash line-
+        # continuation between `def` / `class` and the name is also accepted.
+        r"(\b(?:async\s+def|def|class)(?:\s|\\)+)" + _re.escape(node.name) + r"\b",
         r"\g<1>" + new_name,
-        lines[i],
+        block,
         count=1,
     )
+    lines[start:end_excl] = [new_block]
     return "".join(lines)

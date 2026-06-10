@@ -359,7 +359,7 @@ def test_duplicate_policy_reserved_name_gentle_refusal(capsys):
     for bad in ("list_policies", "__x", "_repl_foo", "_REPLthing", 123, None):
         capsys.readouterr()                               # clear
         result = duplicate_policy("src_pol", bad)
-        assert result is None, f"{bad!r} should be refused"
+        assert not result, f"{bad!r} should be refused"   # falsy PolicyResult on refusal
         err = capsys.readouterr().err
         assert "[policy] duplicate:" in err
         # the original is untouched and no broken policy was installed
@@ -1984,5 +1984,46 @@ def test_int_class_policy_survives_respawn_and_deleted_stays_deleted():
         )
         # class survives (CLASS-OK) + function survives (10) + deleted stays gone + immutable kept
         assert r["stdout"].strip() == "CLASS-OK 10 True True True", r
+    finally:
+        s.close()
+
+
+def test_policyresult_enum_outcomes_on_edit_and_duplicate():
+    """The edit/duplicate API returns a descriptive, FALSY PolicyResult on a problem (branchable
+    `.status`), None on a clean in-place success, and the new policy on a clean duplicate — while the
+    `[policy]` note still fires as the backstop. This is what lets cell code HANDLE a failure
+    (try-retry) instead of only an ancestor LLM reading a contextless note. (PolicyResult / PolicyOp)"""
+    from plm.repl import PythonReplSession
+    s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0, sigint_grace=2.0)
+    try:
+        s.execute_cell("@policy\ndef greet(x):\n    return 'hi ' + x\n")
+        # no-match: falsy PolicyResult(NO_MATCH) + note backstop + source UNCHANGED
+        r = s.execute_cell("res = greet._edit('NOPE','X')\n"
+                           "print(res.status.name, bool(res), repr(greet('bob')))")
+        assert r["stdout"].split()[:2] == ["NO_MATCH", "False"]
+        assert "'hi bob'" in r["stdout"]                      # source unchanged (edit did NOT apply)
+        assert "not found" in r["stderr"]                     # note backstop fired
+        # the try-retry pattern the enum unlocks (impossible with the old note-only path)
+        r = s.execute_cell("for old in ['Hello ', 'hi ']:\n"
+                           "    if greet._edit(old, 'hey '):\n        break\n"
+                           "print(greet('bob'))")
+        assert r["stdout"].strip() == "hey bob"
+        # clean in-place success -> None
+        assert s.execute_cell("print(greet._edit('hey ','HEY ') is None)")["stdout"].strip() == "True"
+        # descriptive failure statuses
+        for code, want in [
+            ("greet._edit(None, 'x')",                          "BAD_ARGS"),
+            ("greet._rewrite('def greet(x): return (')",        "SYNTAX_ERROR"),
+            ("greet._rewrite('x=1\\ndef greet(x): return x')",  "NOT_ONE_DEF"),
+            ("natural_llm._rewrite('def natural_llm(): pass')", "IMMUTABLE"),
+            ("duplicate_policy('nope', 'z')",                   "NOT_FOUND"),
+            ("duplicate_policy('greet', 'list_policies')",      "NAME_INVALID"),
+        ]:
+            out = s.execute_cell(f"print(({code}).status.name)")["stdout"].strip()
+            assert out == want, f"{code} -> {out!r} (want {want})"
+        # clean duplicate success -> the new policy itself (callable), NOT a PolicyResult
+        r = s.execute_cell("g2 = duplicate_policy('greet', 'greet2')\n"
+                           "print(g2('z'), hasattr(g2, 'status'))")
+        assert r["stdout"].strip() == "HEY z False"           # g2 is the policy; no .status
     finally:
         s.close()

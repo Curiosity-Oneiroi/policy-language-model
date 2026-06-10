@@ -138,8 +138,13 @@ def _truncate_head_tail(text: str, max_chars: int) -> str:
     raw_len = len(text)
     if raw_len <= max_chars:
         return text
-    half = max_chars // 2
-    omitted = raw_len - max_chars
+    half = max(1, max_chars // 2)            # >=1: `text[-0:]` is the WHOLE string (-0 == 0), so a
+                                             # max_chars of 0/1 used to print everything while the
+                                             # header claimed all of it omitted (#9)
+    if 2 * half >= raw_len:                  # head+tail would meet/overlap -> nothing is genuinely
+        return text                          # hidden; just show the (short) text
+    omitted = raw_len - 2 * half             # count what is ACTUALLY hidden (2*half chars shown),
+                                             # NOT raw_len - max_chars (wrong for odd / clamped sizes)
     return (
         f"[total {raw_len:,} chars; {omitted:,} omitted]\n"
         + text[:half]
@@ -164,6 +169,11 @@ def _format_repl_output(result: Dict[str, Any], max_section_chars: int = 8192) -
     into the other.
     """
     
+    # Guard against a `None` envelope (e.g. a kernel call that returned no
+    # result for some reason). Other helpers in this module similarly never
+    # raise on missing/None inputs — this one matches that contract.
+    if not result:
+        return "(no output)"
     parts: List[str] = []
     stdout = (result.get("stdout") or "").rstrip()
     if stdout:

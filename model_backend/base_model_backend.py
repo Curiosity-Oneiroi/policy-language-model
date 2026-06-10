@@ -114,11 +114,33 @@ class BaseModelBackend(ModelBackend):
         return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
     def _get_tools_signature(self, tools: List[Dict]) -> str:
-        """Hash signature for the tool list to detect changes between calls."""
-        tool_names = sorted(
-            [t.get("function", {}).get("name", "") for t in tools if t.get("type") == "function"]
-        )
-        return hashlib.md5(json.dumps(tool_names, sort_keys=True).encode()).hexdigest()
+        """Hash signature for the tool list to detect changes between calls.
+
+        Hashes BOTH shapes — nested Chat-Completions (`{"type":"function",
+        "function":{"name":..., "parameters":..., "description":...}}`) AND the
+        flat Responses-API form (`{"type":"function","name":...,"parameters":...,
+        "description":...}`) — and includes name + parameters + description, so
+        two different flat tool lists no longer collide in the sanitization cache.
+        """
+        items: List[Any] = []
+        for t in tools or []:
+            if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                fn = t["function"]
+                items.append(("nested",
+                              fn.get("name", ""),
+                              fn.get("description", ""),
+                              fn.get("parameters", {})))
+            elif t.get("type") == "function":
+                items.append(("flat",
+                              t.get("name", ""),
+                              t.get("description", ""),
+                              t.get("parameters", {})))
+            else:
+                # Unknown shape: hash a stable view of the dict so two different
+                # custom-typed tools don't collide either.
+                items.append(("other", t.get("type", ""), t))
+        items.sort(key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return hashlib.md5(json.dumps(items, sort_keys=True, default=str).encode()).hexdigest()
 
     def _sanitize_and_cache_tools(
         self, tools: Optional[List[Dict]]
@@ -145,7 +167,7 @@ class BaseModelBackend(ModelBackend):
         tool_name_mapping: Dict[str, str] = {}
 
         for tool in tools:
-            if tool.get("type") == "function" and "function" in tool:
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
                 original_name = tool["function"].get("name")
                 if not original_name:
                     self.logger.warning(f"{self._LOG_PREFIX} Skipping tool with no name: {tool}")
@@ -166,6 +188,25 @@ class BaseModelBackend(ModelBackend):
                         },
                     }
                 )
+            elif tool.get("type") == "function":
+                # Flat (Responses-API) shape: `name` / `description` / `parameters`
+                # live at the top level (no nested `function` dict). Sanitize the
+                # top-level name the same way so providers that reject e.g. `.` /
+                # `/` in names still accept this shape, and the sanitized->original
+                # mapping is populated so prior-turn tool_calls get remapped too.
+                original_name = tool.get("name")
+                if not original_name:
+                    self.logger.warning(f"{self._LOG_PREFIX} Skipping tool with no name: {tool}")
+                    continue
+                sanitized_name = self._sanitize_tool_name(original_name)
+                if original_name != sanitized_name:
+                    self.logger.info(
+                        f"{self._LOG_PREFIX} Sanitized: '{original_name}' -> '{sanitized_name}'"
+                    )
+                tool_name_mapping[sanitized_name] = original_name
+                # Preserve any non-standard top-level keys the caller set (the
+                # Responses API may carry extras the base class doesn't model).
+                sanitized_tools.append({**tool, "name": sanitized_name})
             else:
                 sanitized_tools.append(tool)
 

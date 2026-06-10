@@ -317,15 +317,16 @@ def _install_policy_source(full_src: str, slot: str) -> None:
 # --- duplicate_policy: fork any DUPLICABLE policy into a fresh mutable copy --
 
 def duplicate_policy(name: str, new_name: str):
-    """Fork a duplicable policy under a new name. Returns the new policy (mutable).
+    """Fork a duplicable policy under a new name. Returns the new policy (mutable) on success, or a
+    falsy `PolicyResult` (NO raise) on failure — branch on `r.status`; the detail is also noted.
 
-    Refuses (with a `_policy_note`, no raise) when:
-      * `name` is not registered.
-      * `name` is in `_SEALED_POLICIES` (the LLM defaults — model-access base).
+    Fails when:
+      * `name` is not registered                          -> PolicyOp.NOT_FOUND
+      * `name` is in `_SEALED_POLICIES` (the LLM defaults) -> PolicyOp.IMMUTABLE
       * `new_name` fails the shared `@policy` name rule (`_reserved_name_reason`):
         not a valid identifier, a reserved kernel name, or a kernel-internal
-        prefix (`__` / `_repl` / `_REPL`) — the same names `@policy` rejects.
-      * `new_name` is already in `_PLM_POLICIES` / `__main__`.
+        prefix (`__` / `_repl` / `_REPL`)                  -> PolicyOp.NAME_INVALID
+      * `new_name` is already in `_PLM_POLICIES` / `__main__` -> PolicyOp.NAME_TAKEN
 
     The copy is created via the normal `@policy` install path under a fresh
     `<policy-dup-{new_name}>` linecache slot. Internal references inside the
@@ -334,34 +335,27 @@ def duplicate_policy(name: str, new_name: str):
     self-reference, `_edit(...)` it after). The fresh proxy is mutable (not
     in `_SEALED_POLICIES`).
     """
-    from .edits import _compute_rename
-    from .proxy import _policy_note
+    from .edits import _compute_rename, PolicyOp
+    from .proxy import _fail
     from .decorator import _reserved_name_reason
 
     _sync()
     if name not in _PLM_POLICIES:
-        # Docstring promises ALL refusals are a gentle note + return None (no
-        # raise) — the _duplicate/_class_duplicate proxy wrappers rely on it.
-        _policy_note(f"duplicate: {name!r} is not a registered policy")
-        return None
+        # All refusals are a falsy PolicyResult + note (no raise) — the
+        # _duplicate/_class_duplicate proxy wrappers + callers rely on it.
+        return _fail(PolicyOp.NOT_FOUND, f"duplicate: {name!r} is not a registered policy")
     if name in _SEALED_POLICIES:
-        _policy_note(
-            f"{name!r} is sealed (immutable + un-duplicable); cannot duplicate"
-        )
-        return None
+        return _fail(PolicyOp.IMMUTABLE,
+                     f"{name!r} is sealed (immutable + un-duplicable); cannot duplicate")
     # Pre-check the SAME name rule `@policy` enforces, so a name it would later
     # reject (reserved / __ / _repl / _REPL prefix / kernel-internal) is refused
     # here with a gentle note instead of blowing up with a raw ValueError deep in
     # the install path below.
     reason = _reserved_name_reason(new_name)
     if reason is not None:
-        _policy_note(f"duplicate: {reason}")
-        return None
+        return _fail(PolicyOp.NAME_INVALID, f"duplicate: {reason}")
     if new_name in _PLM_POLICIES or new_name in _main():
-        _policy_note(
-            f"duplicate: {new_name!r} is already taken"
-        )
-        return None
+        return _fail(PolicyOp.NAME_TAKEN, f"duplicate: {new_name!r} is already taken")
     new_src = _compute_rename(_PLM_POLICIES[name]._p_source, new_name)
     _install_policy_source("@policy\n" + new_src, "<policy-dup-" + new_name + ">")
     return _PLM_POLICIES.get(new_name)                 # fresh → MUTABLE
