@@ -6,7 +6,7 @@ Layout (per the plan):
     the LLM-policy bodies; owns `_make_backend()`, the depth ContextVar +
     `llm_call`/`descend`/`check_depth_or_raise`/`LLMDepthExceeded`, and the
     blessed-caller gate (`_BLESSED_CALLERS` / `_check_blessed_caller`).
-  * `natural_llm.py`, `react_llm.py`, `react_llm_verifier.py` — the immutable
+  * `natural_llm.py`, `react_llm.py`, `react_verifier_llm.py` — the immutable
     LLM-loop policy source files, and `base_verifier.py` — a MUTABLE +
     DUPLICABLE reference verifier. All are read as TEXT by
     `iter_default_policies` and replayed as synthetic cells via the bootstrap
@@ -66,7 +66,7 @@ def iter_default_policies():
 # which also contains a metaparam's sealed extras — those are sealed but NOT blessed.
 # NOTE: `base_verifier` ships as a default file too but is intentionally ABSENT here —
 # that keeps it mutable + duplicable + unblessed (a PLM-forkable reference verifier).
-_LLM_DEFAULT_POLICIES = frozenset({"natural_llm", "react_llm", "react_llm_verifier"})
+_LLM_DEFAULT_POLICIES = frozenset({"natural_llm", "react_llm", "react_verifier_llm"})
 
 
 def _bless_llm_callers() -> None:

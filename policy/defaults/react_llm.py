@@ -57,6 +57,12 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     Parameters:
 
         messages: str / dict / list of message dicts. Initial conversation.
+            MESSAGE WEAVING — if you pass a LIST, react_llm works on THAT SAME
+            list by reference: the assistant/tool turns it runs are appended to
+            YOUR list, so after the call you (or another policy you hand the list
+            to) can read the full woven conversation. Your original message dicts
+            are never mutated — only new turns are added. (A str / single dict has
+            no caller list to weave into, so a fresh one is built.)
 
         args=()   : tuple of positional inputs. Model accesses as `args[i]`.
 
@@ -238,25 +244,25 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     # ---- nested helpers (NOT policies; local to this call) ----
 
     def _norm(m):
-        # DEEP-copy the message dicts so this policy never mutates the CALLER's own
-        # dicts — react_llm appends new turns, and a verifier mutates `msgs` in
-        # place; either way the caller's `messages` must stay untouched.
-        import copy
+        # PASS-BY-REFERENCE (message weaving): when the caller passes a LIST, react_llm works on
+        # THAT SAME list — the turns it appends (and the namespace system-note it inserts) become
+        # visible to the CALLER, so the woven conversation can be handed to another policy (e.g. a
+        # verifier) for inspection. react_llm only APPENDS/inserts new turns (it never mutates the
+        # caller's existing dicts) and backends read messages without mutating them, so the caller's
+        # ORIGINAL dicts stay intact — weaving only ADDS turns. A str / single dict / other iterable
+        # has no caller list to weave into, so a fresh list is built (only a passed LIST is woven).
         if isinstance(m, str):
             return [{"role": "user", "content": m}]
+        if isinstance(m, dict):
+            return [m]                                          # single dict -> wrap (by reference)
+        if isinstance(m, list):
+            return m                                            # the caller's list, BY REFERENCE
         try:
-            _items = [m] if isinstance(m, dict) else list(m)   # TypeError here = not a valid shape
+            return list(m)                                      # other iterable -> materialize (nothing to weave)
         except TypeError:
             raise TypeError(
                 "react_llm: messages must be a str, a message dict, or an iterable of "
                 f"message dicts; got {type(m).__name__}")
-        try:
-            return [copy.deepcopy(x) for x in _items]
-        except Exception as _norm_copy_exc:                     # a message holds an un-copyable value
-            raise TypeError(                                    # (a lock/handle/etc.) -> clear, not generic
-                "react_llm: a message could not be copied ("
-                + type(_norm_copy_exc).__name__ + ": " + str(_norm_copy_exc)
-                + "); messages must be plain JSON-like dicts") from _norm_copy_exc
 
     def _exec(code, ns, round_no):
         """Run the model's code in the sub-agent's OWN repl namespace `ns`.

@@ -723,20 +723,25 @@ def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stu
                for m in round2_msgs)
 
 
-def test_react_deepcopy_caller_messages_not_mutated(defaults_installed, stub_backend):
-    """Batch 4: a verifier mutating `msgs` in place does NOT corrupt the
-    caller's own message dicts — _norm deep-copies the input."""
+def test_react_messages_woven_by_reference(defaults_installed, stub_backend):
+    """Message weaving: react_llm/verifier work on the caller's OWN list (no deep-copy of a passed
+    list), so the turns react_llm appends — and any in-place mutation a verifier makes — are VISIBLE
+    to the caller, who can then hand the woven conversation to another policy for inspection."""
     stub_backend.script = [make_text("thinking"), make_python_call("RETURN('done')")]
     caller_msgs = [{"role": "user", "content": "original"}]
 
     def _mutator(msgs):
         for m in msgs:
             if m.get("content") == "original":
-                m["content"] = "HIJACKED"
+                m["content"] = "MUTATED-BY-VERIFIER"
 
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     assert rlv(caller_msgs, verifier=_mutator) == "done"
-    assert caller_msgs[0]["content"] == "original"     # caller's dict untouched
+    # the caller's list IS the one react_llm wove: it now holds the appended turns ...
+    assert len(caller_msgs) > 1, caller_msgs
+    assert "assistant" in [m.get("role") for m in caller_msgs], caller_msgs
+    # ... and an in-place mutation by the verifier is visible to the caller (that's the capability)
+    assert caller_msgs[0]["content"] == "MUTATED-BY-VERIFIER", caller_msgs[0]
 
 
 def test_react_null_tool_call_id_becomes_empty_string(defaults_installed, stub_backend):
@@ -769,12 +774,12 @@ def test_react_generate_kwargs_reserved_key_clear_error(defaults_installed, stub
     assert stub_backend.calls == []                                # raised before any generate()
 
 
-def test_react_llm_verifier_depth1_with_verifier_hard_errors(defaults_installed, stub_backend):
+def test_react_verifier_llm_depth1_with_verifier_hard_errors(defaults_installed, stub_backend):
     """Batch 6: a verifier needs depth >= 2 (it runs one level below + composes
-    depth-1 circuits). react_llm_verifier(..., verifier=..., depth=1) raises a clear
+    depth-1 circuits). react_verifier_llm(..., verifier=..., depth=1) raises a clear
     LLMDepthExceeded UP FRONT (no backend call) instead of crashing mid-loop. Without a
     verifier, depth=1 is fine."""
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     stub_backend.script = [make_python_call("RETURN('x')")]
     with pytest.raises(_llm_infra.LLMDepthExceeded):
         rlv("go", verifier=lambda m: None, depth=1)        # raised before any generate()
@@ -1584,7 +1589,7 @@ def test_parallel_collect_all_and_guards():
         asyncio.run(_inside())
 
 
-# ===================== Section: react_llm_verifier =========================
+# ===================== Section: react_verifier_llm =========================
 # The trajectory control axis: react_llm + an optional `verifier` callable run
 # after each NON-terminal round (wrapped in descend()), mutating msgs in place.
 
@@ -1599,7 +1604,7 @@ def test_rlv_verifier_runs_between_rounds(defaults_installed, stub_backend):
         msgs.append({"role": "user", "content": "SENTINEL_INJECT"})
 
     stub_backend.script = [make_text("thinking"), make_python_call("RETURN(1)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     out = rlv("go", verifier=vf)
     assert out == 1
     # Only the round-0 (text-only, non-terminal) round triggers the verifier;
@@ -1614,7 +1619,7 @@ def test_rlv_verifier_not_called_on_terminal_round(defaults_installed, stub_back
     """A successful RETURN short-circuits — the verifier never runs on it."""
     calls_n = []
     stub_backend.script = [make_python_call("RETURN(1)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     out = rlv("go", verifier=lambda msgs: calls_n.append(1))
     assert out == 1
     assert calls_n == []
@@ -1631,7 +1636,7 @@ def test_rlv_verifier_runs_after_tool_rounds(defaults_installed, stub_backend):
                 seen_tool.append(m.get("content") or "")
 
     stub_backend.script = [make_python_call("print('XYZ')"), make_python_call("RETURN(2)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     out = rlv("go", verifier=vf)
     assert out == 2
     assert any("XYZ" in c for c in seen_tool)
@@ -1640,7 +1645,7 @@ def test_rlv_verifier_runs_after_tool_rounds(defaults_installed, stub_backend):
 def test_rlv_verifier_none_is_react_llm_parity(defaults_installed, stub_backend):
     """verifier=None ⇒ behaves like react_llm (terminates on RETURN)."""
     stub_backend.script = [make_python_call("RETURN(42)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     assert rlv("go", verifier=None) == 42
 
 
@@ -1648,33 +1653,33 @@ def test_rlv_accepts_policy_as_verifier(defaults_installed, stub_backend):
     """A POLICY (base_verifier) is accepted as the verifier and is callable
     via its proxy. Here its gate finds no error trigger → no-op, no inner LLM."""
     stub_backend.script = [make_text("hello"), make_python_call("RETURN(9)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     bv = _PLM_POLICIES["base_verifier"]
     assert rlv("go", verifier=bv) == 9
 
 
 def test_rlv_verifier_runs_one_level_below(defaults_installed, stub_backend):
-    """The descend() wrap puts the verifier ONE level below react_llm_verifier:
+    """The descend() wrap puts the verifier ONE level below react_verifier_llm:
     at AGENT_DEPTH=2 the verifier sees remaining==1, so any circuit it spawns is
     capped at depth-1."""
     seen = []
     stub_backend.script = [make_text("t"), make_python_call("RETURN(1)")]
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     out = rlv("go", verifier=lambda msgs: seen.append(_llm_infra._remaining()))
     assert out == 1
     assert seen == [1]                          # root 2 − 1 (verifier's own descend)
 
 
 def test_rlv_immutable_unduplicable_blessed(defaults_installed, stub_backend):
-    """react_llm_verifier is sealed immutable + un-duplicable, and its body is
+    """react_verifier_llm is sealed immutable + un-duplicable, and its body is
     blessed (a scripted call runs the descend()/llm_call gated helpers)."""
-    rlv = _PLM_POLICIES["react_llm_verifier"]
-    assert "react_llm_verifier" in _SEALED_POLICIES          # sealed = immutable + un-duplicable
-    assert "react_llm_verifier" in _LLM_DEFAULT_POLICIES     # AND blessed (an LLM-loop default)
+    rlv = _PLM_POLICIES["react_verifier_llm"]
+    assert "react_verifier_llm" in _SEALED_POLICIES          # sealed = immutable + un-duplicable
+    assert "react_verifier_llm" in _LLM_DEFAULT_POLICIES     # AND blessed (an LLM-loop default)
     v0 = rlv._p_version
-    rewrite_policy("react_llm_verifier", "def react_llm_verifier(messages):\n    return 'evil'\n")
+    rewrite_policy("react_verifier_llm", "def react_verifier_llm(messages):\n    return 'evil'\n")
     assert rlv._p_version == v0                 # immutable → rewrite no-ops
-    assert not duplicate_policy("react_llm_verifier", "rlv_copy")
+    assert not duplicate_policy("react_verifier_llm", "rlv_copy")
     stub_backend.script = [make_python_call("RETURN(123)")]
     assert rlv("go") == 123                      # blessed: gated helpers run
 
@@ -1735,11 +1740,11 @@ def test_base_verifier_gate_trigger_runs_circuit(defaults_installed, stub_backen
     assert msgs == before
 
 
-def test_base_verifier_integration_via_react_llm_verifier(defaults_installed, stub_backend):
-    """End-to-end: react_llm_verifier(verifier=base_verifier). Round 0 errors →
+def test_base_verifier_integration_via_react_verifier_llm(defaults_installed, stub_backend):
+    """End-to-end: react_verifier_llm(verifier=base_verifier). Round 0 errors →
     base_verifier's gate fires → its depth-1 circuit returns a note that is
     injected into the OUTER trajectory and seen by the next outer generate."""
-    rlv = _PLM_POLICIES["react_llm_verifier"]
+    rlv = _PLM_POLICIES["react_verifier_llm"]
     bv = _PLM_POLICIES["base_verifier"]
     stub_backend.script = [
         make_python_call("1/0"),                        # outer round 0 → traceback in tool msg
@@ -2417,3 +2422,19 @@ def test_b2_multi_tool_call_nudge_on_malformed_first(defaults_installed, stub_ba
     assert out == "ok"
     seen = " ".join((m.get("content") or "") for m in stub_backend.calls[-1]["messages"])
     assert "you emitted 2 tool_calls" in seen and "malformed tool_call" in seen, seen
+
+
+def test_react_llm_message_weaving_caller_sees_conversation(defaults_installed, stub_backend):
+    """The headline message-weaving use case: pass react_llm a LIST and, after it returns, the
+    caller's SAME list holds the full woven conversation (its assistant + tool turns) — ready to
+    hand to another agent/policy for inspection. A str input (no caller list) is NOT woven."""
+    rl = _PLM_POLICIES["react_llm"]
+    stub_backend.script = [make_python_call("print('working'); RETURN('answer')")]
+    convo = [{"role": "user", "content": "do the task"}]
+    assert rl(convo) == "answer"
+    roles = [m.get("role") for m in convo]
+    assert roles[0] == "user" and "assistant" in roles and "tool" in roles, convo  # woven in place
+    assert convo[0]["content"] == "do the task"                 # the caller's ORIGINAL dict is intact
+    # a str input has no caller list to weave into (builds a fresh one) — nothing leaks back
+    stub_backend.script = [make_python_call("RETURN('ok')")]
+    assert rl("just a string") == "ok"

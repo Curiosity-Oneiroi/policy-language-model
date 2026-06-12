@@ -1,5 +1,5 @@
 @policy
-def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
+def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
                        constraint=None, max_turns=8, return_budget=5, depth=None,
                        generate_kwargs=None, verifier=None):
     """ReAct sub-agent (model + python tool, same REPL) + a per-round VERIFIER
@@ -23,21 +23,21 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     Quick examples:
 
         # Simple — model writes code, calls RETURN:
-        answer = react_llm_verifier("Compute 7! using python")
+        answer = react_verifier_llm("Compute 7! using python")
         # -> 5040  (whatever the model passed to RETURN)
 
         # Attach a per-round verifier (the trajectory control axis). The
         # verifier sees the live messages after each non-terminal round and
         # mutates them in place. PREFER a verifier POLICY (forkable/editable):
-        react_llm_verifier("solve X step by step", verifier=base_verifier)
+        react_verifier_llm("solve X step by step", verifier=base_verifier)
         # or fork + specialize it:
         #   duplicate_policy("base_verifier", "my_verifier")
         #   my_verifier._edit(...)            # tailor the prompts / gate / checks
-        #   react_llm_verifier("solve X", verifier=my_verifier)
+        #   react_verifier_llm("solve X", verifier=my_verifier)
 
         # Pass named data; the model uses each kwarg key as a DIRECT
         # local name (no `kwargs["a"]` subscripting needed):
-        result = react_llm_verifier(
+        result = react_verifier_llm(
             "Add the two numbers and RETURN the sum",
             kwargs={"a": 3, "b": 5},
         )
@@ -45,7 +45,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
 
         # Grant policy-authoring (the @policy decorator) by name:
         from plm.policy import policy
-        result = react_llm_verifier(
+        result = react_verifier_llm(
             "Author a doubler policy named `doubler` and use it on input.",
             kwargs={"policy": policy, "input": 7},
         )
@@ -55,7 +55,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
         #   RETURN(doubler(input))   -> 14
 
         # Grant nested-LLM access:
-        result = react_llm_verifier(
+        result = react_verifier_llm(
             "Decompose into a sub-question and call natural_llm on it.",
             kwargs={"natural_llm": natural_llm},
         )
@@ -66,15 +66,22 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
         # the tool result and the loop continues):
         class Answer(Constraint):
             value: int
-        result = react_llm_verifier("Compute fact(7)", constraint=Answer)
+        result = react_verifier_llm("Compute fact(7)", constraint=Answer)
         # Model writes: `RETURN({"value": 5040})` -> Answer(value=5040)
 
         # Voluntarily lower the depth budget for this sub-task:
-        react_llm_verifier(msg, depth=1)
+        react_verifier_llm(msg, depth=1)
 
     Parameters:
 
         messages: str / dict / list of message dicts. Initial conversation.
+            MESSAGE WEAVING — if you pass a LIST, this policy works on THAT SAME
+            list by reference: the assistant/tool turns are appended to YOUR list,
+            AND the per-round `verifier` hook operates on it too — so any trajectory
+            control it does (append, EDIT existing turns, prune, rewrite) is visible
+            to the caller. Unlike plain react_llm, your existing turns CAN change
+            here — that is the verifier's purpose. (A str / single dict has no caller
+            list to weave into, so a fresh one is built.)
 
         args=()   : tuple of positional inputs. Model accesses as `args[i]`.
 
@@ -180,7 +187,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     The verifier hook (trajectory control axis):
 
         `react_llm` exposes the input (messages) and output (constraint)
-        axes; `react_llm_verifier` adds the TRAJECTORY axis. After each
+        axes; `react_verifier_llm` adds the TRAJECTORY axis. After each
         non-terminal round the verifier reads/edits the running `msgs`, and
         the (possibly changed) trajectory drives the next generate. This is
         how PLM steers a sub-agent mid-run: inject doubt, force an
@@ -275,13 +282,13 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     for _k in kwargs:
         if not isinstance(_k, str):
             raise TypeError(
-                f"react_llm_verifier: kwargs keys must be strings, got "
+                f"react_verifier_llm: kwargs keys must be strings, got "
                 f"{type(_k).__name__} ({_k!r})."
             )
     _bad_reserved = _RESERVED_KWARG_NAMES & set(kwargs)
     if _bad_reserved:
         raise ValueError(
-            f"react_llm_verifier: kwargs keys {sorted(_bad_reserved)} are reserved — "
+            f"react_verifier_llm: kwargs keys {sorted(_bad_reserved)} are reserved — "
             f"they would shadow the ambient termination primitive (`RETURN`) "
             f"or `__builtins__` in the model's exec scope. Rename them."
         )
@@ -295,25 +302,26 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     # ---- nested helpers (NOT policies; local to this call) ----
 
     def _norm(m):
-        # DEEP-copy the message dicts so this policy never mutates the CALLER's own
-        # dicts — react_llm appends new turns, and a verifier mutates `msgs` in
-        # place; either way the caller's `messages` must stay untouched.
-        import copy
+        # PASS-BY-REFERENCE (message weaving): when the caller passes a LIST, the verifier loop works
+        # on THAT SAME list — the turns it appends become visible to the CALLER, so the woven
+        # conversation can be handed to another policy for inspection. UNLIKE plain react_llm (which
+        # only appends), the per-round `verifier` hook runs on this same list and MAY manipulate the
+        # trajectory IN PLACE — append, EDIT existing turns, prune, rewrite — that is its purpose, and
+        # by-reference makes those edits visible to the caller (a feature, not a leak). So the caller's
+        # existing dicts MAY change here. A str / single dict / other iterable has no caller list to
+        # weave into, so a fresh list is built (only a passed LIST is woven).
         if isinstance(m, str):
             return [{"role": "user", "content": m}]
+        if isinstance(m, dict):
+            return [m]                                          # single dict -> wrap (by reference)
+        if isinstance(m, list):
+            return m                                            # the caller's list, BY REFERENCE
         try:
-            _items = [m] if isinstance(m, dict) else list(m)   # TypeError here = not a valid shape
+            return list(m)                                      # other iterable -> materialize (nothing to weave)
         except TypeError:
             raise TypeError(
-                "react_llm_verifier: messages must be a str, a message dict, or an iterable of "
+                "react_verifier_llm: messages must be a str, a message dict, or an iterable of "
                 f"message dicts; got {type(m).__name__}")
-        try:
-            return [copy.deepcopy(x) for x in _items]
-        except Exception as _norm_copy_exc:                     # a message holds an un-copyable value
-            raise TypeError(                                    # (a lock/handle/etc.) -> clear, not generic
-                "react_llm_verifier: a message could not be copied ("
-                + type(_norm_copy_exc).__name__ + ": " + str(_norm_copy_exc)
-                + "); messages must be plain JSON-like dicts") from _norm_copy_exc
 
     def _exec(code, ns, round_no):
         """Run the model's code in the sub-agent's OWN repl namespace `ns`.
@@ -415,9 +423,9 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     # `parallel`, `natural_llm`, `react_llm`, or the root agent's variables. Its
     # world is only its own repl. Every other capability must be a DELIBERATE
     # grant from PLM via the args/kwargs/objects channels, e.g.:
-    #     react_llm_verifier(msg, kwargs={"policy": policy})            # grant policy-authoring
-    #     react_llm_verifier(msg, kwargs={"natural_llm": natural_llm})  # grant a sub-LLM
-    #     react_llm_verifier(msg, kwargs={"call": some_user_policy})    # grant a specific tool
+    #     react_verifier_llm(msg, kwargs={"policy": policy})            # grant policy-authoring
+    #     react_verifier_llm(msg, kwargs={"natural_llm": natural_llm})  # grant a sub-LLM
+    #     react_verifier_llm(msg, kwargs={"call": some_user_policy})    # grant a specific tool
     # so the sub-LLM's capability surface is entirely engineered by PLM.
     #
     # Seeding order: builtins + RETURN (base), then kwargs splat as direct names,
@@ -458,7 +466,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             # FRONT with a clear error rather than crashing mid-loop when the verifier
             # hook's descend() hits 0. (D2 — depth=1 + verifier is unsupported.)
             raise LLMDepthExceeded(
-                f"react_llm_verifier: a verifier needs depth >= 2 (it runs one level "
+                f"react_verifier_llm: a verifier needs depth >= 2 (it runs one level "
                 f"below and composes depth-1 circuits), but only {_remaining()} level(s) "
                 f"remain. Call without a verifier, or raise the depth / AGENT_DEPTH.")
         backend = _make_backend()
@@ -490,7 +498,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                 # to EVERY branch below (malformed / non-python / bad-code / exec), so it is NOT lost
                 # on a branch that resolves before the exec (B2). Sub-agent's OWN stream, not PLM's.
                 _parallel_note = (
-                    "[react_llm_verifier] you emitted " + str(len(tool_calls)) + " tool_calls; only "
+                    "[react_verifier_llm] you emitted " + str(len(tool_calls)) + " tool_calls; only "
                     "the FIRST ran — send ONE `python` call per turn.\n\n") if len(tool_calls) > 1 else ""
                 if not isinstance(tc, dict):
                     # Malformed tool_call (str/int/None): the assistant turn stored tool_calls=None
@@ -506,7 +514,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                     _fn = _fn if isinstance(_fn, dict) else {}   # `function: null` / malformed -> {}
                     tname = _fn.get("name")
                     if tname != "python":
-                        # react_llm_verifier only offers the python tool. A backend that calls
+                        # react_verifier_llm only offers the python tool. A backend that calls
                         # anything else gets a clear error back (its id IS answered, so history
                         # stays well-formed) — but DON'T `continue`: this is a non-terminal
                         # round, so it must fall through to the verifier hook below. Mirrors the
@@ -560,7 +568,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             # round's messages are complete, BEFORE the next generate. A successful
             # RETURN above already returned, so the verifier never runs on the
             # terminal round. Wrapped in `descend()` so the depth guard accounts the
-            # verifier ONE level below react_llm_verifier — any react_llm/natural_llm
+            # verifier ONE level below react_verifier_llm — any react_llm/natural_llm
             # circuit it builds is then capped at depth-1 (root=2) and respects the
             # global budget. The verifier mutates `msgs` in place; its return value
             # is ignored. Exceptions propagate (fail-loud; the verifier is trusted).
@@ -571,12 +579,12 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
         # --- budget exhausted: model never produced an accepted RETURN(value) ---
         if constraint is None:
             raise RuntimeError(
-                "react_llm_verifier: budget exhausted; model never called RETURN(value). "
-                "react_llm_verifier terminates only on RETURN(value); text-only assistant "
+                "react_verifier_llm: budget exhausted; model never called RETURN(value). "
+                "react_verifier_llm terminates only on RETURN(value); text-only assistant "
                 "turns are not finalizations.")
         
         raise ConstraintViolation(
-            "react_llm_verifier: budget exhausted; model never produced a RETURN(value) "
+            "react_verifier_llm: budget exhausted; model never produced a RETURN(value) "
             "that satisfied the constraint. Each rejected attempt's violation "
             "was returned to the model via the tool result; see the conversation "
             "history for details.")

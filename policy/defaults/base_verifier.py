@@ -4,7 +4,7 @@ def base_verifier(messages):
 
     A verifier is, fundamentally, just a function that takes the running
     `messages` list and MUTATES IT IN PLACE. It can be plain Python, an LLM, or
-    a mix — that choice is yours. `react_llm_verifier` calls a verifier after
+    a mix — that choice is yours. `react_verifier_llm` calls a verifier after
     every non-terminal round (each call wrapped in its own `descend()`), and the
     (possibly edited) trajectory drives the next model turn. This is the THIRD
     control axis over a sub-agent — input (messages), output (Constraint), and
@@ -16,10 +16,10 @@ def base_verifier(messages):
     correction, or steer the next round — adding a turn is just the simplest case.
 
     THIS is the base/reference, and it is MUTABLE + DUPLICABLE (unlike
-    natural_llm / react_llm / react_llm_verifier, which are sealed). Recommended:
+    natural_llm / react_llm / react_verifier_llm, which are sealed). Recommended:
         duplicate_policy("base_verifier", "my_verifier") or my_verifier = base_verifier.duplicate()
         my_verifier._edit(...)            # specialize prompts / gate / checks
-        react_llm_verifier(task, verifier=my_verifier)
+        react_verifier_llm(task, verifier=my_verifier)
     Editing the base in place is allowed but discouraged (it is the shared base).
 
     Contract:
@@ -55,7 +55,7 @@ def base_verifier(messages):
         it and verify every round. Keep any gate LIGHT.
       * one or more `_verify_*(messages)` — the actual verification(s). EACH IS
         ITSELF A VERIFICATION POLICY: ordinary Python that may compose any
-        combination of depth-1 `react_llm` / `natural_llm` / 'react_llm_verifier'
+        combination of depth-1 `react_llm` / `natural_llm` / 'react_verifier_llm'
         circuits AND/OR plain code — or no LLM at all — exactly like any policy.
         The DEPTH-1 limit is on the NESTING of each LLM call, NOT on how many you make or how much
         code you run: one check can fan out several depth-1 circuits, run Python
@@ -67,10 +67,10 @@ def base_verifier(messages):
     hypothesis/claim, an assumption, a tool result, output format... anything.
 
     Depth (HARD LIMIT, for now): each LLM CALL must stay DEPTH-1 — use only
-    `natural_llm` or `react_llm` or `react_llm_verifier`, and pass `depth=1`. This caps the NESTING of a
+    `natural_llm` or `react_llm` or `react_verifier_llm`, and pass `depth=1`. This caps the NESTING of a
     call, not the verification: you may still make as many depth-1 calls and run
     as much Python as you like — the verification is a full policy. Via
-    `react_llm_verifier` the `descend()` wrap already caps you at depth-1 (root=2);
+    `react_verifier_llm` the `descend()` wrap already caps you at depth-1 (root=2);
     `depth=1` keeps it true when `base_verifier` is called standalone. You cannot
     reach the raw model primitives here in any case: the blessed-caller gate in
     `_llm_infra` (`_make_backend` / `descend` / `llm_call` each check the caller's
@@ -86,7 +86,7 @@ def base_verifier(messages):
     def _should_run(messages):
         """Return True to run verification this round, False to no-op.
 
-        react_llm_verifier calls the verifier EVERY non-terminal round, so gate
+        react_verifier_llm calls the verifier EVERY non-terminal round, so gate
         it — verifying every round is wasteful.
 
         Like `_verify_*`, the gate is ITSELF A POLICY: it can be plain code, an
@@ -123,7 +123,7 @@ def base_verifier(messages):
 
     # ===== VERIFICATION(S): each is its own function; you can run several =====
     # Each `_verify_*` is itself a VERIFICATION POLICY: it may combine several
-    # depth-1 react_llm / natural_llm / react_llm_verifier calls/circuits with arbitrary Python — or use no LLM
+    # depth-1 react_llm / natural_llm / react_verifier_llm calls/circuits with arbitrary Python — or use no LLM
     # at all — just like any policy. depth-1 caps each LLM call's nesting, not the
     # orchestration. The system + user prompts below are GENERIC placeholders and
     # are the KNOB you turn: a verifier "system instruction" can be many things —

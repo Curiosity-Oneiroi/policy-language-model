@@ -98,6 +98,8 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
             return [{"role": "user", "content": m}]
         if isinstance(m, dict):
             return [m]
+        if isinstance(m, list):                            # pass-by-reference (message weaving):
+            return m                                       # work on the caller's OWN list
         try:
             return list(m)
         except TypeError:                                  # None / int / ... -> clear error

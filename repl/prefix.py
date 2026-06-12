@@ -388,7 +388,7 @@ for _repl_pn, _repl_ps in _repl_sealed_extras.items():
     _repl_sealed_extra_names.extend(_repl_new_names)
 
 # Seal the LLM-loop defaults (_LLM_DEFAULT_POLICIES — natural_llm / react_llm /
-# react_llm_verifier) AND the user sealed extras: `_seal` sets the intrinsic
+# react_verifier_llm) AND the user sealed extras: `_seal` sets the intrinsic
 # `_p_immutable` flag on each object AND records the name in `_SEALED_POLICIES`
 # (the one seal set). Other defaults (e.g. the mutable base_verifier) and the
 # mutable extras stay mutable + duplicable.

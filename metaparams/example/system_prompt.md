@@ -8,5 +8,5 @@ folder's `policies/` directory:
   defaults.
 - `editable_helper` — NORMAL (mutable + duplicable): you may rewrite/extend/fork it.
 
-Use `natural_llm` / `react_llm` / `react_llm_verifier` as usual; author your own
+Use `natural_llm` / `react_llm` / `react_verifier_llm` as usual; author your own
 policies with `@policy`.

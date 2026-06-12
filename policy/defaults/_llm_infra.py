@@ -62,7 +62,7 @@ def _check_blessed_caller(name: str) -> None:
     if caller_code not in _BLESSED_CALLERS:
         raise RuntimeError(
             f"_llm_infra.{name}: callable ONLY from inside the sanctioned LLM "
-            f"policies (natural_llm / react_llm / react_llm_verifier). To call "
+            f"policies (natural_llm / react_llm / react_verifier_llm). To call "
             f"the model, use those policies; do not author your own LLM primitive."
         )
 
@@ -107,8 +107,8 @@ def check_depth_or_raise() -> None:
 
 def descend():
     """Decrement the LLM-depth budget for the dynamic extent of the agent's
-    act phase. Used by react_llm and react_llm_verifier around their act-phase
-    code execution — and, in react_llm_verifier, around the per-round verifier
+    act phase. Used by react_llm and react_verifier_llm around their act-phase
+    code execution — and, in react_verifier_llm, around the per-round verifier
     hook, so a verifier's react_llm/natural_llm circuits are accounted depth-1.
     natural_llm is single-shot (no act phase) and does
     NOT descend — it only checks before its generate calls.
