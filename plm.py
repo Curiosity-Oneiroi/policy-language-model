@@ -291,7 +291,12 @@ class PLM:
                     cumulative_prompt_tokens=cpt if cpt > 0 else None,
                     **clean_generate_kwargs,
                 )
-                
+                if not isinstance(response, dict):        # non-conformant backend (None / list / ...):
+                    response = {}                          # degrade to an empty turn, never a raw crash.
+                # ONE normalization at the top of the turn makes EVERYTHING below — _track_model_call,
+                # .get("content"/"reasoning"/"tool_calls") — safe by construction, so a malformed
+                # backend response can't escape PLM.__call__ as an AttributeError. Mirrors react_llm.
+
                 _track_model_call(response, call_start, metrics, token_state)
 
                 content = response.get("content", "") or ""

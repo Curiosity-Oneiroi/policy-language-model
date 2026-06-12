@@ -27,7 +27,7 @@ from .registry import (
     rewrite_policy,
 )
 from .guard import _audit_cell, _post_cell_guard
-from .proxy import _FunctionPolicy, _policy_note, PolicyStructuralFallbackWarning
+from .proxy import _FunctionPolicy, _policy_note
 
 __all__ = [
     # the decorator + the by-name helpers PLM calls from cells
@@ -41,5 +41,5 @@ __all__ = [
     # Phase 2: shared replay helper + immutability set (bootstrap loader uses these)
     "_install_policy_source", "_SEALED_POLICIES",
     # useful for tests / introspection
-    "_FunctionPolicy", "_policy_note", "PolicyStructuralFallbackWarning",
+    "_FunctionPolicy", "_policy_note",
 ]

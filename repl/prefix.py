@@ -55,7 +55,7 @@ from plm.policy import (
     duplicate_policy,
     _PLM_POLICIES, _audit_cell, _post_cell_guard,
 )
-from plm.repl.parallel import parallel
+from plm.repl.parallel import parallel, with_edit, ParallelMutationError   # with_edit -> a parallel() branch's edit-grant
 from plm.repl.exec_ns import exec_ns       # shared code-runner (verifiers / code-as-data)
 # Kernel-internal state (snapshot blocklist, Guard C+ canon, buffer reset) lives in an
 # importable side module the KERNEL_LOOP guards RE-IMPORT each cell, so a cell rebinding the
@@ -101,8 +101,16 @@ _sys.setrecursionlimit(20000)
 
 _repl_stdout_buf = _io.StringIO()
 _repl_stderr_buf = _io.StringIO()
-_sys.stdout = _repl_stdout_buf
-_sys.stderr = _repl_stderr_buf
+# stdout/stderr become ONE routing proxy (installed once); the real target buffer lives in a
+# ContextVar, so a parallel() branch's exec_ns captures only its OWN writes (no process-global
+# stream swap to cross-contaminate). `_repl_`-prefixed -> snapshot-skipped. (see plm._branch_state)
+from plm._branch_state import (
+    _OUT_PROXY as _repl_out_proxy, _ERR_PROXY as _repl_err_proxy,
+    set_main_streams as _repl_set_main_streams,
+)
+_sys.stdout = _repl_out_proxy
+_sys.stderr = _repl_err_proxy
+_repl_set_main_streams(_repl_stdout_buf, _repl_stderr_buf)
 
 
 def _repl_excepthook(_exc_type, _exc_val, _exc_tb):
@@ -174,8 +182,8 @@ def _repl_collect_vars():
             continue
         try:
             _probe = _dill.dumps(_v)
-        except Exception:
-            continue
+        except BaseException:                              # BaseException (not just Exception): even a
+            continue                                       # late SIGINT must NOT make collect_vars escape
         if _builtins.len(_probe) > _REPL_VAR_SIZE_MAX:
             continue
         _snap[_k] = _v
@@ -198,8 +206,8 @@ def _repl_collect_vars():
         try:
             _dill.dumps(_pol)
             _reg[_pn] = _pol
-        except Exception:
-            _src = _builtins.getattr(_pol, "_p_source", None)
+        except BaseException:                              # BaseException: a late SIGINT here falls
+            _src = _builtins.getattr(_pol, "_p_source", None)   # back to source, never escapes
             if _builtins.isinstance(_src, str):
                 _pol_sources[_pn] = _src
     _snap["_PLM_POLICIES"] = _reg
@@ -211,8 +219,8 @@ def _repl_collect_vars():
         _snap["_CONSTRAINT_DROPPED"] = _constraint_dropped     # surfaced by the rehydrate note
     try:
         return _dill.dumps(_snap)
-    except Exception:
-        return b""
+    except BaseException:                                  # BaseException: the final blob dump must
+        return b""                                         # return b"" (parent keeps last-good), never escape
 
 
 def _rebuild_linecache_from_policies():

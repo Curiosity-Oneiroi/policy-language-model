@@ -2845,3 +2845,66 @@ def test_is_instance_of_is_strict_no_coercion():
     with pytest.raises(Exception):                    # old name removed
         of(instance_of=int)
     assert "strictly an instance of int" in of(is_instance_of=int).describe()
+
+
+def test_d1_composite_as_direct_struct_field():
+    """D1: a composite (`A | B`, `&`, `^`, `~`) used as a DIRECT struct-field annotation must
+    validate the field value through the composite's own `.validate()` — NOT against an empty-fields
+    model (which rejected EVERY scalar and accepted garbage), and must `describe()` the OR/AND tree
+    rather than leak the mangled internal class name. Fixed via the composite's
+    `__get_pydantic_core_schema__` hook + a composite branch in `_struct_body`."""
+    A = Constraint.field(int_ge=0)
+    B = Constraint.field(str_pattern="^x")
+
+    class S(Constraint):
+        v: A | B
+
+    # correct OR semantics on the field value
+    assert S.validate({"v": 5}) is not None              # int >= 0 -> A
+    assert S.validate({"v": "xyz"}) is not None           # matches ^x -> B
+    for bad in ({"v": -1}, {"v": "nope"}):
+        with pytest.raises(Exception):
+            S.validate(bad)
+
+    # describe renders the tree, not `_OrConstraint__...`
+    d = S.describe()
+    assert "OR" in d and "_OrConstraint" not in d and "_FieldConstraint" not in d, d
+    # json-schema generation over a composite field must not crash
+    S.model_json_schema()
+
+    # structural children as a direct field work too (accept either shape, reject garbage)
+    class P(Constraint):
+        x: int
+
+    class Q(Constraint):
+        y: str
+
+    class T(Constraint):
+        obj: P | Q
+
+    assert T.validate({"obj": {"x": 1}}) is not None
+    assert T.validate({"obj": {"y": "hi"}}) is not None
+    with pytest.raises(Exception):
+        T.validate({"obj": {"z": 9}})
+    assert "_OrConstraint" not in T.describe()
+
+    # top-level composite use is unaffected
+    assert (A | B).validate(5) == 5
+
+
+def test_algebra_rejects_non_constraint_operands():
+    """Constraints have NO nullable/Optional: a field always satisfies its constraint. So a bare
+    non-Constraint operand to the algebra (`A | None`, `A & 5`, `A ^ "x"`) — a model's likely way of
+    fumbling 'optional' — must FAIL LOUD at composition, not silently build a dead 'branch' that
+    quietly rejects everything (a D1-class trap). Legitimate Constraint-only algebra is unaffected."""
+    A = Constraint.field(int_ge=0)
+    B = Constraint.field(str_pattern="^x")
+    for bad in (lambda: A | None, lambda: None | A, lambda: A & 5, lambda: A ^ "x", lambda: A & None):
+        with pytest.raises(TypeError, match="combines Constraints"):
+            bad()
+    # constraint-only algebra still composes
+    assert (A | B).validate(5) == 5
+    assert (A | B).validate("xyz") == "xyz"
+    assert (A & Constraint.field(int_le=10)).validate(5) == 5
+    assert (A ^ B).validate(5) == 5
+    assert (~A).validate("not-an-int") == "not-an-int"

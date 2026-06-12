@@ -51,9 +51,12 @@ import types
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from plm._branch_state import _edit_guard, _no_branch_mutation, _rename_guard
+
 from .edits import (
     PolicyOp,
     PolicyResult,
+    PolicyValueResult,
     _compute_delete,
     _compute_edit,
     _compute_insert,
@@ -74,13 +77,117 @@ def _policy_note(msg: str) -> None:
     sys.stderr.write(f"[policy] {msg}\n")
 
 
+def _caller_origin(_max: int = 8) -> str:
+    """WHERE a note came from — the model's own call CHAIN that triggered it, as a mini-traceback
+    bounded to THIS LLM's execution. Walk up from the call site collecting model-authored frames
+    (those whose code-object filename is a `<...>` linecache pseudo-name — a `<cell-N>` for the main
+    loop, a `<policy-name>` for a policy body, an `<exec_ns>`/sub-agent slot), then STOP at the first
+    real-file frame above them: that frame is the runner that ENTERED this LLM's execution
+    (`exec_ns` for a sub-LLM, the kernel cell loop for the main PLM). Frames past that boundary
+    belong to a DIFFERENT LLM / plm machinery and must not leak into this note — the same scoping the
+    captured stderr already has, and trivially correct because the kernel is its own process and
+    `_getframe` only walks this thread.
+
+    Returns the chain newest-first (one `    from <file>:<line>  <source>` per line), or `""` when
+    the op wasn't reached from model code (an internal/bootstrap call). This gives a note the
+    provenance a raised exception carries and a bare note loses."""
+    frames = []
+    f = sys._getframe(1)
+    seen_model = False
+    while f is not None and len(frames) < _max:
+        fn = f.f_code.co_filename
+        if fn.startswith("<"):                       # model-authored frame (cell / policy / sub-agent)
+            seen_model = True
+            src = linecache.getline(fn, f.f_lineno).strip()
+            frames.append(f"    from {fn}:{f.f_lineno}" + (f"  {src}" if src else ""))
+        elif seen_model:                             # first real-file frame above the model block =
+            break                                    # the runner (exec_ns / kernel loop) -> boundary
+        f = f.f_back
+    return "\n".join(frames)
+
+
+def _note(detail: str) -> None:
+    """The ENHANCED policy note: `detail` PLUS where it came from (`_caller_origin` — the model's
+    call chain up to this LLM's execution boundary) — so every surfaced note reads like a
+    (scoped) traceback. The single note path for BOTH the result backstop (`_fail`/`_fail_value`,
+    alongside the returned PolicyResult) AND the can't-return ops (del/pop, `@policy` re-decoration,
+    captures-locals), which have no result to carry the location."""
+    origin = _caller_origin()
+    _policy_note(detail + ("\n" + origin if origin else ""))
+
+
+def _ok() -> "PolicyResult":
+    """The success result for an IN-PLACE op (edit/insert/delete/rewrite/remove). No note — only
+    problems are noted; success is silent but still returns a (truthy) result so the caller always
+    gets the same shape."""
+    return PolicyResult(PolicyOp.OK)
+
+
 def _fail(status: "PolicyOp", detail: str) -> "PolicyResult":
-    """Emit the `[policy]` note (the backstop) AND return a descriptive PolicyResult. Returned by the
-    in-place edit/remove methods (whose clean success is None) and `duplicate_policy` (whose clean
-    success is the new policy) ONLY on a problem — so calling code can branch on `r.status`/`r.detail`
-    while an unchecked caller still sees the note. Never returned on a clean success."""
-    _policy_note(detail)
+    """The failure result for an IN-PLACE op: emit the `[policy]` note (the backstop) AND return a
+    descriptive (falsy) PolicyResult, so calling code can branch on `r.status`/`r.detail` while an
+    unchecked caller still sees the note."""
+    _note(detail)
     return PolicyResult(status, detail)
+
+
+def _fail_value(status: "PolicyOp", detail: str) -> "PolicyValueResult":
+    """The failure result for a VALUE op (`duplicate_policy`): note + a falsy PolicyValueResult
+    (value=None). Success is built inline as `PolicyValueResult(PolicyOp.OK, value=<policy>)`."""
+    _note(detail)
+    return PolicyValueResult(status, detail)
+
+
+# --- ONE edit implementation for EVERY policy shape ---------------------------
+#
+# `_FunctionPolicy._edit/_insert/_delete_lines`, the `_class_*` mirrors, AND the
+# by-name `edit_policy`/... helpers all route through these, so the
+# validate -> _compute_* -> BAD_ARGS/NO_MATCH -> propagate-the-rewrite-result
+# contract lives exactly ONCE and the function/class shapes cannot drift again.
+# `rewrite` is the shape's only difference: `ns:str -> PolicyResult|None` — the
+# proxy's bound `_rewrite` for a function policy, `_rewrite_class_policy(cls, .)`
+# for a class policy.
+
+def _do_edit(name, source, rewrite, old, new, replace_all):
+    if not isinstance(old, str) or not isinstance(new, str):
+        return _fail(PolicyOp.BAD_ARGS,
+                     f"{name}._edit: `old`/`new` must be strings (got "
+                     f"{type(old).__name__}/{type(new).__name__}); nothing changed")
+    ns = _compute_edit(source, old, new, replace_all)
+    if ns is None:
+        return _fail(PolicyOp.NO_MATCH,
+                     f"{name}._edit: {old!r} not found in source; nothing changed")
+    return rewrite(ns)
+
+
+def _do_insert(name, source, rewrite, after_line, content):
+    if not isinstance(content, str):
+        return _fail(PolicyOp.BAD_ARGS,
+                     f"{name}._insert: `content` must be a string (got "
+                     f"{type(content).__name__}); nothing changed")
+    if not isinstance(after_line, int) or isinstance(after_line, bool) or after_line < 0:
+        return _fail(PolicyOp.BAD_ARGS,
+                     f"{name}._insert: `after_line` must be a non-negative int (got "
+                     f"{after_line!r}); nothing changed")
+    ns = _compute_insert(source, after_line, content)
+    if ns is None:
+        return _fail(PolicyOp.NO_MATCH,
+                     f"{name}._insert: nothing to insert (empty content); nothing changed")
+    return rewrite(ns)
+
+
+def _do_delete(name, source, rewrite, start, end):
+    if (not isinstance(start, int) or isinstance(start, bool)
+            or (end is not None and (not isinstance(end, int) or isinstance(end, bool)))):
+        return _fail(PolicyOp.BAD_ARGS,
+                     f"{name}._delete_lines: `start`/`end` must be ints (got "
+                     f"{type(start).__name__}/{type(end).__name__}); nothing changed")
+    ns = _compute_delete(source, start, end)
+    if ns is None:
+        return _fail(PolicyOp.NO_MATCH,
+                     f"{name}._delete_lines: lines [{start}, {end}] out of range or no "
+                     f"change; nothing changed")
+    return rewrite(ns)
 
 
 # --- policy-call depth cap (Phase 2) -----------------------------------------
@@ -230,45 +337,18 @@ class _FunctionPolicy:
     # --- edit API (thin wrappers over the shared _compute_* + the _rewrite choke point) ---
 
     def _edit(self, old, new, *, replace_all=False):
-        if not isinstance(old, str) or not isinstance(new, str):
-            return _fail(PolicyOp.BAD_ARGS,
-                         f"{self._p_name}._edit: `old`/`new` must be strings (got "
-                         f"{type(old).__name__}/{type(new).__name__}); nothing changed")
-        ns = _compute_edit(self._p_source, old, new, replace_all)
-        if ns is None:
-            return _fail(PolicyOp.NO_MATCH,
-                         f"{self._p_name}._edit: {old!r} not found in source; nothing changed")
-        return self._rewrite(ns)
+        return _do_edit(self._p_name, self._p_source, self._rewrite, old, new, replace_all)
 
     def _insert(self, after_line, content):
-        if not isinstance(content, str):
-            return _fail(PolicyOp.BAD_ARGS,
-                         f"{self._p_name}._insert: `content` must be a string (got "
-                         f"{type(content).__name__}); nothing changed")
-        if not isinstance(after_line, int) or isinstance(after_line, bool) or after_line < 0:
-            return _fail(PolicyOp.BAD_ARGS,
-                         f"{self._p_name}._insert: `after_line` must be a non-negative int (got "
-                         f"{after_line!r}); nothing changed")
-        ns = _compute_insert(self._p_source, after_line, content)
-        if ns is None:
-            return _fail(PolicyOp.NO_MATCH,
-                         f"{self._p_name}._insert: nothing to insert (empty content); nothing changed")
-        return self._rewrite(ns)
+        return _do_insert(self._p_name, self._p_source, self._rewrite, after_line, content)
 
     def _delete_lines(self, start, end=None):
-        if (not isinstance(start, int) or isinstance(start, bool)
-                or (end is not None and (not isinstance(end, int) or isinstance(end, bool)))):
-            return _fail(PolicyOp.BAD_ARGS,
-                         f"{self._p_name}._delete_lines: `start`/`end` must be ints (got "
-                         f"{type(start).__name__}/{type(end).__name__}); nothing changed")
-        ns = _compute_delete(self._p_source, start, end)
-        if ns is None:
-            return _fail(PolicyOp.NO_MATCH,
-                         f"{self._p_name}._delete_lines: lines [{start}, {end}] out of range or no "
-                         f"change; nothing changed")
-        return self._rewrite(ns)
+        return _do_delete(self._p_name, self._p_source, self._rewrite, start, end)
 
     def _remove(self):
+        # Parallel-branch gate: removal changes the registry MEMBERSHIP (a size change a sibling
+        # iterating the registry could trip on), so it is parent-only — never granted to a branch.
+        _no_branch_mutation("removing a policy")
         # Immutability check: refuse to remove a default policy. Other
         # paths (`del <name>`, `globals().pop(<name>)`) are handled by
         # Guard A (pre-reject) and Guard C (restore canonical), and the registry
@@ -282,14 +362,20 @@ class _FunctionPolicy:
         g.pop(self._p_name, None)
         _PLM_POLICIES.pop(self._p_name, None)
         linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot
+        return _ok()
 
     def _duplicate(self, new_name):
-        """Fork this policy under `new_name`. Returns the new mutable copy on success,
-        or a falsy `PolicyResult` (branch on `.status`) if duplication is refused."""
+        """Fork this policy under `new_name`. Always returns a `PolicyValueResult`: on success
+        `.value` is the new mutable copy; on refusal a falsy result (branch on `.status`)."""
         from .registry import duplicate_policy
         return duplicate_policy(self._p_name, new_name)
 
     def _rewrite(self, new_source):
+        # Parallel-branch gate: an in-place edit is allowed inside a parallel() branch ONLY for a
+        # policy granted to THIS branch via with_edit() — raises ParallelMutationError otherwise.
+        # No-op in the main loop. (Covers _edit/_insert/_delete_lines + @policy re-decoration, which
+        # all funnel here.) The rename half is checked below, once we know the new def name.
+        _edit_guard(self)
         # Immutability gate: refuse to rewrite a DEFAULT policy. This also covers
         # `_edit`/`_insert`/`_delete_lines` (they funnel through `_rewrite`)
         # and `@policy` re-decoration of a default (the decorator's
@@ -314,6 +400,10 @@ class _FunctionPolicy:
                          f"def (got {len(tree.body)} statement(s)); source unchanged. "
                          f"Nest helpers inside the function body; reference REPL globals.")
         new_name = defs[0].name
+        # Parallel-branch gate: a grant is an IN-PLACE body edit; renaming (changing the def name)
+        # is a namespace change, parent-only. No-op outside a branch. (Also forecloses the
+        # two-branches-rename-to-the-same-new-name race that per-policy exclusivity can't see.)
+        _rename_guard(self, new_name)
         # Rename-collision guard: a rename must not CLOBBER another policy or a
         # kernel-internal name. Without this, `mutable._rewrite("def natural_llm():
         # ...")` would take over the immutable default's slot (the gate above only
@@ -358,6 +448,7 @@ class _FunctionPolicy:
             cell_globals.pop(old_name, None); cell_globals[new_name] = self
             _PLM_POLICIES.pop(old_name, None)
         _PLM_POLICIES[new_name] = self
+        return _ok()
 
 
 # --- class policy -------------------------------------------------------------
@@ -371,14 +462,6 @@ _CLASS_PRESERVE = frozenset({"__dict__", "__weakref__", "__doc__",
                              "__qualname__", "__annotations__", "__module__"})
 _POLICY_API = frozenset({"_rewrite", "_edit", "_insert", "_delete_lines",
                          "_remove", "_duplicate"})
-
-
-class PolicyStructuralFallbackWarning(UserWarning):
-    """Marker type for the (rare) class-edit-couldn't-apply-in-place event.
-
-    Surfaced to PLM as a `_policy_note` to stderr — kept as a class only so
-    callers/tests can refer to the concept by name.
-    """
 
 
 def _class_origin_filename(cls):
@@ -455,24 +538,24 @@ def _attach_class_policy_metadata(cls, source, filename):
 
 
 def _class_edit(cls, old, new, *, replace_all=False):
-    ns = _compute_edit(cls._p_source, old, new, replace_all)
-    if ns is not None:
-        _rewrite_class_policy(cls, ns)
+    return _do_edit(cls.__name__, cls._p_source,
+                    functools.partial(_rewrite_class_policy, cls), old, new, replace_all)
 
 
 def _class_insert(cls, after_line, content):
-    ns = _compute_insert(cls._p_source, after_line, content)
-    if ns is not None:
-        _rewrite_class_policy(cls, ns)
+    return _do_insert(cls.__name__, cls._p_source,
+                      functools.partial(_rewrite_class_policy, cls), after_line, content)
 
 
 def _class_delete_lines(cls, start, end=None):
-    ns = _compute_delete(cls._p_source, start, end)
-    if ns is not None:
-        _rewrite_class_policy(cls, ns)
+    return _do_delete(cls.__name__, cls._p_source,
+                      functools.partial(_rewrite_class_policy, cls), start, end)
 
 
 def _class_remove(cls):
+    # Parallel-branch gate (mirrors _FunctionPolicy._remove): removal changes registry membership,
+    # so it is parent-only — never granted to a branch.
+    _no_branch_mutation("removing a policy")
     # Immutability check: refuse to remove an immutable class policy. v1 has
     # no immutable class default, but v1.5 may; keep the gate here so adding
     # one later doesn't require touching this method.
@@ -485,16 +568,20 @@ def _class_remove(cls):
     _PLM_POLICIES.pop(cls.__name__, None)
     linecache.cache.pop(getattr(cls, "_p_filename", None), None)   # reclaim <policy-{name}> slot (
                                                                   # mirrors the function-policy _remove)
+    return _ok()
 
 
 def _class_duplicate(cls, new_name):
-    """Fork this class policy under `new_name`. Returns the new mutable copy on success,
-    or a falsy `PolicyResult` (branch on `.status`) if duplication is refused."""
+    """Fork this class policy under `new_name`. Always returns a `PolicyValueResult`: on success
+    `.value` is the new mutable copy; on refusal a falsy result (branch on `.status`)."""
     from .registry import duplicate_policy
     return duplicate_policy(cls.__name__, new_name)
 
 
 def _rewrite_class_policy(cls, new_source):
+    # Parallel-branch gate (mirrors _FunctionPolicy._rewrite): in-place edit only for a granted
+    # policy; the rename half is checked once the new class name is known, below.
+    _edit_guard(cls)
     # Immutability gate: refuse to rewrite a DEFAULT class policy.
     if getattr(cls, "_p_immutable", False) or _is_sealed_obj(cls):
         return _fail(PolicyOp.IMMUTABLE,
@@ -513,6 +600,8 @@ def _rewrite_class_policy(cls, new_source):
                      f"class (got {len(tree.body)} statement(s)); source unchanged. "
                      f"Nest helpers/attrs inside the class body; reference REPL globals.")
     new_name = tree.body[0].name
+    # Parallel-branch gate (mirrors _FunctionPolicy._rewrite): renaming is parent-only.
+    _rename_guard(cls, new_name)
     # Rename-collision guard (mirrors _FunctionPolicy._rewrite): a rename must not
     # clobber another policy or a kernel-internal name. Edit in place (new_name ==
     # old) is fine.
@@ -617,6 +706,7 @@ def _rewrite_class_policy(cls, new_source):
                 return _maybe_track_gen(type(self).__name__, _inner_call, _inner_call(self, *a, **k))
         _wrapped_call._plm_depth_wrapped = True
         cls.__call__ = _wrapped_call
+    return _ok()
 
 
 def _remove_and_recreate(old_cls, new_cls, new_source):
@@ -635,7 +725,8 @@ def _remove_and_recreate(old_cls, new_cls, new_source):
     if new_filename != old_cls._p_filename:
         linecache.cache.pop(old_cls._p_filename, None)
     _PLM_POLICIES[new_cls.__name__] = g[new_cls.__name__] = new_cls
-    _policy_note(
+    _note(
         f"{name!r}: structural edit couldn't apply in place; replaced the class. "
         f"Existing instances created before this edit remain on the OLD class and "
         f"won't see the new behavior.")
+    return _ok()        # the edit DID apply (OK) — the replacement caveat rides as the note above

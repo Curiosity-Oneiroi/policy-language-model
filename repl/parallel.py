@@ -13,6 +13,16 @@ each branch via `copy_context().run(...)`, so whatever is in context carries thr
 
 from __future__ import annotations
 
+from plm._branch_state import (
+    _BRANCH_EDIT_GRANTS,
+    _EditGrant,
+    _IN_PARALLEL_BRANCH,
+    ParallelMutationError,
+    with_edit,
+)
+
+__all__ = ["parallel", "with_edit", "ParallelMutationError"]
+
 
 def parallel(*tasks, max_workers=None):
     """Run zero-arg callables in parallel; return a list of results (or exceptions) in
@@ -47,11 +57,31 @@ def parallel(*tasks, max_workers=None):
         error, the ONLY thing it ever raises, never a task's. Nested `parallel(...)` from a
         worker thread (no loop there) works — each makes its own loop.
 
+    World mutation inside a branch (closed-to-mutation, opt-in by grant):
+      - A branch READS the world freely (call any policy, read vars) and RETURNS a value. It may
+        NOT mutate the shared policy world by default — that would race a sibling.
+      - To EDIT a policy in a branch you must hand that branch the capability explicitly, with
+        `with_edit(task, that_policy)`. The grant is for an IN-PLACE body edit only, and at most
+        ONE branch may be granted a given policy (exclusive). A granted policy is that branch's
+        alone for the call — no sibling should read, call, or edit it meanwhile.
+      - Renaming, removing, duplicating, by-name edits (`edit_policy(...)`), `@policy`, and unseal
+        change the shared registry/namespace and are NOT allowed in a branch — do them in the main
+        loop. A violation raises `ParallelMutationError`, returned in that branch's slot (or, for a
+        double-grant, raised by `parallel()` itself before anything runs).
+      - Don't mutate plain shared data (a global list/dict) from two branches either — RETURN
+        values and combine them in the parent, or `deepcopy` isolated input.
+
     Example:
         # any zero-arg callables — plain functions, policies, sub-LLM calls, ...
         a, b, c = parallel(lambda: heavy_compute(data),
                            lambda: my_policy(x),
                            lambda: natural_llm(m))
+
+        # editing one policy in a branch: grant it (read-only branches stay bare lambdas):
+        r_edit, score = parallel(
+            with_edit(lambda: predict._edit("old", "new"), predict),
+            lambda: evaluate(x),
+        )
 
         # a wide batch; one branch failing leaves a result-or-exception in its slot:
         results = parallel(*[lambda i=i: my_policy(items[i]) for i in range(500)],
@@ -65,6 +95,32 @@ def parallel(*tasks, max_workers=None):
 
     if not tasks:
         return []
+
+    # Unwrap with_edit() grants and enforce EXCLUSIVE borrow UP FRONT (before anything runs): a
+    # branch may edit a policy only if granted, and a given policy may be granted to AT MOST ONE
+    # branch. A second grant of the same policy is a contract breach raised HERE, by parallel()
+    # itself (not inside a branch), so PLM gets it directly rather than in a result slot.
+    _plan = []                                         # [(zero-arg callable, frozenset(id(policy))), ...]
+    _granted = {}                                      # id(policy) -> policy (for a clear dup message)
+    for _t in tasks:
+        if isinstance(_t, _EditGrant):
+            _ids = set()
+            for _p in _t.policies:
+                _pid = id(_p)
+                if _pid in _granted:
+                    raise ParallelMutationError(
+                        f"policy {getattr(_p, '_p_name', '?')!r} is granted to more than one "
+                        f"parallel() branch; at most ONE branch may edit a given policy.")
+                _granted[_pid] = _p
+                _ids.add(_pid)
+            _plan.append((_t.task, frozenset(_ids)))
+        elif callable(_t):
+            _plan.append((_t, frozenset()))
+        else:
+            raise TypeError(
+                f"parallel(): each task must be a zero-arg callable or with_edit(task, ...); "
+                f"got {_t!r}.")
+
     if max_workers is None:
         n = min(len(tasks), 256)
     else:
@@ -93,23 +149,30 @@ def parallel(*tasks, max_workers=None):
         # `copy_context()` per task carries the current context (e.g. the depth gate) into the
         # worker. `return_exceptions=True` -> gather runs ALL tasks to completion and returns
         # a RESULT-OR-EXCEPTION per task, so one failing branch never aborts the others.
-        def _shielded(_t):
-            # FULL isolation: a task that raises ANYTHING — a normal Exception OR a control-flow
-            # BaseException (SystemExit/KeyboardInterrupt/GeneratorExit/CancelledError), which a
-            # policy can legitimately raise — has it CAUGHT and RETURNED in its slot, never
-            # propagated out of parallel(). (Runs in a worker thread, so such an exception never
-            # reached the caller anyway; this just makes the return a guarantee, not a gather
-            # quirk.) The task's behaviour/side-effects/context are untouched — only its
-            # exception is captured, with its traceback preserved on the object.
+        def _shielded(_fn, _grants):
+            # FULL isolation + per-branch state. Before running, mark this context as a parallel
+            # branch and install its edit-grant id-set; restore both after. These `.set()`s land in
+            # the branch's OWN copied context (copy_context() below), so they're private to it — and
+            # the mutation gates (plm._branch_state) read them to allow only a granted in-place edit.
+            # A task that raises ANYTHING — a normal Exception OR a control-flow BaseException
+            # (SystemExit/KeyboardInterrupt/GeneratorExit/CancelledError), which a policy can
+            # legitimately raise, OR a ParallelMutationError from a contract breach — has it CAUGHT
+            # and RETURNED in its slot, never propagated out of parallel().
             def _run():
+                _tok_b = _IN_PARALLEL_BRANCH.set(True)
+                _tok_g = _BRANCH_EDIT_GRANTS.set(_grants)
                 try:
-                    return _t()
+                    return _fn()
                 except BaseException as _e:
                     return _e
+                finally:
+                    _BRANCH_EDIT_GRANTS.reset(_tok_g)
+                    _IN_PARALLEL_BRANCH.reset(_tok_b)
             return _run
         pool = ThreadPoolExecutor(max_workers=n)         # own pool, not a per-call default
         try:
-            futs = [loop.run_in_executor(pool, copy_context().run, _shielded(t)) for t in tasks]
+            futs = [loop.run_in_executor(pool, copy_context().run, _shielded(_fn, _g))
+                    for (_fn, _g) in _plan]
             return await asyncio.gather(*futs, return_exceptions=True)   # belt-and-suspenders
         finally:
             pool.shutdown(wait=False)

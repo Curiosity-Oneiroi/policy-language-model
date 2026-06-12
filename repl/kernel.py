@@ -25,6 +25,16 @@ try:
 except Exception:
     pass
 
+# SIGINT policy — ONE rule for the whole kernel. The parent sends SIGINT for exactly one purpose:
+# abort a cell BODY that's running too long (a clean-boundary cell timeout). So SIGINT is IGNORED
+# kernel-wide by default, and ARMED (-> KeyboardInterrupt) ONLY around the cell exec in KERNEL_LOOP.
+# A late / mis-timed SIGINT — landing in setup, the post-exec guards, the snapshot/finalize, the
+# idle read, rehydrate, or boot — is then a no-op, instead of escaping into a spurious `boot_error`
+# / false "did NOT execute" / torn result frame. (Robust import: the prctl block above swallows an
+# ImportError, which could leave its `signal` alias unbound — bind our own here.)
+import signal as _repl_signal_mod
+_repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.SIG_IGN)
+
 _repl_sock = _repl_socket.socket(_repl_socket.AF_UNIX, _repl_socket.SOCK_STREAM)
 _repl_sock.connect(_repl_os.environ["_REPL_SOCK_PATH"])
 _repl_sock_io = _repl_sock.makefile("rwb", buffering=0)
@@ -73,8 +83,12 @@ def _repl_reset_buffers():
     global _repl_stdout_buf, _repl_stderr_buf
     _repl_stdout_buf = _io.StringIO()
     _repl_stderr_buf = _io.StringIO()
-    _sys.stdout = _repl_stdout_buf
-    _sys.stderr = _repl_stderr_buf
+    # Re-assert the routing proxy (a cell may have rebound sys.stdout) and re-point the top-level
+    # (non-branch) streams at the freshly-recreated buffers. The proxy + set_main_streams come from
+    # PREFIX (`_repl_`-prefixed globals); the kernel still READS `_repl_stdout_buf` for cell output.
+    _sys.stdout = _repl_out_proxy
+    _sys.stderr = _repl_err_proxy
+    _repl_set_main_streams(_repl_stdout_buf, _repl_stderr_buf)
 '''
 
 
@@ -368,6 +382,14 @@ while True:
     # below goes to stderr, and the result frame ships BOTH. A print-then-error cell
     # surfaces its output AND the traceback — the same guarantee exec_ns gives (which was
     # modeled on this loop).
+    # ARM SIGINT for the cell BODY ONLY: a timeout SIGINT lands here -> KeyboardInterrupt ->
+    # caught below as an interrupted-result (graceful abort). It is IGNORED in every other phase
+    # (see the kernel-wide SIG_IGN in KERNEL_BOOTSTRAP), so it can never escape into a spurious
+    # boot_error / false "did NOT execute". Re-import fresh (defeat a prior cell's rebind of the
+    # alias) to arm, and DISARM in `finally` (re-import fresh too) so a SIGINT arriving a hair after
+    # exec returns is ignored — and so a cell that rebinds the alias can't break the restore.
+    import signal as _repl_signal_mod
+    _repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.default_int_handler)
     try:
         _builtins.exec(_builtins.compile(_repl_code, _repl_cell_file, "exec"), _repl_g, _repl_g)
     except BaseException as _repl_exc:
@@ -388,6 +410,11 @@ while True:
             _repl_stderr_buf.write("".join(_traceback.format_exception(
                 _repl_builtins.type(_repl_exc), _repl_exc,
                 _repl_tb_obj.tb_next if _repl_tb_obj else None)))
+    finally:
+        # DISARM: late SIGINT (after the cell finished) is now ignored through the guards/snapshot/
+        # write_frame/idle, so it can't tear the result or fake a "did NOT execute".
+        import signal as _repl_signal_mod
+        _repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.SIG_IGN)
 
     # Re-establish a TRUSTED handle to the REAL __main__ globals before Guard C.
     # A cell can rebind the bare `_repl_g` (or `_builtins`) __main__ name during its

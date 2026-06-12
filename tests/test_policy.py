@@ -883,27 +883,32 @@ def test_nr31_respawn_result_signals_not_executed():
 
 
 def test_f4_root_loop_survives_malformed_tool_calls():
-    """F4 + PLM1: PLM's root loop must not CRASH on a non-conformant backend's tool_calls — it now
-    mirrors react_llm's guards (normalize shape, isinstance(tc, dict), isinstance(function, dict),
-    isinstance(code, str), reply a user-turn for a non-dict tc). Shapes that used to crash
-    PLM.__call__ raw (the outer try has no `except`) now re-prompt and exhaust the budget gracefully
-    (PLMTaskFailure), no TypeError/KeyError/AttributeError. `["junk"]` hit the bare
-    `tool_call["function"]` subscript (F4); a non-string `code` arg hit `_strip_code_fences` (PLM1)."""
+    """F4 + PLM1 + B1: PLM's root loop must not CRASH on a non-conformant backend — it mirrors
+    react_llm's guards (normalize the whole RESPONSE to a dict, normalize tool_calls shape,
+    isinstance(tc, dict), isinstance(function, dict), isinstance(code, str), reply a user-turn for a
+    non-dict tc). Inputs that used to crash PLM.__call__ raw (the outer try has no `except`) now
+    re-prompt and exhaust the budget gracefully (PLMTaskFailure), no TypeError/KeyError/
+    AttributeError. `["junk"]` hit the bare `tool_call["function"]` subscript (F4); a non-string
+    `code` arg hit `_strip_code_fences` (PLM1); a non-dict response hit `response.get(...)` (B1)."""
     import asyncio
     from plm.plm import PLM, PLMMetaParameters, PLMTaskFailure
 
-    shapes = [
-        ["junk"],                                                            # F4: non-dict tc
-        [{"id": "1", "function": {"name": "python", "arguments": '{"code": 123}'}}],  # PLM1: non-string code
+    # each entry is a full backend RESPONSE (B1 covers non-dict responses; F4/PLM1 cover bad tool_calls)
+    responses = [
+        {"content": "", "tool_calls": ["junk"]},                                          # F4: non-dict tc
+        {"content": "", "tool_calls": [{"id": "1", "function": {"name": "python",
+                                                                "arguments": '{"code": 123}'}}]},  # PLM1: non-str code
+        None,                                                                             # B1: non-dict response
+        ["not", "a", "dict"],                                                             # B1: non-dict response
     ]
-    for shape in shapes:
+    for resp in responses:
         class _FakeBackend:
             model = "fake-model"
-            def __init__(self, s): self._s = s
+            def __init__(self, r): self._r = r
             async def generate(self, messages=None, tools=None, **kw):
-                return {"content": "", "tool_calls": self._s}    # malformed every round
+                return self._r                                   # malformed every round
 
-        plm = PLM(model_backend=_FakeBackend(shape),
+        plm = PLM(model_backend=_FakeBackend(resp),
                   metaparams=PLMMetaParameters(system_prompt="sys"), max_turns=1, return_budget=1)
         with pytest.raises(PLMTaskFailure):                      # graceful budget-exhaust, NOT a crash
             asyncio.run(plm([{"role": "user", "content": "go"}]))
@@ -1303,6 +1308,58 @@ def test_frame4_decode_error_respawns():
     out = s.execute_cell("x = 1")
     assert s.respawns == 1
     assert "preserved" in out["stderr"]
+
+
+def test_sigint_during_post_exec_snapshot_yields_real_result():
+    """Unified SIGINT model (real kernel): SIGINT is armed (-> KeyboardInterrupt) ONLY around the
+    cell body, and SIG_IGN in every other phase. So a SIGINT landing AFTER the body finished —
+    here fired from inside the snapshot dump itself, deterministically in the P4 finalize window,
+    not racing a timeout — is a no-op: the kernel finishes finalizing and delivers the cell's REAL
+    RETURN value, with NO respawn and NO false "did NOT execute". (Pre-fix, the KeyboardInterrupt
+    escaped `_repl_collect_vars` -> boot_error -> respawn — finding C1, and the whole class of
+    P1/P3/P4/loop-back/rehydrate escapes with it.)"""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                                  # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        out = s.execute_cell(
+            "import os, signal\n"
+            "class _SigOnDump:\n"
+            "    def __reduce__(self):\n"
+            "        os.kill(os.getpid(), signal.SIGINT)   # SIGINT DURING the post-exec snapshot\n"
+            "        return (dict, ())\n"
+            "sig_obj = _SigOnDump()\n"                      # a global -> dumped in P4 -> fires the signal
+            "RETURN('real-result')\n")
+        assert out.get("type") == "return", out
+        assert out.get("return_obj") == "real-result", out
+        assert "RE-RUN" not in (out.get("stderr") or ""), out          # no spurious respawn
+        # the kernel survived and still serves cells (signal was ignored, not fatal)
+        alive = s.execute_cell("print('alive-after-snapshot-sigint')")
+        assert "alive-after-snapshot-sigint" in (alive.get("stdout") or ""), alive
+    finally:
+        s.close()
+
+
+def test_sigint_armed_only_during_cell_body():
+    """During the cell body, SIGINT is armed (`default_int_handler`) so a clean-boundary timeout can
+    abort a runaway cell; the kernel-wide default is SIG_IGN. We observe the armed half from inside
+    a running cell (the cell body IS the armed phase)."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                                  # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        out = s.execute_cell(
+            "import signal\n"
+            "print(getattr(signal.getsignal(signal.SIGINT), '__name__', '?'))")
+        assert "default_int_handler" in (out.get("stdout") or ""), out
+    finally:
+        s.close()
 
 
 def _fake_resp_stream(data: bytes):
@@ -1989,10 +2046,11 @@ def test_int_class_policy_survives_respawn_and_deleted_stays_deleted():
 
 
 def test_policyresult_enum_outcomes_on_edit_and_duplicate():
-    """The edit/duplicate API returns a descriptive, FALSY PolicyResult on a problem (branchable
-    `.status`), None on a clean in-place success, and the new policy on a clean duplicate — while the
-    `[policy]` note still fires as the backstop. This is what lets cell code HANDLE a failure
-    (try-retry) instead of only an ancestor LLM reading a contextless note. (PolicyResult / PolicyOp)"""
+    """The edit/duplicate API ALWAYS returns a result object so PLM writes ONE handling pattern: an
+    in-place op returns PolicyResult (OK on success, a descriptive failure status otherwise);
+    duplicate ALWAYS returns PolicyValueResult (.value = the new policy on success). `if r: ... else:
+    handle(r.status)` reads the same everywhere; the `[policy]` note still fires as the backstop on a
+    problem. This lets cell code HANDLE a failure (try-retry) — impossible with the note-only path."""
     from plm.repl import PythonReplSession
     s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0, sigint_grace=2.0)
     try:
@@ -2008,8 +2066,9 @@ def test_policyresult_enum_outcomes_on_edit_and_duplicate():
                            "    if greet._edit(old, 'hey '):\n        break\n"
                            "print(greet('bob'))")
         assert r["stdout"].strip() == "hey bob"
-        # clean in-place success -> None
-        assert s.execute_cell("print(greet._edit('hey ','HEY ') is None)")["stdout"].strip() == "True"
+        # clean in-place success -> PolicyResult(OK), truthy (NOT None — uniform shape)
+        assert s.execute_cell("r = greet._edit('hey ','HEY ')\n"
+                              "print(r.status.name, bool(r))")["stdout"].strip() == "OK True"
         # descriptive failure statuses
         for code, want in [
             ("greet._edit(None, 'x')",                          "BAD_ARGS"),
@@ -2021,9 +2080,39 @@ def test_policyresult_enum_outcomes_on_edit_and_duplicate():
         ]:
             out = s.execute_cell(f"print(({code}).status.name)")["stdout"].strip()
             assert out == want, f"{code} -> {out!r} (want {want})"
-        # clean duplicate success -> the new policy itself (callable), NOT a PolicyResult
-        r = s.execute_cell("g2 = duplicate_policy('greet', 'greet2')\n"
-                           "print(g2('z'), hasattr(g2, 'status'))")
-        assert r["stdout"].strip() == "HEY z False"           # g2 is the policy; no .status
+        # clean duplicate success -> PolicyValueResult(OK); .value is the new policy
+        r = s.execute_cell("r2 = duplicate_policy('greet', 'greet2')\n"
+                           "print(r2.value('z'), bool(r2), r2.status.name)")
+        assert r["stdout"].strip() == "HEY z True OK"         # .value is the policy; OK + truthy
+    finally:
+        s.close()
+
+
+def test_policyresult_uniform_across_class_and_by_name():
+    """A1/A2: the PolicyResult edit contract must be IDENTICAL across EVERY policy shape — function
+    methods, class-policy methods, AND the by-name helpers — because they all route through the one
+    shared edit core (_do_edit/_do_insert/_do_delete). Regression: a class-policy edit used to raise a
+    raw TypeError on bad args, silently swallow a no-match (no note), and discard the rewrite result;
+    the by-name helpers always returned None and raised KeyError on an unknown name."""
+    from plm.repl import PythonReplSession
+    s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=15.0, sigint_grace=2.0)
+
+    def out(c):
+        return s.execute_cell(c)["stdout"].strip()
+
+    try:
+        s.execute_cell("@policy\nclass Net:\n    def __call__(self, x):\n        return x * 2\n")
+        s.execute_cell("@policy\ndef greet(x):\n    return 'hi'\n")
+        # CLASS-policy methods now mirror the function contract exactly
+        assert out("print(Net._edit(123, 'y').status.name)") == "BAD_ARGS"        # was a raw TypeError
+        r = s.execute_cell("print(Net._edit('NOPE', 'y').status.name)")
+        assert r["stdout"].strip() == "NO_MATCH" and "not found" in r["stderr"]   # was silent None, no note
+        assert out("print(Net._insert(0, 999).status.name)") == "BAD_ARGS"        # non-str content
+        assert out("print(Net._edit('return x * 2', 'return x * 3').status.name)") == "OK"   # success -> OK (truthy)
+        # BY-NAME helpers now propagate the result + map an unknown name -> NOT_FOUND (not KeyError)
+        assert out("print(edit_policy('greet', 'NOPE', 'y').status.name)") == "NO_MATCH"
+        assert out("print(edit_policy('does_not_exist', 'a', 'b').status.name)") == "NOT_FOUND"
+        assert out("print(insert_into('greet', 0, 123).status.name)") == "BAD_ARGS"
+        assert out("print(bool(edit_policy('greet', \"'hi'\", \"'yo'\")), greet(0))") == "True yo"   # OK + applied
     finally:
         s.close()

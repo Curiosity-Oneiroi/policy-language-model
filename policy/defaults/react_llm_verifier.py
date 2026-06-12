@@ -96,7 +96,8 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                 the meta-channel value wins silently — user data is still
                 reachable via `kwargs[<the meta name>]`.
               * Identifier-invalid keys ("foo-bar", Python keywords like
-                "if") -> UserWarning. Still reachable via `kwargs[<key>]`.
+                "if") -> a namespace note added to the SUB-LLM's own context
+                (telling it to use `kwargs[<key>]`); still reachable that way.
 
         objects=None (resolved to []): positional list of references
             accessed by index (`objects[i]`). Use when order matters
@@ -169,8 +170,10 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
         - LLMDepthExceeded: the depth budget is at 0 before a generate, OR a
           `verifier` is set with fewer than 2 levels remaining (e.g. depth=1) —
           the latter is raised UP FRONT, before any backend call.
-        - UserWarning (emitted, not raised): kwargs has identifier-invalid
-          or Python-keyword keys.
+
+        (Identifier-invalid / Python-keyword kwargs keys are NOT raised and
+        NOT surfaced to PLM — they add a namespace note to the SUB-LLM's own
+        context, since the sub-agent is the actor that references the names.)
         - Anything the `verifier` raises propagates out (fail-loud; the
           verifier is trusted PLM code).
 
@@ -225,7 +228,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
           the same path as any other exception, ending up in the tool
           result for the model to see.
     """
-    import sys, json, keyword, warnings
+    import sys, json, keyword
     from plm.plm_tools import _tool_python
     from plm._react_helper import _strip_code_fences
     from plm.policy.defaults._llm_infra import (
@@ -264,8 +267,10 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     #     This is silent precedence by design.
     #   * Identifier-invalid keys (`"foo-bar"`, Python keywords like `"if"`)
     #     splat into `ns` but Python's name resolution can't reach them by
-    #     name. Emit a UserWarning so PLM authors notice; the value remains
-    #     accessible via `kwargs["foo-bar"]`.
+    #     name. This is SUB-AGENT guidance (the sub-LLM writes the code that
+    #     references them), so a namespace note is added to the SUB-LLM's own
+    #     context after `_norm` — NOT raised / NOT written to PLM's stderr. The
+    #     value remains accessible via `kwargs["foo-bar"]`.
     _RESERVED_KWARG_NAMES = frozenset({"RETURN", "__builtins__"})
     for _k in kwargs:
         if not isinstance(_k, str):
@@ -280,18 +285,12 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             f"they would shadow the ambient termination primitive (`RETURN`) "
             f"or `__builtins__` in the model's exec scope. Rename them."
         )
-    _bad_idents = [
-        k for k in kwargs
-        if not (k.isidentifier() and not keyword.iskeyword(k))
-    ]
-    if _bad_idents:
-        warnings.warn(
-            f"react_llm_verifier: kwargs keys {sorted(_bad_idents)} are not valid "
-            f"Python identifiers (or are Python keywords); they will only "
-            f"be reachable via `kwargs[<key>]`, not as direct local names.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # NOTE: identifier-invalid / keyword keys are NOT a caller-contract error (they still work via
+    # `kwargs[<key>]`) — they are SUB-AGENT namespace guidance, handled as a note in the sub-LLM's
+    # OWN context AFTER message normalization (see the "[namespace]" note below `msgs = _norm(...)`),
+    # NOT raised or written to PLM's stderr here. (Audience rule for this policy: caller-contract
+    # violations RAISE to PLM; anything about the sub-agent's own behavior/namespace goes into the
+    # sub-agent's msgs / tool output — keep any new diagnostic on the correct side of that line.)
 
     # ---- nested helpers (NOT policies; local to this call) ----
 
@@ -389,6 +388,20 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
     # ---- main ReAct loop ----
 
     msgs = _norm(messages)
+    # Identifier-invalid / keyword kwarg keys can't be referenced as BARE names in the sub-LLM's
+    # code (`foo-bar`, `if`) — only via `kwargs[<key>]`. The actor that needs to know this is the
+    # SUB-LLM (it writes the code that references the grants), so the guidance goes into the
+    # SUB-LLM's OWN context as a leading system note — NOT onto PLM's stderr. (PLM chose the key,
+    # but it's the sub-agent that must adapt; this is sub-agent business, not the meta-reasoner's.)
+    _bad_idents = [k for k in kwargs if not (k.isidentifier() and not keyword.iskeyword(k))]
+    if _bad_idents:
+        _ns_note = ("[namespace] Some granted inputs have names that are not valid Python "
+                    "identifiers (or are Python keywords), so you can't use them as bare names — "
+                    f"access them via kwargs[<key>]: {sorted(_bad_idents)}.")
+        if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+            msgs[0]["content"] = (msgs[0].get("content") or "") + "\n\n" + _ns_note
+        else:
+            msgs.insert(0, {"role": "system", "content": _ns_note})
     # ---- the sub-agent's OWN repl namespace (`ns`) ----
     # ONE dict, used as BOTH globals and locals in `_exec`, so it behaves like
     # the sub-agent's private "repl globals" — modeled on how PLM's kernel runs
@@ -473,6 +486,12 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
             if tool_calls:
                 # --- model emitted a tool call: verify it's `python`, then parse/exec/RETURN ---
                 tc = tool_calls[0]
+                # Mirror plm.py / react_llm: compute the parallel-tool-calls nudge ONCE and prepend
+                # to EVERY branch below (malformed / non-python / bad-code / exec), so it is NOT lost
+                # on a branch that resolves before the exec (B2). Sub-agent's OWN stream, not PLM's.
+                _parallel_note = (
+                    "[react_llm_verifier] you emitted " + str(len(tool_calls)) + " tool_calls; only "
+                    "the FIRST ran — send ONE `python` call per turn.\n\n") if len(tool_calls) > 1 else ""
                 if not isinstance(tc, dict):
                     # Malformed tool_call (str/int/None): the assistant turn stored tool_calls=None
                     # for it (M4), so there is NO tool_call to answer — a `tool` reply would be a
@@ -480,7 +499,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                     # request 400s. Send the error as a USER turn instead, then fall through to the
                     # verifier hook (this round is non-terminal).
                     msgs.append({"role": "user",
-                                 "content": f"[error] malformed tool_call ({type(tc).__name__}); "
+                                 "content": _parallel_note + f"[error] malformed tool_call ({type(tc).__name__}); "
                                             f"emit a single `python` tool call"})
                 else:
                     _fn = tc.get("function")
@@ -493,7 +512,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                         # round, so it must fall through to the verifier hook below. Mirrors the
                         # root loop's guard (plm.py) rather than silently exec'ing "".
                         msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "",
-                                     "content": f"error: tool {tname!r} not supported (only `python`)"})
+                                     "content": _parallel_note + f"error: tool {tname!r} not supported (only `python`)"})
                     else:
                         args_raw = _fn.get("arguments") or "{}"
                         try:
@@ -510,7 +529,7 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                         if not isinstance(code, str):
                             # non-string `code`: clear error + fall through
                             msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "",
-                                         "content": "error: `code` must be a string of Python source"})
+                                         "content": _parallel_note + "error: `code` must be a string of Python source"})
                         else:
                             out, term, val = "(no output)", None, None  # defensive init
                             # `_exec` (= exec_ns) CAPTURES the cell's stdout AND any error together
@@ -528,14 +547,8 @@ def react_llm_verifier(messages, *, args=(), kwargs=None, objects=None,
                             except Exception as e:              # any other failure -> stderr back to the model
                                 out = f"stderr:\n{type(e).__name__}: {e}"
 
-                            if len(tool_calls) > 1:
-                                # The SUB-LLM emitted parallel tool_calls; only the first ran. Surface
-                                # the nudge in the SUB-LLM's OWN tool result (its message stream) so it
-                                # self-corrects to one call per turn — NOT to PLM's stderr.
-                                out = ("[react_llm_verifier] you emitted " + str(len(tool_calls))
-                                       + " tool_calls; only the FIRST ran — send ONE `python` call "
-                                       "per turn.\n\n" + out)
-                            msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "", "content": out})
+                            msgs.append({"role": "tool", "tool_call_id": tc.get("id") or "",
+                                         "content": _parallel_note + out})
                             if term == "return":                # RETURN(value) succeeded (constraint passed
                                 return val                      # or there was no constraint) — done; NO verifier.
             # else: text-only turn — the assistant message is already appended; the

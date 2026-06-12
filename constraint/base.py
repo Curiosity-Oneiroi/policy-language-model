@@ -156,8 +156,11 @@ def _calls_super_builtin(code: Any) -> bool:
       * a LOCAL named `super` (`super = ...; super()`) is a LOAD_FAST -> NOT flagged (it shadows the
         builtin, isn't inheritance);
       * a different name (`fsuper`, `super_helper`) -> exact `argval == "super"` -> NOT flagged;
-      * a NESTED helper's `super()` lives in its OWN code object (co_consts), not in `code`'s
-        instruction stream -> NOT flagged (no false-positive on the enclosing method).
+      * a NESTED helper's `super()` lives in its OWN code object — a `def`/`lambda`/generator-expr
+        in co_consts — not in `code`'s instruction stream -> NOT flagged. (PEP-709 caveat, Py3.12+:
+        a list/set/dict COMPREHENSION is INLINED into the enclosing code object, so a `super()`
+        *inside a comprehension* IS in `code` and WOULD be flagged. `super()` inside a comprehension
+        in a flat constraint method is pathological, so this is noted, not worked around.)
     Replaces a `'super' in co_names` membership test, which wrongly flagged `n.super` (co_names also
     holds LOAD_ATTR names)."""
     import dis as _dis
@@ -1562,6 +1565,22 @@ def _struct_body(cls: Type[Constraint], base: int, seen: set) -> List[str]:
             if field_desc:
                 line += f": {field_desc}"
             lines.append(line)
+            continue
+
+        if getattr(ann, "_constraint_is_composite", False):
+            # A composite (A|B / A&B / ~A / A^B) field: render the composite's OWN describe() (the
+            # OR/AND/XOR/NOT tree), NOT the mangled internal class name `_short(ann)` would emit (D1).
+            summary = ann.describe()
+            head = f"{fpad}- {name}"
+            if field_desc:
+                head += f": {field_desc}"
+            if summary and "\n" not in summary:                  # single-line: inline
+                lines.append(f"{head} — {summary}")
+            elif summary:                                        # multi-line (structural child): block
+                lines.append(head + ":")
+                lines.extend(f"{fpad}    {ln}" for ln in summary.splitlines())
+            else:
+                lines.append(head)
             continue
 
         constraints = _field_constraint_summary(info)

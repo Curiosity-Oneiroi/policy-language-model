@@ -253,8 +253,13 @@ def base_verifier(messages):
             # reviewers above (propose -> approve); this is PLM's OWN code, self-approved.
             _safe = {"len": len, "range": range, "list": list, "dict": dict,
                      "str": str, "enumerate": enumerate, "sorted": sorted}
-            out, _term, _val = exec_ns(str(code), {"__builtins__": _safe, "trajectory": messages},
-                                       slot=f"verifier-edit-{len(messages)}")
+            _vns = {"__builtins__": _safe, "trajectory": messages}
+            # `id(_vns)` makes the linecache slot UNIQUE per call (H5): `len(messages)` alone can
+            # collide across concurrent parallel() branches (same length -> same slot -> a traceback
+            # mis-attributed to a sibling's source). The fresh per-call ns is alive for the call, so
+            # its id can't be reused by a concurrent branch.
+            out, _term, _val = exec_ns(str(code), _vns,
+                                       slot=f"verifier-edit-{id(_vns)}-{len(messages)}")
             # exec_ns CAPTURES (never raises) a failing edit into `out`; check it so we do
             # NOT record "applied" for an edit that actually errored.
             if "Traceback (most recent call last)" in out:

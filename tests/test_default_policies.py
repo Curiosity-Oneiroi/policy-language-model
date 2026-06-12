@@ -1003,29 +1003,24 @@ def test_12h_kwargs_meta_channel_collision_silent_precedence(defaults_installed,
     assert isinstance(out[2], str) and out[2] == "huh"
 
 
-def test_12i_kwargs_identifier_invalid_warns(defaults_installed, stub_backend):
-    """Identifier-invalid kwarg keys (e.g. `"foo-bar"`, Python keywords
-    like `"if"`) emit a UserWarning at call time. The value is still
-    splat into `ns` and accessible via `kwargs["foo-bar"]`."""
-    import warnings as _w
-    stub_backend.script = [
-        make_python_call("RETURN(kwargs['foo-bar'])"),
-    ]
+def test_12i_kwargs_identifier_invalid_notes(defaults_installed, stub_backend):
+    """Identifier-invalid kwarg keys (`"foo-bar"`, Python keywords like `"if"`) can't be bare names
+    in the sub-LLM's code, so react_llm puts the guidance in the SUB-LLM's OWN context (a namespace
+    note in its messages), NOT on PLM's stderr — the sub-agent is the actor that must use
+    `kwargs[<key>]`. The value is still splat into `ns` / reachable via `kwargs["foo-bar"]`."""
     rl = _PLM_POLICIES["react_llm"]
-    with _w.catch_warnings(record=True) as captured:
-        _w.simplefilter("always")
-        out = rl("?", kwargs={"foo-bar": "hyphen-value"})
+    stub_backend.script = [make_python_call("RETURN(kwargs['foo-bar'])")]
+    out = rl("?", kwargs={"foo-bar": "hyphen-value"})
     assert out == "hyphen-value"
-    assert any("foo-bar" in str(w.message) for w in captured), captured
-    # Python keyword `"if"` also warns.
-    stub_backend.script = [
-        make_python_call("RETURN(kwargs['if'])"),
-    ]
-    with _w.catch_warnings(record=True) as captured:
-        _w.simplefilter("always")
-        out = rl("?", kwargs={"if": "keyword-value"})
+    seen = "".join((m.get("content") or "") for m in stub_backend.calls[0]["messages"])
+    assert "kwargs[" in seen and "foo-bar" in seen, seen          # guidance reached the SUB-LLM, not PLM
+    # Python keyword `"if"` likewise — the note goes to the sub-LLM on each call (no dedup).
+    stub_backend.calls.clear()
+    stub_backend.script = [make_python_call("RETURN(kwargs['if'])")]
+    out = rl("?", kwargs={"if": "keyword-value"})
     assert out == "keyword-value"
-    assert any("if" in str(w.message) for w in captured), captured
+    seen = "".join((m.get("content") or "") for m in stub_backend.calls[0]["messages"])
+    assert "kwargs[" in seen and "'if'" in seen, seen
 
 
 def test_12d_plm_passed_policy_reference_works(defaults_installed, stub_backend):
@@ -1205,7 +1200,7 @@ def test_20_duplicate_mutable_creates_independent_copy(defaults_installed):
     def helper(x):
         return x + 1
 
-    copy = duplicate_policy("helper", "helper2")
+    copy = duplicate_policy("helper", "helper2").value     # always a PolicyValueResult; .value = the new policy
     assert copy is not None
     assert "helper2" in _PLM_POLICIES
     assert copy(5) == 6
@@ -1238,7 +1233,7 @@ def test_21_class_policy_duplicate(defaults_installed):
         def name(self):
             return "Tool"
 
-    Tool2 = duplicate_policy("Tool", "Tool2")
+    Tool2 = duplicate_policy("Tool", "Tool2").value        # .value = the new class policy
     assert Tool2 is not None
     assert "Tool2" in _PLM_POLICIES
     assert isinstance(Tool2, type)
@@ -1264,7 +1259,7 @@ def test_method_duplicate_proxy_method(defaults_installed):
     def predict(x):
         return x + 1
 
-    new_pred = predict._duplicate("predict2")
+    new_pred = predict._duplicate("predict2").value
     assert new_pred is not None
     assert _PLM_POLICIES["predict2"] is new_pred
     assert new_pred(10) == 11
@@ -1275,7 +1270,7 @@ def test_method_duplicate_proxy_method(defaults_installed):
         def forward(self, x):
             return x * 10
 
-    Net2 = Net._duplicate("Net2")
+    Net2 = Net._duplicate("Net2").value
     assert Net2 is not None
     assert _PLM_POLICIES["Net2"] is Net2
     assert Net2().forward(3) == 30
@@ -2389,3 +2384,36 @@ def test_natural_llm_rejects_non_constraint(defaults_installed, stub_backend):
     for bad in (5, "x", {"a": 1}):
         with pytest.raises(TypeError):
             nl("?", constraint=bad)
+
+
+def test_b2_multi_tool_call_nudge_fires_on_non_exec_branch(defaults_installed, stub_backend):
+    """B2: the 'you emitted N tool_calls; only the FIRST ran' nudge must reach the sub-LLM on EVERY
+    branch, not only a successful exec. When the FIRST of several tool_calls is a non-`python` tool
+    (a branch that resolves BEFORE the exec), the nudge used to be dropped — now it's prepended on
+    every branch, matching plm.py's root loop."""
+    rl = _PLM_POLICIES["react_llm"]
+    nonpython = {"id": "1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+    extra = {"id": "2", "type": "function", "function": {"name": "python", "arguments": "{}"}}
+    stub_backend.script = [
+        {"content": "", "reasoning": None, "tool_calls": [nonpython, extra]},  # 2 calls, first non-python
+        make_python_call("RETURN('done')"),
+    ]
+    out = rl("?")
+    assert out == "done"
+    # round 2's input carries the round-1 tool reply, which must include the multi-call nudge
+    seen = " ".join((m.get("content") or "") for m in stub_backend.calls[-1]["messages"])
+    assert "you emitted 2 tool_calls" in seen and "not supported" in seen, seen
+
+
+def test_b2_multi_tool_call_nudge_on_malformed_first(defaults_installed, stub_backend):
+    """B2 (malformed branch): a non-dict FIRST tool_call among several still surfaces the nudge."""
+    rl = _PLM_POLICIES["react_llm"]
+    extra = {"id": "2", "type": "function", "function": {"name": "python", "arguments": "{}"}}
+    stub_backend.script = [
+        {"content": "", "reasoning": None, "tool_calls": ["not-a-dict", extra]},  # malformed first of 2
+        make_python_call("RETURN('ok')"),
+    ]
+    out = rl("?")
+    assert out == "ok"
+    seen = " ".join((m.get("content") or "") for m in stub_backend.calls[-1]["messages"])
+    assert "you emitted 2 tool_calls" in seen and "malformed tool_call" in seen, seen

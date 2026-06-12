@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Dict, List, Optional, Type
 
 import pydantic as pd
+from pydantic_core import core_schema
 
 from .base import (
     Constraint,
@@ -39,12 +40,27 @@ def _is_struct_only(cls: type) -> bool:
     return True
 
 
+def _require_constraints(op_symbol: str, *ops: Any) -> None:
+    """Every operand of the constraint algebra MUST be a Constraint. Reject anything else LOUDLY at
+    composition time (e.g. `A | None`, `A | 5`) — otherwise a bare non-constraint gets silently
+    wrapped as a dead "branch" that quietly rejects everything, with no signal (a D1-class trap).
+    Constraints have NO nullable/Optional: a field always satisfies its constraint, so `| None` is
+    not valid — build constraints ONLY from `Constraint.field(...)` and the algebra `& | ^ ~`."""
+    for o in ops:
+        if not (isinstance(o, type) and issubclass(o, Constraint)):
+            raise TypeError(
+                f"`{op_symbol}` combines Constraints; got {o!r} ({type(o).__name__}). A field must "
+                f"satisfy a constraint — compose `Constraint.field(...)` constraints with `& | ^ ~`. "
+                f"(Constraints have no nullable/Optional; `| None` is not valid.)")
+
+
 def _and(a: type, b: type) -> type:
     """`a & b` — if both are struct-only, try to merge; else build a run-both
     wrapper. Result is always a Constraint subclass.
 
     NB2: short-circuit when both children are the same class — `A & A == A`
     semantically, and Python disallows duplicate bases anyway."""
+    _require_constraints("&", a, b)
     if a is b:
         return a
     if _is_struct_only(a) and _is_struct_only(b):
@@ -480,6 +496,7 @@ def _and_validate(children: List[type], value: Any, context: Optional[Dict] = No
 
 
 def _or(a: type, b: type) -> type:
+    _require_constraints("|", a, b)
     return _make_composite_wrapper("Or", "OR", [a, b], _or_validate)
 
 
@@ -533,6 +550,7 @@ def _not_validate(children: List[type], value: Any, context: Optional[Dict] = No
 
 
 def _xor(a: type, b: type) -> type:
+    _require_constraints("^", a, b)
     return _make_composite_wrapper("Xor", "XOR", [a, b], _xor_validate)
 
 
@@ -613,6 +631,24 @@ def _make_composite_wrapper(
             items.append(marker + desc.replace("\n", "\n" + " " * len(marker)))
         return heading + ":\n" + "\n".join(items)
 
+    def _get_core(cls, source, handler):  # noqa: ANN001
+        # As a DIRECT field annotation inside another Constraint (`v: A | B`), validate the field
+        # value through THIS composite's own validate() — threading the outer `context=` — instead
+        # of letting pydantic build a schema for an empty-fields model (a composite has NO pydantic
+        # fields), which rejects EVERY scalar and accepts garbage (D1). Mirrors the `.field()`
+        # factory's core-schema hook (base.py `_get_core`). Top-level use goes through `.validate()`
+        # directly and never hits this; list_of/dict_of elements still route via `_resolve_elem_type`.
+        return core_schema.with_info_plain_validator_function(
+            lambda v, info, _c=cls: _c.validate(
+                v, context=(info.context if info is not None else None)))
+
+    def _get_json_schema(cls, schema, handler):  # noqa: ANN001
+        # The plain-validator core schema above carries no auto JSON schema, so a struct WITH a
+        # composite field would otherwise raise PydanticInvalidForJsonSchema. Supply the composite's
+        # OWN json_schema() (allOf/anyOf/oneOf/not + hoisted child $defs) — the same shape the
+        # top-level composite emits — so `Struct.model_json_schema()` / structured-output works (D1).
+        return cls.json_schema()
+
     def _json_schema(cls):  # noqa: ANN001
         sub = [c.json_schema() if hasattr(c, "json_schema") else {} for c in children]
         # Hoist every child's `$defs` to the composite's OWN root. Pydantic emits a
@@ -680,6 +716,8 @@ def _make_composite_wrapper(
         "model_validate": classmethod(_model_validate),
         "describe": classmethod(_describe),
         "json_schema": classmethod(_json_schema),
+        "__get_pydantic_core_schema__": classmethod(_get_core),   # usable as a DIRECT field (D1)
+        "__get_pydantic_json_schema__": classmethod(_get_json_schema),   # + its JSON schema (D1)
         "model_config": pd.ConfigDict(arbitrary_types_allowed=True),
     }
     cls = _ConstraintMeta(cls_name, (Constraint,), cls_dict)  # type: ignore[call-arg]

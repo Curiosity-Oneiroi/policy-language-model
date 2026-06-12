@@ -30,6 +30,8 @@ import types
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from plm._branch_state import _CURRENT_ERR, _CURRENT_OUT, _ERR_PROXY, _OUT_PROXY
+
 
 # ===== sealed-namespace helpers — the react_llm sub-LLM ns is a CONTAINMENT boundary =====
 #
@@ -141,22 +143,34 @@ def exec_ns(
     buf_o, buf_e = io.StringIO(), io.StringIO()
     term: Optional[str] = None
     val: Any = None
-    with redirect_stdout(buf_o), redirect_stderr(buf_e):
-        try:
-            exec(compile(code, fn, "exec"), ns)         # ONE namespace = globals AND locals
-        except BaseException as e:
-            if type(e).__name__ == "_REPLReturn":       # termination sentinel (name-based, like the kernel loop)
-                proposed = getattr(e, "value", None)
-                term, val = (
-                    on_return(proposed) if on_return is not None else ("return", proposed)
-                )
-            elif isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-                raise                                   # operator/runtime control — NEVER swallow; a Ctrl-C must interrupt (K-F9/R-F7)
-            else:
-                # Write the traceback STRAIGHT to buf_e: a cell rebinding `sys.stderr`
-                # defeats redirect_stderr, so `print_exc()` could vanish — formatting to
-                # the buffer is rebind-proof. Drop THIS frame (the `exec(compile(...))`
-                # line) so the captured output shows only the run's own source.
-                tb = e.__traceback__
-                buf_e.write("".join(traceback.format_exception(type(e), e, tb.tb_next if tb else None)))
+    # Capture is IDENTICAL to the original `redirect_stdout(buf_o)` — with ONE change: redirect to
+    # the routing PROXY, not the raw buffer. The proxy forwards to `_CURRENT_OUT` (set just below) =
+    # this run's buffer, so the captured output is the same; but under parallel() each branch copies
+    # the context and has its OWN `_CURRENT_OUT`, so concurrent captures never cross-contaminate
+    # (the old raw-buffer swap was process-global and DID). In the kernel sys.stdout is already the
+    # proxy, so the redirect is a no-op there. Self-contained: works the same OUTSIDE the kernel too.
+    _tok_o = _CURRENT_OUT.set(buf_o)
+    _tok_e = _CURRENT_ERR.set(buf_e)
+    try:
+        with redirect_stdout(_OUT_PROXY), redirect_stderr(_ERR_PROXY):
+            try:
+                exec(compile(code, fn, "exec"), ns)     # ONE namespace = globals AND locals
+            except BaseException as e:
+                if type(e).__name__ == "_REPLReturn":   # termination sentinel (name-based, like the kernel loop)
+                    proposed = getattr(e, "value", None)
+                    term, val = (
+                        on_return(proposed) if on_return is not None else ("return", proposed)
+                    )
+                elif isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise                               # operator/runtime control — NEVER swallow; a Ctrl-C must interrupt (K-F9/R-F7)
+                else:
+                    # Write the traceback STRAIGHT to buf_e: a cell rebinding `sys.stderr`
+                    # defeats redirect_stderr, so `print_exc()` could vanish — formatting to
+                    # the buffer is rebind-proof. Drop THIS frame (the `exec(compile(...))`
+                    # line) so the captured output shows only the run's own source.
+                    tb = e.__traceback__
+                    buf_e.write("".join(traceback.format_exception(type(e), e, tb.tb_next if tb else None)))
+    finally:
+        _CURRENT_ERR.reset(_tok_e)
+        _CURRENT_OUT.reset(_tok_o)
     return (buf_o.getvalue() + buf_e.getvalue()) or "(no output)", term, val

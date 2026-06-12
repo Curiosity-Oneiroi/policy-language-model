@@ -169,9 +169,11 @@ def _format_repl_output(result: Dict[str, Any], max_section_chars: int = 8192) -
     into the other.
     """
     
-    # Guard against a `None` envelope (e.g. a kernel call that returned no
-    # result for some reason). Other helpers in this module similarly never
-    # raise on missing/None inputs — this one matches that contract.
+    # Guard a falsy/`None` envelope (e.g. a kernel call that returned no result): `not result` plus
+    # the `or ""` on each section below tolerate None / missing / empty. NOT a blanket "never raises"
+    # — a TRUTHY NON-STRING section (e.g. stdout=5) would still raise on `.rstrip()`. That's
+    # unreachable in practice (the sole producer, `execute_cell`, always yields string sections), so
+    # this guards the reachable None/missing case rather than coercing arbitrary types.
     if not result:
         return "(no output)"
     parts: List[str] = []

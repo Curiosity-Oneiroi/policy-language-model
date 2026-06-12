@@ -29,6 +29,8 @@ import linecache as _linecache
 import sys
 from contextlib import contextmanager as _contextmanager
 
+from plm._branch_state import _no_branch_mutation   # stdlib-only leaf; parallel-branch mutation gate
+
 
 _MISSING = object()                 # sentinel: shared with guard (it imports this one)
 
@@ -66,6 +68,9 @@ def _unsealed():
     """Temporarily lift default-policy protection on `_PLM_POLICIES`. HARNESS ONLY
     (crash-restart rehydrate / test reset). Re-entrant-safe."""
     global _STORE_UNSEALED
+    # Parallel-branch gate: unsealing lifts default-policy protection on the shared store — a
+    # world-level operation, parent-only (harness rehydrate/test reset run in the main thread).
+    _no_branch_mutation("unsealing the policy store")
     _prev = _STORE_UNSEALED
     _STORE_UNSEALED = True
     try:
@@ -91,8 +96,8 @@ class _PolicyStore(dict):
         if _STORE_UNSEALED:
             return False
         if _is_default(dict.get(self, key)):
-            from .proxy import _policy_note           # local import: break import cycle
-            _policy_note(
+            from .proxy import _note                  # local import: break import cycle
+            _note(
                 f"{key!r} is an immutable default policy; the registry refuses to "
                 f"replace/remove it. Use `duplicate_policy({key!r}, '<new_name>')` to fork."
             )
@@ -247,29 +252,42 @@ def read_policy(name):
     return _PLM_POLICIES[name]._p_source
 
 
-def rewrite_policy(name, src):
+def _by_name(name, op):
+    """The by-name edit surface: resolve `name` to its policy and run `op(policy)`, PROPAGATING the
+    method's PolicyResult so a cell can branch on it (same contract as the `.method`/`_class_*`
+    shapes) — and turning an unknown name into a descriptive PolicyResult(NOT_FOUND) instead of a raw
+    KeyError. One choke point so all five helpers stay uniform with the rest of the edit API."""
+    # Parallel-branch gate: the by-name surface reaches a policy BY NAME (not via a granted handle),
+    # so it is never grantable in a branch — even for a policy you hold an edit-grant on, use the
+    # granted handle (`predict._edit(...)`). Always refused in a branch; the choke covers all five.
+    _no_branch_mutation("a by-name policy edit", hint="Use the granted handle, e.g. `predict._edit(...)`.")
     _sync()
-    _PLM_POLICIES[name]._rewrite(src)
+    p = _PLM_POLICIES.get(name)
+    if p is None:
+        from .proxy import _fail
+        from .edits import PolicyOp
+        return _fail(PolicyOp.NOT_FOUND, f"{name!r} is not a registered policy")
+    return op(p)
+
+
+def rewrite_policy(name, src):
+    return _by_name(name, lambda p: p._rewrite(src))
 
 
 def edit_policy(name, old, new, **kw):
-    _sync()
-    _PLM_POLICIES[name]._edit(old, new, **kw)
+    return _by_name(name, lambda p: p._edit(old, new, **kw))
 
 
 def insert_into(name, after, content):
-    _sync()
-    _PLM_POLICIES[name]._insert(after, content)
+    return _by_name(name, lambda p: p._insert(after, content))
 
 
 def delete_lines(name, a, b=None):
-    _sync()
-    _PLM_POLICIES[name]._delete_lines(a, b)
+    return _by_name(name, lambda p: p._delete_lines(a, b))
 
 
 def delete_policy(name):
-    _sync()
-    _PLM_POLICIES[name]._remove()
+    return _by_name(name, lambda p: p._remove())
 
 
 # --- shared replay helper (bootstrap loader + duplicate_policy) --------------
@@ -317,8 +335,9 @@ def _install_policy_source(full_src: str, slot: str) -> None:
 # --- duplicate_policy: fork any DUPLICABLE policy into a fresh mutable copy --
 
 def duplicate_policy(name: str, new_name: str):
-    """Fork a duplicable policy under a new name. Returns the new policy (mutable) on success, or a
-    falsy `PolicyResult` (NO raise) on failure — branch on `r.status`; the detail is also noted.
+    """Fork a duplicable policy under a new name. ALWAYS returns a `PolicyValueResult` (NO raise):
+    on success `.status is OK` and `.value` is the new mutable policy (also bound by name); on failure
+    a falsy result — branch on `r.status`; the detail is also noted.
 
     Fails when:
       * `name` is not registered                          -> PolicyOp.NOT_FOUND
@@ -335,27 +354,30 @@ def duplicate_policy(name: str, new_name: str):
     self-reference, `_edit(...)` it after). The fresh proxy is mutable (not
     in `_SEALED_POLICIES`).
     """
-    from .edits import _compute_rename, PolicyOp
-    from .proxy import _fail
+    from .edits import _compute_rename, PolicyOp, PolicyValueResult
+    from .proxy import _fail_value
     from .decorator import _reserved_name_reason
 
+    # Parallel-branch gate: duplicating AUTHORS a new global (registry + __main__) — a world-level
+    # change no single branch owns. Parent-only.
+    _no_branch_mutation("duplicating a policy")
     _sync()
     if name not in _PLM_POLICIES:
-        # All refusals are a falsy PolicyResult + note (no raise) — the
+        # Every failure is a falsy PolicyValueResult + note (no raise) — the
         # _duplicate/_class_duplicate proxy wrappers + callers rely on it.
-        return _fail(PolicyOp.NOT_FOUND, f"duplicate: {name!r} is not a registered policy")
+        return _fail_value(PolicyOp.NOT_FOUND, f"duplicate: {name!r} is not a registered policy")
     if name in _SEALED_POLICIES:
-        return _fail(PolicyOp.IMMUTABLE,
-                     f"{name!r} is sealed (immutable + un-duplicable); cannot duplicate")
+        return _fail_value(PolicyOp.IMMUTABLE,
+                           f"{name!r} is sealed (immutable + un-duplicable); cannot duplicate")
     # Pre-check the SAME name rule `@policy` enforces, so a name it would later
     # reject (reserved / __ / _repl / _REPL prefix / kernel-internal) is refused
     # here with a gentle note instead of blowing up with a raw ValueError deep in
     # the install path below.
     reason = _reserved_name_reason(new_name)
     if reason is not None:
-        return _fail(PolicyOp.NAME_INVALID, f"duplicate: {reason}")
+        return _fail_value(PolicyOp.NAME_INVALID, f"duplicate: {reason}")
     if new_name in _PLM_POLICIES or new_name in _main():
-        return _fail(PolicyOp.NAME_TAKEN, f"duplicate: {new_name!r} is already taken")
+        return _fail_value(PolicyOp.NAME_TAKEN, f"duplicate: {new_name!r} is already taken")
     new_src = _compute_rename(_PLM_POLICIES[name]._p_source, new_name)
     _install_policy_source("@policy\n" + new_src, "<policy-dup-" + new_name + ">")
-    return _PLM_POLICIES.get(new_name)                 # fresh → MUTABLE
+    return PolicyValueResult(PolicyOp.OK, value=_PLM_POLICIES.get(new_name))   # fresh → MUTABLE

@@ -20,10 +20,11 @@ from .proxy import (
     _FunctionPolicy,
     _attach_class_policy_metadata,
     _class_origin_filename,
-    _policy_note,
+    _note,
     _rewrite_class_policy,
 )
 from .registry import _PLM_POLICIES, _is_default
+from plm._branch_state import _no_branch_mutation
 
 
 _RESERVED = frozenset({
@@ -71,6 +72,10 @@ def _reserved_name_reason(name: str) -> str | None:
 def policy(obj):
     if not (inspect.isfunction(obj) or inspect.isclass(obj)):
         raise TypeError("@policy supports functions and classes only")
+    # Parallel-branch gate: defining OR re-decorating a policy authors/replaces a global (registry
+    # + __main__) — a world-level change no single branch owns. Parent-only. To tweak a policy's
+    # body in a branch, grant it via with_edit(...) and use the handle (`predict._edit(...)`).
+    _no_branch_mutation("@policy (defining or redefining a policy)")
     name = obj.__name__
     reason = _reserved_name_reason(name)                  # shared rule (see duplicate_policy)
     if reason is not None:
@@ -92,7 +97,7 @@ def policy(obj):
     # registry anchor. Without this the kind-change path below could pop+recreate a sealed class as
     # an attacker function in __main__ for the rest of the cell.
     if _existing0 is not None and _is_default(_existing0):
-        _policy_note(
+        _note(
             f"@policy {name!r}: immutable default policy; re-decoration ignored. "
             f"Use `duplicate_policy({name!r}, '<new_name>')` to fork it."
         )
@@ -211,7 +216,7 @@ def _warn_if_captures_locals(obj):
                 seen.update(n for n in fn.__code__.co_freevars if n != "__class__")
         free = tuple(sorted(seen))
     if free:
-        _policy_note(
+        _note(
             f"@policy {obj.__name__!r}: captures enclosing-function local(s) {free} "
             f"— lost when the policy is re-exec'd standalone; will NameError at call "
             f"unless they exist as REPL globals. Reference REPL globals or inline.")

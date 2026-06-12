@@ -24,22 +24,22 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# --- the policy-mutation outcome type (returned only on a problem / caveat) ----
+# --- the policy-mutation outcome types -----------------------------------------
 #
-# A `PolicyResult` is the structured, descriptive replacement for the old "return
-# None + write a note" failure path: it lets the CALLING code branch on what went
-# wrong (`r.status`), read the detail (`r.detail`, the traceback-ish text), and —
-# on a caveat — still receive a produced object (`r.value`). It is returned ONLY
-# when there is something to report; a clean success returns the normal thing
-# (None for the in-place edit/remove methods, the new policy for duplicate_policy)
-# so the success path — and every existing caller that ignores the return — is
-# unchanged. The detail is ALSO emitted as a `[policy]` stderr note (the backstop),
-# so an unchecked caller still sees it.
+# EVERY policy mutation ALWAYS returns a result object — on success AND failure —
+# so PLM writes ONE handling pattern (`if r: ... else: handle(r.status)`) and never
+# has to special-case a `None`. The two shapes differ only by whether the op
+# produces a new object:
+#   * in-place ops (edit/insert/delete/rewrite/remove) -> `PolicyResult(status, detail)`
+#   * value ops    (duplicate_policy)                   -> `PolicyValueResult(.., value)`
+# On a problem the `detail` is ALSO written to the cell's stderr as a `[policy]`
+# note (the backstop), so an unchecked caller still sees what went wrong.
 
 class PolicyOp(enum.Enum):
-    """Why a policy mutation reported a problem (or a caveat). Descriptive (a class, not a bare
-    int), so calling code can branch precisely: `if r.status is PolicyOp.NO_MATCH: ...`."""
-    # --- hard failures: the operation did NOT apply ---
+    """The outcome status of a policy mutation. Descriptive (a class, not a bare int), so calling
+    code can branch precisely: `if r.status is PolicyOp.NO_MATCH: ...`. `OK` is the sole success."""
+    OK = "ok"                         # the operation applied successfully
+    # --- failures: the operation did NOT apply ---
     NO_MATCH = "no_match"             # _edit/_insert/_delete matched nothing / produced no change
     BAD_ARGS = "bad_args"             # wrong-typed / invalid argument (e.g. non-string old/new)
     SYNTAX_ERROR = "syntax_error"     # new source does not parse
@@ -49,35 +49,37 @@ class PolicyOp(enum.Enum):
     NAME_INVALID = "name_invalid"     # reserved / kernel-internal / otherwise illegal name
     IMMUTABLE = "immutable"           # target is a sealed/default policy (un-editable, un-duplicable)
     NOT_FOUND = "not_found"           # the named policy does not exist
-    # --- caveats: the operation APPLIED, but with a consequence worth flagging ---
-    STRUCTURAL_FALLBACK = "structural_fallback"   # edit applied by REPLACING the class (old instances stale)
 
 
 @dataclass(frozen=True)
 class PolicyResult:
-    """Outcome of a policy mutation, returned ONLY when there is something to report (a failure or a
-    caveat). A clean success does NOT produce one — the in-place edit/remove methods return None and
-    `duplicate_policy` returns the new policy, exactly as before.
-
-    Fields: `status` (a `PolicyOp` — the descriptive reason), `detail` (the human/"traceback-ish"
-    message; also written to the cell's stderr as a `[policy]` note so an unchecked caller still sees
-    it), and `value` (a produced object handed back only on a CAVEAT result, else None).
-
-    Always falsy, so the two idioms read naturally:
-        r = predict._edit("old", "new")          # in-place op
-        if r is not None: ...                     #   -> a problem (r.status / r.detail)
-        d = duplicate_policy("a", "b")            # value op
-        if not d: ...                             #   -> a problem; on success `d` is the new policy
-    """
+    """Outcome of an IN-PLACE policy mutation (edit/insert/delete/rewrite/remove) — ALWAYS returned,
+    success or failure. `status` is a `PolicyOp` (`OK` on success); `detail` is the human/
+    "traceback-ish" message (also written to stderr as a `[policy]` note on a problem). Truthy iff
+    OK, so the one idiom reads:
+        r = predict._edit("old", "new")
+        if r: ...                      # applied
+        else: handle(r.status, r.detail)
+    These ops produce no object, so there is deliberately NO `value` field (see PolicyValueResult)."""
     status: "PolicyOp"
     detail: str = ""
-    value: Any = None
 
     def __bool__(self) -> bool:
-        return False
+        return self.status is PolicyOp.OK
 
     def __repr__(self) -> str:
-        return f"PolicyResult({self.status.name}" + (f": {self.detail}" if self.detail else "") + ")"
+        return f"{type(self).__name__}({self.status.name}" + (f": {self.detail}" if self.detail else "") + ")"
+
+
+@dataclass(frozen=True)
+class PolicyValueResult(PolicyResult):
+    """Outcome of a VALUE-producing policy mutation (`duplicate_policy`) — ALWAYS returned, success or
+    failure, so the caller never has to tell a bare policy apart from an error object. Adds `value`:
+    the produced policy on success (`status is OK`), `None` on failure.
+        r = duplicate_policy("a", "b")
+        if r: use(r.value)             # the new policy (also bound by name)
+        else: handle(r.status)"""
+    value: Any = None
 
 
 # --- @policy decorator detection / stripping (line-based, comment-preserving) ---
