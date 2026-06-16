@@ -35,6 +35,29 @@ except Exception:
 import signal as _repl_signal_mod
 _repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.SIG_IGN)
 
+# TRUSTED signal handles, captured at boot BEFORE any cell runs — immune to a later
+# `sys.modules['signal']` poison (the per-cell `import signal` would return the fake). Arm/disarm
+# go through these, each SWALLOWING any failure: a thrown arm/disarm must NEVER escape and turn an
+# executed cell into a spurious boot_error / false "did NOT execute" (M4).
+_REPL_SIG_SET = _repl_signal_mod.signal
+_REPL_SIGINT = _repl_signal_mod.SIGINT
+_REPL_SIG_IGN = _repl_signal_mod.SIG_IGN
+_REPL_SIG_DFL = _repl_signal_mod.default_int_handler
+
+
+def _repl_arm_sigint():
+    try:
+        _REPL_SIG_SET(_REPL_SIGINT, _REPL_SIG_DFL)
+    except Exception:
+        pass                                              # arm failed -> body just isn't SIGINT-abortable
+
+
+def _repl_disarm_sigint():
+    try:
+        _REPL_SIG_SET(_REPL_SIGINT, _REPL_SIG_IGN)
+    except Exception:
+        pass                                              # disarm failed -> never let it escape the cell
+
 _repl_sock = _repl_socket.socket(_repl_socket.AF_UNIX, _repl_socket.SOCK_STREAM)
 _repl_sock.connect(_repl_os.environ["_REPL_SOCK_PATH"])
 _repl_sock_io = _repl_sock.makefile("rwb", buffering=0)
@@ -83,12 +106,18 @@ def _repl_reset_buffers():
     global _repl_stdout_buf, _repl_stderr_buf
     _repl_stdout_buf = _io.StringIO()
     _repl_stderr_buf = _io.StringIO()
-    # Re-assert the routing proxy (a cell may have rebound sys.stdout) and re-point the top-level
-    # (non-branch) streams at the freshly-recreated buffers. The proxy + set_main_streams come from
-    # PREFIX (`_repl_`-prefixed globals); the kernel still READS `_repl_stdout_buf` for cell output.
-    _sys.stdout = _repl_out_proxy
-    _sys.stderr = _repl_err_proxy
-    _repl_set_main_streams(_repl_stdout_buf, _repl_stderr_buf)
+    # Re-derive the routing proxies + set_main_streams FRESH from the trusted module each cell — NOT
+    # from the `_repl_`-prefixed __main__ aliases PREFIX bound. Those aliases are excluded from the
+    # Guard C+ canon (`_REPL_INJECTED` filters `_repl`/`_REPL`), so a cell rebinding one (e.g.
+    # `_repl_out_proxy = 0`) would otherwise propagate here and PERMANENTLY brick stdout/stderr
+    # capture — unlike `_repl_stdout_buf`, which is recreated each cell and self-heals. A fresh
+    # import resolves through sys.modules, ignoring any cell rebind (the R5-1 pattern the loop uses
+    # to re-import plm.repl._kernel_state). `_repl_bs` is a function-local, not a __main__ name, so
+    # there is nothing for a cell to clobber. The kernel still READS `_repl_stdout_buf` for output.
+    import plm._branch_state as _repl_bs
+    _sys.stdout = _repl_bs._OUT_PROXY
+    _sys.stderr = _repl_bs._ERR_PROXY
+    _repl_bs.set_main_streams(_repl_stdout_buf, _repl_stderr_buf)
 '''
 
 
@@ -169,7 +198,7 @@ while True:
             # mutables" semantic (PLM-deleted extras stay deleted) BUT force the
             # LLM defaults to come from on-disk source.
             from plm.policy.defaults import _bless_llm_callers as _repl_bless_after
-            from plm.policy.registry import _unsealed as _repl_unsealed, _SEALED_POLICIES as _repl_sealed
+            from plm.policy.registry import _unsealed as _repl_unsealed, _SEALED_POLICIES as _repl_sealed, _store_writable as _repl_store_writable
 
             # Snapshot the FRESH-PREFIX boot policies (name -> proxy) BEFORE the
             # registry reset below, so orphaned __main__ bindings can be reaped
@@ -192,7 +221,7 @@ while True:
                 # The registry protects sealed entries during normal cell exec; this is a
                 # harness-owned full reset, so drop the seal for it. `_unsealed` keeps this path
                 # explicit + force-restores the freshly-installed v0 regardless of the snapshot.
-                with _repl_unsealed():
+                with _repl_unsealed(), _repl_store_writable():   # harness rehydrate -> authorize registry writes
                     _PLM_POLICIES.clear()
                     _PLM_POLICIES.update(_repl_restored.pop("_PLM_POLICIES"))
                     _PLM_POLICIES.update(_repl_saved_sealed)    # force-overwrite back to v0
@@ -385,18 +414,23 @@ while True:
     # ARM SIGINT for the cell BODY ONLY: a timeout SIGINT lands here -> KeyboardInterrupt ->
     # caught below as an interrupted-result (graceful abort). It is IGNORED in every other phase
     # (see the kernel-wide SIG_IGN in KERNEL_BOOTSTRAP), so it can never escape into a spurious
-    # boot_error / false "did NOT execute". Re-import fresh (defeat a prior cell's rebind of the
-    # alias) to arm, and DISARM in `finally` (re-import fresh too) so a SIGINT arriving a hair after
-    # exec returns is ignored — and so a cell that rebinds the alias can't break the restore.
-    import signal as _repl_signal_mod
-    _repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.default_int_handler)
+    # boot_error / false "did NOT execute". The armed window is EXACTLY the exec: the inner
+    # `finally` DISARMs the instant exec returns/raises — BEFORE the classification/traceback block
+    # below — so a late, mis-timed timeout SIGINT can't tear the traceback formatting. Arm and
+    # disarm go through the trusted-ref helpers, which can't throw even if a cell poisoned
+    # `sys.modules['signal']`.
+    _repl_arm_sigint()
     try:
-        _builtins.exec(_builtins.compile(_repl_code, _repl_cell_file, "exec"), _repl_g, _repl_g)
+        try:
+            _builtins.exec(_builtins.compile(_repl_code, _repl_cell_file, "exec"), _repl_g, _repl_g)
+        finally:
+            _repl_disarm_sigint()
     except BaseException as _repl_exc:
         # Classify the terminal with a FRESHLY re-imported builtins, not the bare
         # `_builtins` the cell just had a chance to rebind: a fake `_builtins` whose
         # `.type`/`.getattr` lie could otherwise mask the cell's own exception as a
-        # silent RETURN (or hide its traceback). Guard C must still run below.
+        # silent RETURN (or hide its traceback). Guard C must still run below. SIGINT is
+        # already DISARMED here (inner finally), so this block can't be torn by a late SIGINT.
         import builtins as _repl_builtins
         _repl_exc_name = _repl_builtins.type(_repl_exc).__name__
         if _repl_exc_name == "_REPLReturn":
@@ -410,11 +444,6 @@ while True:
             _repl_stderr_buf.write("".join(_traceback.format_exception(
                 _repl_builtins.type(_repl_exc), _repl_exc,
                 _repl_tb_obj.tb_next if _repl_tb_obj else None)))
-    finally:
-        # DISARM: late SIGINT (after the cell finished) is now ignored through the guards/snapshot/
-        # write_frame/idle, so it can't tear the result or fake a "did NOT execute".
-        import signal as _repl_signal_mod
-        _repl_signal_mod.signal(_repl_signal_mod.SIGINT, _repl_signal_mod.SIG_IGN)
 
     # Re-establish a TRUSTED handle to the REAL __main__ globals before Guard C.
     # A cell can rebind the bare `_repl_g` (or `_builtins`) __main__ name during its

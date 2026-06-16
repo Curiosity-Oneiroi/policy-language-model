@@ -23,7 +23,7 @@ from .proxy import (
     _note,
     _rewrite_class_policy,
 )
-from .registry import _PLM_POLICIES, _is_default
+from .registry import _PLM_POLICIES, _is_default, _store_writable
 from plm._branch_state import _no_branch_mutation
 
 
@@ -52,6 +52,10 @@ def _reserved_name_reason(name: str) -> str | None:
     if keyword.iskeyword(name):                            # but `def NAME` on one is a SyntaxError -> refuse
         return f"{name!r} is a Python keyword"             # gently here. SOFT keywords (match/case/type/_) are
                                                            # VALID def/class names, so they are NOT rejected (NP3-6).
+    import builtins as _bi                                  # a policy named print/len/sum/type/... would
+    if hasattr(_bi, name):                                  # silently CLOBBER that builtin in the namespace,
+        return (f"{name!r} shadows a Python builtin — a policy by that name would clobber "  # breaking later
+                f"it in the namespace")                     # code that calls it. Pick another name.
     if name in _RESERVED:
         return f"{name!r} is a reserved kernel name"
     # Kernel-internal prefixes are filtered by the snapshot collector, so such a
@@ -123,9 +127,16 @@ def policy(obj):
         same_kind = isinstance(existing, _FunctionPolicy) == inspect.isfunction(obj)
         if same_kind:                                     # edit in place (identity kept where possible)
             if isinstance(existing, _FunctionPolicy):
-                existing._rewrite(source)
+                _rw = existing._rewrite(source)
             else:
-                _rewrite_class_policy(existing, source)
+                _rw = _rewrite_class_policy(existing, source)
+            # `_rewrite`/`_rewrite_class_policy` REPORT failure by returning a falsy PolicyResult
+            # (SyntaxError/not-one-def/bad-source/immutable/...) rather than raising. Swallowing it
+            # let a re-decoration that DIDN'T apply silently report success with the stale policy.
+            # Surface it loudly — `@policy` already raises on a bad name, so failing here is consistent.
+            if _rw is not None and hasattr(_rw, "status") and not _rw:
+                raise ValueError(
+                    f"@policy {name!r}: re-decoration did not apply — {getattr(_rw, 'detail', _rw)}")
             # Re-fetch the CANONICAL object from the registry rather than blindly
             # reusing `existing`. A class rewrite that needs a structural change
             # (metaclass / __slots__ / incompatible bases) can't apply in place —
@@ -155,7 +166,8 @@ def policy(obj):
         ns = {}
         exec(compile(source, stable, "exec"), main_globals, ns)   # under __main__; a `def`
         proxy = _FunctionPolicy(ns[name], source, stable)         # has no side effects
-        _PLM_POLICIES[name] = main_globals[name] = proxy
+        with _store_writable():           # sanctioned install path -> authorize the registry write
+            _PLM_POLICIES[name] = main_globals[name] = proxy
         return proxy
 
     ns = {}
@@ -169,7 +181,8 @@ def policy(obj):
     exec(compile(source, stable, "exec"), main_globals, ns)       # under __main__ too
     cls = ns[name]
     _attach_class_policy_metadata(cls, source, stable)
-    _PLM_POLICIES[name] = main_globals[name] = cls
+    with _store_writable():               # sanctioned install path -> authorize the registry write
+        _PLM_POLICIES[name] = main_globals[name] = cls
     return cls
 
 

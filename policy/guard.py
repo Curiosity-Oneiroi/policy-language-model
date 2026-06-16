@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import ast
 
-from .registry import _SEALED_POLICIES, _MISSING, _PLM_POLICIES
+from .registry import _SEALED_POLICIES, _MISSING, _PLM_POLICIES, _store_writable
 
 
 def _names_in_target(target):
@@ -221,7 +221,8 @@ def _post_cell_guard(cell_globals, stderr_buf):
                     f"`duplicate_policy({name!r}, '<new_name>')` to fork it.\n"
                 )
                 continue
-            _PLM_POLICIES.pop(name, None)       # mutable del -> cleanup
+            with _store_writable():             # Guard C cleanup -> authorize the registry write
+                _PLM_POLICIES.pop(name, None)   # mutable del -> cleanup
             continue
         cell_globals[name] = canonical          # rebound -> restore + note
         tail = (

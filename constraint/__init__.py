@@ -12,15 +12,17 @@ Public API
 
     # Pattern 2 — value/field rule via Constraint.field (the public authoring
     # entry; works standalone AND embeds FLAT as a struct field):
-    c = Constraint.field(int_range=(0, 9))
-    c = Constraint.field(predicate=is_prime, description="must be prime")
-    c = Constraint.field(coercer=str.lower, str_pattern=r"^[a-z]+$")
-    c = Constraint.field(coercers=[strip_bom, normalize_spaces, str.lower])
+    c = Constraint.field(type=int, int_range=(0, 9))
+    c = Constraint.field(type=int, predicate=is_prime, description="must be prime")
+    c = Constraint.field(type=str, coercer=str.lower, str_pattern=r"^[a-z]+$")
+    c = Constraint.field(type=str, coercers=[strip_bom, normalize_spaces, str.lower])
 
-    # The full Constraint.field(**kw) kwarg surface — int/float/str/list/tuple/set/
-    # dict/bytes/complex rules (e.g. list_contains=X for list-element membership via
-    # `in`, subset_of/superset_of, multiple_of, kind=...) — is catalogued by type in
-    # the `plm.constraint.base` module docstring.
+    # Every field has a MANDATORY type coercer, ALWAYS spelled `type=`: a builtin, a typing
+    # generic (list[int]/dict[str,int]/tuple[..]/set[int]/frozenset[int]), a Literal[...] (an
+    # enum of values), or a Constraint struct. It is the sole source of the schema "type".
+    # Everything else (int_range, str_pattern, is_instance_of, kind=, multiple_of, ...) is
+    # a PREDICATE — a pure check that never sets a type. The full kwarg surface is
+    # catalogued in the `plm.constraint.base` module docstring.
 
     # Composition (closed under &, |, ~, ^):
     c1 & c2     # both must pass; struct-only pair auto-merges into one model
@@ -55,9 +57,9 @@ contracts so each has one clear meaning:
                                Multiple coercers chain left → right: fn1's
                                output feeds fn2.
 
-Execution order in one `Constraint.field(...)` call:
+Execution order in one `Constraint.field(...)` call (the 3-stage pipeline):
 
-    coercer(s)  →  type & Field(...) constraints  →  predicate(s)
+    coercer(s)  →  the type coercer (establishes the type)  →  predicate(s)
 
 PLM authors typically use one of:
   - `predicate=` alone for pure checks.
@@ -68,7 +70,7 @@ PLM authors typically use one of:
 Built-in `kind=` registry
 =========================
 
-`Constraint.field(kind="semver")`, `kind="url"`, `kind="json"`, `kind="email"`,
+`Constraint.field(type=str, kind="semver")`, `kind="url"`, `kind="json"`, `kind="email"`,
 `kind="iso_date"`, `kind="uuid"`, `kind="identifier"`, `kind="regex"`,
 `kind="path_exists"`. PLM can extend at runtime:
 

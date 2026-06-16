@@ -151,11 +151,11 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
             `base_verifier`) but optional. The verifier runs in trusted
             policy scope (NOT the sub-LLM's restricted exec), wrapped in its
             own `descend()` so the depth guard caps any circuit it spawns at
-            depth-1 (root=2). Because it runs one level below and its circuits
-            are depth-1, a verifier needs depth >= 2: calling WITH a verifier at
-            depth=1 (or any remaining < 2) raises LLMDepthExceeded UP FRONT,
-            before any backend call. Exceptions the verifier raises propagate
-            (fail-loud).
+            depth-1 (root=2). There is NO up-front depth pre-reject: a PURE-CODE
+            verifier (no LLM) needs zero extra depth and runs even at depth=1; a
+            verifier that DOES build an LLM circuit is gated by that circuit's
+            own depth check (LLMDepthExceeded at the actual call). Exceptions the
+            verifier raises propagate (fail-loud).
 
     Returns:
 
@@ -174,9 +174,9 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
         - ConstraintViolation: budget exhausted; final RETURN(s) all
           failed validation. The model has seen each failure in the
           conversation history.
-        - LLMDepthExceeded: the depth budget is at 0 before a generate, OR a
-          `verifier` is set with fewer than 2 levels remaining (e.g. depth=1) —
-          the latter is raised UP FRONT, before any backend call.
+        - LLMDepthExceeded: the depth budget is at 0 before a generate (incl. a
+          verifier-spawned LLM circuit hitting the cap at its own call — there is
+          NO up-front pre-reject, so a pure-code verifier runs even at depth=1).
 
         (Identifier-invalid / Python-keyword kwargs keys are NOT raised and
         NOT surfaced to PLM — they add a namespace note to the SUB-LLM's own
@@ -239,7 +239,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
     from plm.plm_tools import _tool_python
     from plm._react_helper import _strip_code_fences
     from plm.policy.defaults._llm_infra import (
-        _make_backend, descend, llm_call, check_depth_or_raise, _remaining, LLMDepthExceeded)
+        _make_backend, descend, llm_call, check_depth_or_raise)
 
     # Resolve None-sentinel mutable defaults (no shared-default footgun).
     kwargs = {} if kwargs is None else kwargs
@@ -253,7 +253,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
     _reserved_gk = {"messages", "tools"} & set(generate_kwargs)
     if _reserved_gk:
         raise ValueError(
-            f"generate_kwargs may not contain {sorted(_reserved_gk)} — react_llm passes "
+            f"generate_kwargs may not contain {sorted(_reserved_gk)} — react_verifier_llm passes "
             f"`messages` and `tools` itself; put backend params (temperature, max_tokens, ...) here")
 
     # ---- kwargs validation (bulletproof) ---------------------------------
@@ -406,10 +406,11 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
         _ns_note = ("[namespace] Some granted inputs have names that are not valid Python "
                     "identifiers (or are Python keywords), so you can't use them as bare names — "
                     f"access them via kwargs[<key>]: {sorted(_bad_idents)}.")
-        if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
-            msgs[0]["content"] = (msgs[0].get("content") or "") + "\n\n" + _ns_note
-        else:
-            msgs.insert(0, {"role": "system", "content": _ns_note})
+        # add a FRESH, dedicated system message — NEVER mutate one of the caller's own message
+        # dicts (the by-reference weaving contract is append-only). (L8: re-passing the SAME woven
+        # thread through react_verifier_llm re-adds this note — an accepted artifact of weaving,
+        # deliberately NOT de-duplicated here.)
+        msgs.insert(0, {"role": "system", "content": _ns_note})
     # ---- the sub-agent's OWN repl namespace (`ns`) ----
     # ONE dict, used as BOTH globals and locals in `_exec`, so it behaves like
     # the sub-agent's private "repl globals" — modeled on how PLM's kernel runs
@@ -460,15 +461,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
     
     with llm_call(depth):                               # voluntary lowering (no-op if depth=None)
         check_depth_or_raise()                          # depth gate FIRST: a clear LLMDepthExceeded, not a backend-spec error
-        if verifier is not None and _remaining() < 2:
-            # A verifier runs ONE level below (its own descend()) and its checks are
-            # depth-1 circuits, so it needs >= 2 levels of remaining budget. Fail UP
-            # FRONT with a clear error rather than crashing mid-loop when the verifier
-            # hook's descend() hits 0. (D2 — depth=1 + verifier is unsupported.)
-            raise LLMDepthExceeded(
-                f"react_verifier_llm: a verifier needs depth >= 2 (it runs one level "
-                f"below and composes depth-1 circuits), but only {_remaining()} level(s) "
-                f"remain. Call without a verifier, or raise the depth / AGENT_DEPTH.")
+        
         backend = _make_backend()
         for _round in range(max_turns + return_budget):
             check_depth_or_raise()                      # policy owns the depth gate

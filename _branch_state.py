@@ -69,6 +69,10 @@ class _StreamProxy:
         return self._target().flush()
 
     def __getattr__(self, name):         # encoding / isatty / fileno / errors / ... -> the buffer
+        # if the slots are ever unset (e.g. mid-unpickle), `self._var` inside `_target()` would
+        # re-enter __getattr__ forever -> RecursionError. Give a clean AttributeError instead.
+        if name in ("_var", "_fallback"):
+            raise AttributeError(name)
         return getattr(self._target(), name)
 
 
@@ -116,7 +120,7 @@ def _rename_guard(target, new_name):
     """A branch grant is for an IN-PLACE body edit; renaming a policy (changing its def name) claims
     a new global name — a namespace change no single branch owns, so it is parent-only."""
     if _IN_PARALLEL_BRANCH.get():
-        old = getattr(target, "_p_name", None)
+        old = _policy_label(target)        # uniform name accessor (works for function + class policies)
         if new_name != old:
             raise ParallelMutationError(
                 f"cannot rename policy {old!r} -> {new_name!r} inside a parallel() branch: a grant "
@@ -166,7 +170,10 @@ def with_edit(task, *policies):
     if not callable(task):
         raise TypeError("with_edit(task, *policies): `task` must be a zero-arg callable (a branch).")
     for p in policies:
-        if not hasattr(p, "_p_name"):
+        # KIND-AGNOSTIC policy check: `_p_source` is part of the uniform `_p_*` interface that BOTH
+        # a function proxy AND a class policy carry — unlike `_p_name`, which used to be proxy-only
+        # (so checking it rejected every class policy). A policy also exposes the edit API.
+        if not (hasattr(p, "_p_source") and hasattr(p, "_rewrite")):
             raise TypeError(
                 f"with_edit: {p!r} is not a policy — you can only grant edit access to a policy "
                 f"object (e.g. `with_edit(task, predict)`)."

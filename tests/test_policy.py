@@ -34,7 +34,9 @@ def _isolate():
     yield
     for n in list(_PLM_POLICIES):
         main.pop(n, None)
-    _PLM_POLICIES.clear()
+    from plm.policy.registry import _store_writable
+    with _store_writable():                          # harness reset -> authorize the registry write
+        _PLM_POLICIES.clear()
     # also drop any stray names @policy injected that weren't in the registry
     for n in set(main) - before:
         main.pop(n, None)
@@ -679,9 +681,9 @@ def test_int_crash_restart_constraints_survive():
         # class with a default, a Field bound, and a validator (reconstructed from fields).
         s.execute_cell(
             "from pydantic import Field, model_validator\n"
-            "field_c = Constraint.field(is_instance_of=int, predicate=lambda x: x > 100)\n"
-            "comp_c = Constraint.field(is_instance_of=int) & "
-            "Constraint.field(is_instance_of=int, predicate=lambda x: x > 0)\n"
+            "field_c = Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 100)\n"
+            "comp_c = Constraint.field(type=object, is_instance_of=int) & "
+            "Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 0)\n"
             "class StructC(Constraint):\n"
             "    name: str = 'anon'\n"
             "    n: int = Field(ge=0)\n"
@@ -729,12 +731,13 @@ def test_int_crash_restart_nested_constraints_survive():
         pytest.skip(f"could not start pydantic kernel: {e}")
     try:
         s.execute_cell(
+            "from typing import Literal\n"
             "class Address(Constraint):\n    city: str\n"
             "class Person(Constraint):\n    name: str\n    addr: Address\n"
             "class Order(Constraint):\n"
-            "    currency: Constraint.field(one_of=['USD','EUR'])\n"
-            "    qty: Constraint.field(int_range=(1,100))\n"
-            "nested = Constraint.field(list_of=Constraint.field(int_range=(1,5)))\n"
+            "    currency: Constraint.field(type=Literal['USD','EUR'])\n"
+            "    qty: Constraint.field(type=int, int_range=(1,100))\n"
+            "nested = Constraint.field(type=list[Constraint.field(type=int, int_range=(1,5))])\n"
             "some_var = 42\n")                          # a plain sibling: must NOT be sunk
         ep = s.kernel_epoch
         r0 = s.execute_cell("import os as _o\n_o._exit(0)")   # hard crash -> respawn + rehydrate
@@ -2114,5 +2117,91 @@ def test_policyresult_uniform_across_class_and_by_name():
         assert out("print(edit_policy('does_not_exist', 'a', 'b').status.name)") == "NOT_FOUND"
         assert out("print(insert_into('greet', 0, 123).status.name)") == "BAD_ARGS"
         assert out("print(bool(edit_policy('greet', \"'hi'\", \"'yo'\")), greet(0))") == "True yo"   # OK + applied
+    finally:
+        s.close()
+
+
+def test_registry_read_only_to_model_main_loop_and_branch():
+    """H1+: the policy registry is READ-ONLY to cell/model code. A bare `_PLM_POLICIES.pop()/.clear()/
+    [x]=` is refused in the main loop AND inside a `parallel()` branch (where it previously silently
+    wiped the SHARED registry). Deletion/authoring go through the sanctioned API only, which still
+    works. Reads (`list_policies`, `_PLM_POLICIES[x]`) stay free."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                                  # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        s.execute_cell("@policy\ndef alpha(x): return x")
+        out = s.execute_cell(
+            "try:\n"
+            "    _PLM_POLICIES.pop('alpha')\n"
+            "    direct = 'ALLOWED'\n"
+            "except TypeError:\n"
+            "    direct = 'refused'\n"
+            "r = parallel(lambda: _PLM_POLICIES.pop('alpha', 'M'), lambda: _PLM_POLICIES.clear())\n"
+            "branch_refused = all(isinstance(x, BaseException) for x in r)\n"
+            "print(direct, branch_refused, 'alpha' in list_policies())")
+        assert out.get("stdout", "").strip() == "refused True True", out
+        # sanctioned API still works
+        out = s.execute_cell("print(bool(delete_policy('alpha')), 'alpha' not in list_policies())")
+        assert out.get("stdout", "").strip() == "True True", out
+    finally:
+        s.close()
+
+
+def test_with_edit_grants_work_for_class_policies():
+    """H2 + M1 (root: class policies now carry the uniform `_p_name`): a CLASS policy can be granted
+    an IN-PLACE edit in a `parallel()` branch — `with_edit` no longer rejects classes (policy-hood is
+    checked kind-agnostically via `_p_source`/`_rewrite`), and `_rename_guard` no longer mis-fires on
+    a class in-place edit. An ungranted class edit is still refused; a rename is still refused."""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                                  # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        s.execute_cell("@policy\nclass Net:\n    def __call__(self, x):\n        return x + 1")
+        out = s.execute_cell(
+            "has_name = (getattr(Net, '_p_name', None) == 'Net')\n"
+            "g, _ = parallel(with_edit(lambda: Net._edit('x + 1', 'x + 100'), Net), lambda: 0)\n"
+            "granted = (not isinstance(g, BaseException)) and bool(g) and Net()(5) == 105\n"
+            "u = parallel(lambda: Net._edit('x + 100', 'x + 9'))\n"
+            "ungranted_refused = type(u[0]).__name__ == 'ParallelMutationError'\n"
+            "rn = parallel(with_edit(lambda: Net._rewrite("
+            "    'class R:\\n    def __call__(self, x):\\n        return x'), Net))\n"
+            "rename_refused = type(rn[0]).__name__ == 'ParallelMutationError' and 'Net' in list_policies()\n"
+            "print(has_name, granted, ungranted_refused, rename_refused)")
+        assert out.get("stdout", "").strip() == "True True True True", out
+        # main-loop class rename keeps the uniform _p_name in sync with __name__
+        out = s.execute_cell(
+            "Net._rewrite('class Net2:\\n    def __call__(self, x):\\n        return x')\n"
+            "print(_PLM_POLICIES['Net2']._p_name == 'Net2')")
+        assert out.get("stdout", "").strip() == "True", out
+    finally:
+        s.close()
+
+
+def test_proxy_global_rebind_does_not_brick_capture():
+    """H3 + M10: a cell rebinding the `_repl_`-prefixed stream-proxy / set_main_streams globals must
+    NOT brick or silently lose output capture — `_repl_reset_buffers` re-derives them FRESH from
+    `plm._branch_state` each cell (the R5-1 re-import pattern), so a clobber in __main__ is ignored.
+    (Pre-fix: clobbering `_repl_out_proxy` permanently bricked stdout for the rest of the session.)"""
+    try:
+        from plm.repl import PythonReplSession
+        s = PythonReplSession(workspace=None, preinstall=("dill",),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                                  # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        s.execute_cell("_repl_out_proxy = 12345; _repl_err_proxy = None")    # H3: clobber the proxy alias
+        out = s.execute_cell("print('after-proxy-rebind')")
+        assert out.get("stdout", "").strip() == "after-proxy-rebind", out
+        assert "AttributeError" not in (out.get("stderr") or ""), out
+        s.execute_cell("_repl_set_main_streams = lambda *a, **k: None")      # M10: clobber set_main_streams
+        out = s.execute_cell("print('after-sms-rebind')")
+        assert out.get("stdout", "").strip() == "after-sms-rebind", out      # output not silently lost
     finally:
         s.close()

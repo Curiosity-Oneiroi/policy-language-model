@@ -50,6 +50,7 @@ from plm.policy.proxy import (
 from plm.policy.registry import (
     _install_policy_source,
     _seal,
+    _store_writable,
     _unsealed,
 )
 
@@ -61,9 +62,9 @@ def _clear_registry() -> None:
     main = sys.modules["__main__"].__dict__
     for n in list(_PLM_POLICIES):
         main.pop(n, None)
-    with _unsealed():                 # harness reset: the store retains defaults while sealed
+    with _unsealed(), _store_writable():   # harness reset: unseal (drop defaults too) + authorize the write
         _PLM_POLICIES.clear()
-    _SEALED_POLICIES.clear()
+        _SEALED_POLICIES.clear()           # removal is gated -> must be inside the unsealed context
 
 
 @pytest.fixture(autouse=True)
@@ -429,21 +430,27 @@ def test_8_natural_llm_constraint_passes(defaults_installed, stub_backend):
     assert len(stub_backend.calls) == 1
 
 
-def test_f1_natural_llm_rejects_non_json_schema_constraint(defaults_installed, stub_backend):
-    """F1: a constraint with NO JSON-schema representation — e.g. a struct embedding a
-    `Constraint.field(is_instance_of=...)` field — slips natural_llm's `_contains_factory` guard (it
-    only walks composites, not struct fields), and `is_instance_schema` has no JSON schema. natural_llm
-    must raise a CLEAR TypeError (like the factory case), NOT an uncaught PydanticInvalidForJsonSchema
-    crash, and make NO generate call."""
+def test_f1_is_instance_of_struct_field_is_airtight(defaults_installed, stub_backend):
+    """F1 (post-reframe): `is_instance_of` is now a PURE predicate (sets no type, contributes no
+    schema) instead of a pydantic `is_instance_schema`. So a struct embedding a
+    `Constraint.field(type=object, is_instance_of=...)` field NO LONGER crashes json_schema() — the
+    old uncaught PydanticInvalidForJsonSchema path is gone, json_schema() is AIRTIGHT (the isinstance
+    rule degrades to an x-description / runtime check). natural_llm builds a schema and PROCEEDS
+    (the isinstance check runs as a post-generation validate), rather than raising upfront."""
     from plm.constraint import Constraint
 
     class S(Constraint):
-        x: Constraint.field(is_instance_of=int)
+        x: Constraint.field(type=object, is_instance_of=int)
 
+    # Airtight: building the schema must NOT raise (this is exactly what used to crash).
+    schema = S.json_schema()
+    assert isinstance(schema, dict)
+
+    stub_backend.script = [make_text('{"x": 5}')]
     nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(TypeError, match="no JSON-schema representation"):
-        nl("give me x", constraint=S)
-    assert len(stub_backend.calls) == 0          # crashed at setup, before any generate
+    out = nl("give me x", constraint=S)
+    assert out.x == 5
+    assert len(stub_backend.calls) == 1          # proceeded to generate — no upfront crash/reject
 
 
 def test_f8_is_sealed_obj_none_is_false():
@@ -451,12 +458,33 @@ def test_f8_is_sealed_obj_none_is_false():
     absent key); `dict.get` ALSO returns None for a sealed name missing from the registry — so
     without the `obj is None` guard a None arg could alias a dangling sealed name and wrongly report
     sealed. (Invariant holds today; this keeps the predicate airtight for any future caller.)"""
-    from plm.policy.registry import _is_sealed_obj, _SEALED_POLICIES
+    from plm.policy.registry import _is_sealed_obj, _SEALED_POLICIES, _unsealed
     _SEALED_POLICIES.add("__ghost_unregistered__")       # a sealed NAME with NO registry entry
     try:
         assert _is_sealed_obj(None) is False
     finally:
-        _SEALED_POLICIES.discard("__ghost_unregistered__")
+        with _unsealed():                                # removal is gated -> drop the ghost under the context
+            _SEALED_POLICIES.discard("__ghost_unregistered__")
+
+
+def test_l9_sealed_names_removal_is_gated_reads_unchanged():
+    """L9: `_SEALED_POLICIES` is a `set` SUBCLASS whose REMOVAL is gated — a cell (no `_unsealed()`
+    context) cannot un-seal a default — while reads and `add` behave EXACTLY like a plain set.
+    Removal works inside the sanctioned `_unsealed()` context (boot / crash-restart / test reset)."""
+    from plm.policy.registry import _SEALED_POLICIES, _unsealed
+    assert isinstance(_SEALED_POLICIES, set)               # still a set for every read/consumer
+    _SEALED_POLICIES.add("__l9_probe__")                   # GROW is ungated
+    assert "__l9_probe__" in _SEALED_POLICIES              # membership read
+    assert "__l9_probe__" in set(_SEALED_POLICIES)         # set() copy / iteration read
+    try:
+        for op in ("discard", "remove", "clear", "pop", "difference_update"):
+            with pytest.raises(TypeError, match="cannot be un-sealed"):
+                getattr(_SEALED_POLICIES, op)(*(("__l9_probe__",) if op != "clear" and op != "pop" else ()))
+        assert "__l9_probe__" in _SEALED_POLICIES          # every cell-side removal refused -> still sealed
+    finally:
+        with _unsealed():                                  # sanctioned removal works
+            _SEALED_POLICIES.discard("__l9_probe__")
+    assert "__l9_probe__" not in _SEALED_POLICIES
 
 
 def test_9_natural_llm_retry_then_pass(defaults_installed, stub_backend):
@@ -498,21 +526,31 @@ def test_10_natural_llm_budget_exhausted(defaults_installed, stub_backend):
     assert len(stub_backend.calls) == 4
 
 
-def test_10b_natural_llm_rejects_factory_constraint(defaults_installed, stub_backend):
-    """A Constraint.field(...) factory constraint carries Python predicates the
-    model can't read; natural_llm refuses upfront with a TypeError. No backend
-    call is made."""
-    from plm.constraint import Constraint
-
-    # Build a factory constraint with a predicate (this sets _constraint_is_factory=True).
-    PositiveInt = Constraint.field(predicate=lambda v: v > 0, int_gt=0)
-    assert getattr(PositiveInt, "_constraint_is_factory", False) is True
+def test_10b_natural_llm_gate_rejects_undescribed_accepts_described(defaults_installed, stub_backend):
+    """natural_llm's communicability gate (M12): a Constraint.field(...) with a user predicate is
+    REJECTED upfront iff the predicate has NO description (the model can't be told about it), and
+    ACCEPTED if it's @constraint-described — the rule is communicable, so the model is steered and
+    validate+retry gates it. (This is a natural_llm rule; building either constraint is fine.)"""
+    from plm.constraint import Constraint, constraint
 
     nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(TypeError, match="predicate/AfterValidator"):
-        nl("give me a positive int", constraint=PositiveInt)
-    # No generate happened — the rejection is upfront.
+
+    # UNDESCRIBED predicate -> rejected upfront, NO backend call.
+    Undesc = Constraint.field(type=int, predicate=lambda v: v > 0, int_gt=0)
+    with pytest.raises(TypeError, match="NO description"):
+        nl("give me a positive int", constraint=Undesc)
     assert len(stub_backend.calls) == 0
+
+    # DESCRIBED predicate -> accepted; reaches generate and validates.
+    @constraint("a positive integer")
+    def positive(v):
+        if v <= 0:
+            raise ValueError("must be positive")
+    Described = Constraint.field(type=int, predicate=positive)
+    stub_backend.script = [make_text("7")]
+    out = nl("give me a positive int", constraint=Described)
+    assert out == 7
+    assert len(stub_backend.calls) == 1
 
 
 def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backend):
@@ -578,11 +616,12 @@ def test_10e_natural_llm_retries_on_non_violation_error(defaults_installed, stub
     be treated as a retry, not abort the call — the model gets another turn and a
     later good answer is accepted."""
     from pydantic import model_validator
-    from plm.constraint import Constraint
+    from plm.constraint import Constraint, constraint
 
     class C(Constraint):
         v: int = 0
         @model_validator(mode="after")
+        @constraint("v must be non-zero")            # described -> passes natural_llm's gate
         def _chk(self):
             if self.v == 0:
                 raise KeyError("v missing")          # RAW non-ValueError; pydantic won't wrap it
@@ -628,11 +667,12 @@ def test_10h_natural_llm_exhaustion_raises_constraint_violation(defaults_install
     ConstraintViolation — even when the underlying validator raised a raw
     non-ValueError — not a bare KeyError. Honors the documented Raises contract."""
     from pydantic import model_validator
-    from plm.constraint import Constraint, ConstraintViolation
+    from plm.constraint import Constraint, ConstraintViolation, constraint
 
     class C(Constraint):
         v: int = 0
         @model_validator(mode="after")
+        @constraint("v always rejected (test)")     # described -> passes natural_llm's gate
         def _chk(self):
             raise KeyError("always")               # raw non-ValueError; pydantic won't wrap it
 
@@ -642,6 +682,90 @@ def test_10h_natural_llm_exhaustion_raises_constraint_violation(defaults_install
         nl("?", constraint=C, return_budget=2)
     msg = str(ei.value)
     assert "budget exhausted" in msg and "KeyError" in msg   # clear, wrapped, not a raw KeyError
+
+
+def test_10i_natural_llm_communicability_gate_describe_upfront(defaults_installed, stub_backend):
+    """M12: the gate is communicability, not factory-presence. A DESCRIBED predicate (even hidden
+    in a struct field) is ACCEPTED and steered via describe() fed UPFRONT; an UNDESCRIBED one
+    anywhere is REJECTED; a structureless-but-described constraint generates describe-only (no
+    response_format)."""
+    from plm.constraint import Constraint, constraint
+    nl = _PLM_POLICIES["natural_llm"]
+
+    # (a) struct hiding an UNDESCRIBED field predicate -> rejected (the old struct-field blind spot)
+    class Bad(Constraint):
+        x: Constraint.field(type=int, predicate=lambda v: v > 100)
+    with pytest.raises(TypeError, match="NO description"):
+        nl("?", constraint=Bad)
+    assert len(stub_backend.calls) == 0
+
+    # (b) struct with a DESCRIBED field predicate -> accepted; describe() sent UPFRONT; struct has shape
+    @constraint("over one hundred")
+    def over100(v):
+        if v <= 100:
+            raise ValueError("too small")
+    class Good(Constraint):
+        x: Constraint.field(type=int, predicate=over100)
+    stub_backend.script = [make_text('{"x": 150}')]
+    assert nl("?", constraint=Good).x == 150
+    call_b = stub_backend.calls[-1]
+    assert any("over one hundred" in (m.get("content") or "") for m in call_b["messages"])   # upfront
+    assert call_b["kw"].get("response_format") is not None                                    # struct has shape
+
+    # (c) structureless but described -> accepted; NO response_format (describe-only steering)
+    @constraint("an even integer")
+    def even(v):
+        if not (isinstance(v, int) and v % 2 == 0):
+            raise ValueError("not even")
+    Pred = Constraint.field(type=object, predicate=even)
+    stub_backend.script = [make_text("4")]
+    assert nl("?", constraint=Pred) == 4
+    call_c = stub_backend.calls[-1]
+    assert call_c["kw"].get("response_format") is None                                        # no shape
+    assert any("an even integer" in (m.get("content") or "") for m in call_c["messages"])     # describe-only
+
+
+def test_10j_natural_llm_rejects_reserved_generate_kwargs(defaults_installed, stub_backend):
+    """M7: natural_llm refuses generate_kwargs that collide with keys it controls — `messages`
+    always, and `response_format` when a constraint is set (it hard-sets that from the schema) —
+    instead of silently dropping them."""
+    from plm.constraint import Constraint
+    nl = _PLM_POLICIES["natural_llm"]
+
+    class IntC(Constraint):
+        value: int
+    with pytest.raises(ValueError, match="response_format"):
+        nl("?", constraint=IntC, generate_kwargs={"response_format": {"x": 1}})
+    with pytest.raises(ValueError, match="messages"):
+        nl("?", generate_kwargs={"messages": []})
+    assert len(stub_backend.calls) == 0
+
+
+def test_10k_natural_llm_retries_weave_into_caller_list(defaults_installed, stub_backend):
+    """M6: a constraint retry appends the failed answer + violation to the CALLER's OWN message list
+    (by reference), so retry turns are visible to weaving — not lost to a `msgs = msgs + [...]`
+    rebind. (And the contract is fed upfront, so the retry turn carries only the violation.)"""
+    from plm.constraint import Constraint
+
+    class IntC(Constraint):
+        value: int
+    msgs = [{"role": "user", "content": "give an int"}]
+    stub_backend.script = [make_text('"bad"'), make_text('{"value": 7}')]
+    nl = _PLM_POLICIES["natural_llm"]
+    assert nl(msgs, constraint=IntC).value == 7
+    contents = " ".join(m.get("content", "") for m in msgs)
+    assert "bad" in contents and "failed validation" in contents     # woven into the caller's list
+    assert len(msgs) > 1
+
+
+def test_compute_insert_out_of_range_is_no_match():
+    """N5: _compute_insert returns None (NO_MATCH) for an after_line PAST end-of-file, instead of
+    silently clamping to EOF (mirrors _compute_delete's out-of-range guard)."""
+    from plm.policy.edits import _compute_insert
+    src = "a\nb\n"                                        # 2 lines
+    assert _compute_insert(src, 2, "x") is not None      # after the last line -> append (valid)
+    assert _compute_insert(src, 3, "x") is None          # after a line that doesn't exist -> NO_MATCH
+    assert _compute_insert(src, 99, "x") is None
 
 
 # ============================ Section: react_llm ============================
@@ -774,16 +898,17 @@ def test_react_generate_kwargs_reserved_key_clear_error(defaults_installed, stub
     assert stub_backend.calls == []                                # raised before any generate()
 
 
-def test_react_verifier_llm_depth1_with_verifier_hard_errors(defaults_installed, stub_backend):
-    """Batch 6: a verifier needs depth >= 2 (it runs one level below + composes
-    depth-1 circuits). react_verifier_llm(..., verifier=..., depth=1) raises a clear
-    LLMDepthExceeded UP FRONT (no backend call) instead of crashing mid-loop. Without a
-    verifier, depth=1 is fine."""
+def test_react_verifier_llm_depth1_pure_code_verifier_runs(defaults_installed, stub_backend):
+    """L10: a PURE-CODE verifier (no LLM) needs zero extra depth, so it must RUN at depth=1 — there
+    is NO up-front 'verifier needs depth >= 2' pre-reject anymore. (A verifier that actually builds an
+    LLM circuit is still gated by that circuit's own descend()/check_depth_or_raise().)"""
     rlv = _PLM_POLICIES["react_verifier_llm"]
+    # pure-code verifier (returns None = approve) at depth=1: RUNS, no LLMDepthExceeded.
     stub_backend.script = [make_python_call("RETURN('x')")]
-    with pytest.raises(_llm_infra.LLMDepthExceeded):
-        rlv("go", verifier=lambda m: None, depth=1)        # raised before any generate()
-    assert rlv("go", depth=1) == "x"                       # no verifier -> depth-1 is valid; script intact
+    assert rlv("go", verifier=lambda m: None, depth=1) == "x"
+    # no verifier -> depth-1 is valid too.
+    stub_backend.script = [make_python_call("RETURN('x')")]
+    assert rlv("go", depth=1) == "x"
 
 
 def test_12_react_llm_ns_contained(defaults_installed, stub_backend):
@@ -1026,6 +1151,20 @@ def test_12i_kwargs_identifier_invalid_notes(defaults_installed, stub_backend):
     assert out == "keyword-value"
     seen = "".join((m.get("content") or "") for m in stub_backend.calls[0]["messages"])
     assert "kwargs[" in seen and "'if'" in seen, seen
+
+
+def test_12i2_namespace_note_is_fresh_not_mutated(defaults_installed, stub_backend):
+    """M5: the namespace note is a FRESH dedicated system message — react_llm NEVER mutates one of
+    the caller's own message dicts (the by-reference weaving contract is append-only). (L8: re-passing
+    the same woven thread re-adds the note — an accepted weaving artifact, not de-duplicated.)"""
+    rl = _PLM_POLICIES["react_llm"]
+    sys_msg = {"role": "system", "content": "ORIGINAL SYSTEM PROMPT"}
+    msgs = [sys_msg, {"role": "user", "content": "?"}]
+
+    stub_backend.script = [make_python_call("RETURN(kwargs['foo-bar'])")]
+    rl(msgs, kwargs={"foo-bar": "v"})                                 # weaves into msgs by reference
+    assert sys_msg["content"] == "ORIGINAL SYSTEM PROMPT"             # M5: caller's dict UNCHANGED
+    assert sum("[namespace]" in (m.get("content") or "") for m in msgs) == 1   # added as a fresh message
 
 
 def test_12d_plm_passed_policy_reference_works(defaults_installed, stub_backend):
@@ -1416,7 +1555,8 @@ def test_32_init_succeeds():
         proxy = _FunctionPolicy(fn, "def natural_llm(): return 1", "<policy-natural_llm>")
         assert proxy._p_name == "natural_llm"
     finally:
-        _SEALED_POLICIES.discard("natural_llm")
+        with _unsealed():                    # removal is gated -> drop under the context
+            _SEALED_POLICIES.discard("natural_llm")
 
 
 def test_33_policy_call_depth_cap():
@@ -1917,25 +2057,34 @@ def test_sealed_sub_llm_cannot_escape_or_hang_via_interactive_builtins():
 
 
 def test_seal_subscript_poison_refused(defaults_installed):
-    """`_PLM_POLICIES['natural_llm'] = evil` is refused; the default is intact."""
+    """The registry is READ-ONLY to cell/model code: a bare `_PLM_POLICIES['x'] = ...` / `.update(...)`
+    RAISES (not directly mutable). The default is intact. AND, as a 2nd layer, even inside an
+    authorized write a sealed default is still protected (the seal)."""
     nl0 = _PLM_POLICIES["natural_llm"]
-    _PLM_POLICIES["natural_llm"] = "EVIL"
+    with pytest.raises(TypeError, match="not directly mutable"):
+        _PLM_POLICIES["natural_llm"] = "EVIL"
     assert _PLM_POLICIES["natural_llm"] is nl0
-    _PLM_POLICIES.update({"natural_llm": "EVIL2"})       # update() routed through the guard
+    with pytest.raises(TypeError, match="not directly mutable"):
+        _PLM_POLICIES.update({"natural_llm": "EVIL2"})
+    assert _PLM_POLICIES["natural_llm"] is nl0
+    # 2nd layer: within an AUTHORIZED write (not unsealed), the seal still refuses overwriting a default
+    from plm.policy.registry import _store_writable
+    with _store_writable():
+        _PLM_POLICIES["natural_llm"] = "EVIL3"          # seal -> silent no-op (not unsealed)
     assert _PLM_POLICIES["natural_llm"] is nl0
 
 
 def test_seal_subscript_del_and_pop_refused(defaults_installed):
-    """`del`/`pop` of a default registry entry is refused; it stays present. pop no
-    longer silently returns the live value: without a default it raises KeyError,
-    with a default it returns the default — never removing the protected entry."""
+    """`del`/`pop` of a registry entry from cell/model code is refused (registry read-only); the
+    entry stays present."""
     nl0 = _PLM_POLICIES["natural_llm"]
-    del _PLM_POLICIES["natural_llm"]
+    with pytest.raises(TypeError, match="not directly mutable"):
+        del _PLM_POLICIES["natural_llm"]
     assert _PLM_POLICIES.get("natural_llm") is nl0
-    sentinel = object()
-    assert _PLM_POLICIES.pop("natural_llm", sentinel) is sentinel       # default returned, key kept
-    with pytest.raises(KeyError):
-        _PLM_POLICIES.pop("natural_llm")                                # no default -> KeyError, key kept
+    with pytest.raises(TypeError, match="not directly mutable"):
+        _PLM_POLICIES.pop("natural_llm", object())
+    with pytest.raises(TypeError, match="not directly mutable"):
+        _PLM_POLICIES.pop("natural_llm")
     assert _PLM_POLICIES.get("natural_llm") is nl0
 
 
@@ -2018,13 +2167,18 @@ def test_np35_inherited_async_method_refused():
 
 
 def test_np36_soft_keywords_are_valid_policy_names():
-    """NP3-6: SOFT keywords (match/case/type/_) ARE valid def/class names, so they must be accepted
-    as policy names. HARD keywords (class/if/return) stay refused (`def class` is a SyntaxError)."""
+    """NP3-6: SOFT keywords that are NOT builtins (match/case/_) ARE valid def/class names, so they
+    must be accepted as policy names. HARD keywords (class/if/return) stay refused (`def class` is a
+    SyntaxError). NOTE (M3): `type` is a soft keyword BUT also a builtin, so a policy named `type`
+    would clobber the builtin — now rejected for THAT reason."""
     from plm.policy.decorator import _reserved_name_reason
-    for ok in ("match", "case", "type", "_"):
+    for ok in ("match", "case", "_"):
         assert _reserved_name_reason(ok) is None, ok
     for bad in ("class", "if", "return"):
         assert _reserved_name_reason(bad) is not None, bad
+    # M3: builtin-shadowing names are refused (print/len/sum/type/...), even soft-keyword `type`.
+    for shadow in ("type", "print", "len", "sum", "list"):
+        assert _reserved_name_reason(shadow) is not None and "builtin" in _reserved_name_reason(shadow), shadow
 
 
 def test_generator_policy_depth_correct_all_permutations():
@@ -2221,12 +2375,18 @@ def test_da7_natural_llm_input_and_response_validation(defaults_installed, stub_
 
 
 def test_seal_clear_retains_defaults_but_drops_mutables(defaults_installed):
-    """A sealed clear() keeps defaults (anti wipe-then-poison) but drops mutables."""
+    """clear() from cell/model code is refused (registry read-only). Even inside an AUTHORIZED write,
+    a SEALED clear() keeps the defaults (anti wipe-then-poison) but drops mutables."""
     @policy
     def keep_me():
         return 1
     assert "keep_me" in _PLM_POLICIES
-    _PLM_POLICIES.clear()                                # sealed: defaults retained
+    with pytest.raises(TypeError, match="not directly mutable"):
+        _PLM_POLICIES.clear()                            # cell code cannot clear the registry
+    assert "keep_me" in _PLM_POLICIES                     # nothing dropped
+    from plm.policy.registry import _store_writable
+    with _store_writable():                              # authorized + sealed: retains defaults
+        _PLM_POLICIES.clear()
     assert "natural_llm" in _PLM_POLICIES and "react_llm" in _PLM_POLICIES
     assert "keep_me" not in _PLM_POLICIES
 
@@ -2308,7 +2468,7 @@ def test_validate_helper_surfaces_non_cv_error():
 
     def _boom(v):
         raise TypeError("boom")                          # not a ValueError -> not a ConstraintViolation
-    C = Constraint.field(predicate=_boom)
+    C = Constraint.field(type=object, predicate=_boom)
     ok, msg = _validate_return_against_constraint(123, C)
     assert ok is False and ("boom" in msg or "TypeError" in msg)
 
@@ -2320,7 +2480,7 @@ def test_natural_llm_rejects_composite_hiding_factory(defaults_installed, stub_b
 
     class HasName(Constraint):
         name: str
-    Pred = Constraint.field(predicate=lambda v: None)    # a factory (Python predicate)
+    Pred = Constraint.field(type=object, predicate=lambda v: None)   # a factory (Python predicate)
     nl = _PLM_POLICIES["natural_llm"]
     with pytest.raises(TypeError):
         nl("make a person", constraint=(HasName & Pred))

@@ -246,9 +246,20 @@ def _track_model_call(
     uniform across every per-round generate call.
     """
     
-    usage = response.get("usage") or {}
-    tok_total = usage.get("total_tokens", 0) or 0
-    pt = usage.get("prompt_tokens", 0) or 0
+    # a malformed `usage` must not crash the root loop. `response` is normalized to a dict by the
+    # caller, but the NESTED `usage` is not — a non-dict usage (str/int/list) would AttributeError on
+    # `.get`, and a non-numeric token sub-field would ValueError on `int()`. Coerce both defensively.
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+
+    def _as_int(v: Any) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+    tok_total = _as_int(usage.get("total_tokens", 0))
+    pt = _as_int(usage.get("prompt_tokens", 0))
     if pt > 0:
         token_state["cumulative_prompt_tokens"] = pt
     if metrics is not None:

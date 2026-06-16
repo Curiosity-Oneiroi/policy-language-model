@@ -29,7 +29,7 @@ import linecache as _linecache
 import sys
 from contextlib import contextmanager as _contextmanager
 
-from plm._branch_state import _no_branch_mutation   # stdlib-only leaf; parallel-branch mutation gate
+from plm._branch_state import _IN_PARALLEL_BRANCH, _no_branch_mutation   # parallel-branch state/gate
 
 
 _MISSING = object()                 # sentinel: shared with guard (it imports this one)
@@ -39,7 +39,60 @@ _MISSING = object()                 # sentinel: shared with guard (it imports th
 # they are rebuilt from scratch on each boot, so no snapshot is needed. They
 # carry the SEALED (immutable + un-duplicable) NAMES used by the name-based checks
 # (Guard A, duplicate_policy); the per-OBJECT truth is the policy's `_p_immutable` flag.
-_SEALED_POLICIES: set = set()
+class _SealedNames(set):
+    """The SEALED-policy NAME set. Reads and GROW ops (`add`/`update`/`|=`) behave EXACTLY like a
+    plain `set`; only the REMOVAL mutators are GATED — a cell may hold a reference to this set but
+    cannot UN-SEAL a default via `discard`/`remove`/`pop`/`clear`/`difference_update`/
+    `intersection_update`/`symmetric_difference_update`/`-=`/`&=`/`^=`. Removal is permitted ONLY
+    inside the sanctioned registry-rebuild context `_unsealed()` (boot / crash-restart / test reset)
+    — the same `_STORE_UNSEALED` flag `_PolicyStore` uses for default protection.
+
+    (L9: this is the seal's backstop for a future sealed CLASS policy — whose `_p_immutable` flag is
+    freely writable on a raw type. With this set un-removable, a flag-flip is MOOT, since
+    `_is_sealed_obj` reads THIS set. Same irreducible boundary as the store: a deliberate
+    `set.discard(_SEALED_POLICIES, x)` or rebinding the module attribute still bypasses it — integrity
+    hardening of the obvious/casual path, not a sandbox.)"""
+
+    def _require_unsealed(self, op: str) -> None:
+        if not _STORE_UNSEALED:
+            raise TypeError(
+                f"_SEALED_POLICIES.{op}() is not allowed — a sealed (default) policy cannot be "
+                f"un-sealed. Removal is permitted only inside the harness registry-rebuild context "
+                f"(`_unsealed()` — boot / crash-restart / test reset), never from cell/model code.")
+
+    def discard(self, *a):
+        self._require_unsealed("discard"); return set.discard(self, *a)
+
+    def remove(self, *a):
+        self._require_unsealed("remove"); return set.remove(self, *a)
+
+    def pop(self, *a):
+        self._require_unsealed("pop"); return set.pop(self, *a)
+
+    def clear(self):
+        self._require_unsealed("clear"); return set.clear(self)
+
+    def difference_update(self, *a):
+        self._require_unsealed("difference_update"); return set.difference_update(self, *a)
+
+    def intersection_update(self, *a):
+        self._require_unsealed("intersection_update"); return set.intersection_update(self, *a)
+
+    def symmetric_difference_update(self, *a):
+        self._require_unsealed("symmetric_difference_update"); return set.symmetric_difference_update(self, *a)
+
+    def __isub__(self, other):
+        self._require_unsealed("-="); return set.__isub__(self, other)
+
+    def __iand__(self, other):
+        self._require_unsealed("&="); return set.__iand__(self, other)
+
+    def __ixor__(self, other):
+        self._require_unsealed("^="); return set.__ixor__(self, other)
+
+
+# A `set` SUBCLASS, not a plain `set`: reads + GROW are identical; only REMOVAL is gated (above).
+_SEALED_POLICIES: "_SealedNames" = _SealedNames()
 
 
 # --- the single policy store + its default-policy protection ------------------
@@ -79,18 +132,55 @@ def _unsealed():
         _STORE_UNSEALED = _prev
 
 
+# The registry (`_PLM_POLICIES`, a `_PolicyStore`) is injected into kernel `__main__`, so a cell can
+# reach it by name. It must be READ-ONLY to cell/model code: the ONLY way to change the registry is
+# the sanctioned API (`@policy` install, `<p>._edit(...)`/`edit_policy`, `<p>._remove()`/
+# `delete_policy`, `duplicate_policy`, plus crash-restart rehydrate). A bare `_PLM_POLICIES.pop(...)`
+# / `.clear()` / `[...] = ...` bypasses that API (its PolicyResult, notes, guards, and the parallel
+# edit-grant model), so every `_PolicyStore` MUTATOR refuses unless this flag is set. The sanctioned
+# paths set it via `_store_writable()` for the span of their write; nothing else does. Reads are free.
+_STORE_WRITABLE: bool = False
+
+
+@_contextmanager
+def _store_writable():
+    """Authorize DIRECT `_PLM_POLICIES` mutation for the duration. Re-entrant-safe (mirrors
+    `_unsealed`). Wraps the registry-write span of every sanctioned mutation path so cell/model code,
+    which never enters this context, cannot mutate the registry directly."""
+    global _STORE_WRITABLE
+    _prev = _STORE_WRITABLE
+    _STORE_WRITABLE = True
+    try:
+        yield
+    finally:
+        _STORE_WRITABLE = _prev
+
+
 def _is_default(value) -> bool:
     """True iff `value` is a DEFAULT (sealed) policy. Anchored to the canonical seal record by
     IDENTITY (`_is_sealed_obj`), not only the per-object `_p_immutable` flag: a class policy is a
     raw type whose flag is freely writable, so trusting the flag alone would let a flipped flag
     defeat the store's default-protection and Guard C's canonical restore. The write-locked flag on
-    function proxies remains the fast path; the registry anchor is the un-spoofable backstop."""
+    function proxies remains the fast path; the registry name-set anchor is the backstop (see
+    `_is_sealed_obj` for the scope/limits of that backstop — L9)."""
     return getattr(value, "_p_immutable", False) is True or _is_sealed_obj(value)
 
 
 class _PolicyStore(dict):
-    """The single policy registry; refuses to replace/remove a default-policy
-    entry while sealed (see module notes above)."""
+    """The single policy registry; READ-ONLY to cell/model code (mutators refuse unless inside
+    `_store_writable()`), and additionally refuses to replace/remove a default-policy entry while
+    sealed (see module notes above)."""
+
+    def _require_writable(self) -> None:
+        # Direct registry mutation is not a supported surface. The sanctioned API (`@policy` /
+        # `edit_policy` / `delete_policy` / `duplicate_policy`) wraps its writes in `_store_writable()`;
+        # a bare `_PLM_POLICIES.pop/clear/[..]=` from cell code does not, so it is refused LOUDLY.
+        if not _STORE_WRITABLE:
+            raise TypeError(
+                "_PLM_POLICIES is not directly mutable. Author a policy with `@policy`, edit one with "
+                "`edit_policy(name, ...)` or `<policy>._edit(...)`, delete one with "
+                "`delete_policy(name)`, and fork one with `duplicate_policy(name, '<new>')`. "
+                "(The registry changes only through that API — never a bare `_PLM_POLICIES` write.)")
 
     def _blocked(self, key) -> bool:
         if _STORE_UNSEALED:
@@ -105,18 +195,21 @@ class _PolicyStore(dict):
         return False
 
     def __setitem__(self, key, value):
-        if dict.get(self, key) is value:              # idempotent re-set -> no-op
+        if dict.get(self, key) is value:              # idempotent re-set -> no-op (harmless)
             return
+        self._require_writable()
         if self._blocked(key):
             return
         dict.__setitem__(self, key, value)
 
     def __delitem__(self, key):
+        self._require_writable()
         if self._blocked(key):
             return
         dict.__delitem__(self, key)
 
     def pop(self, key, *default):
+        self._require_writable()
         if self._blocked(key):
             # An immutable default is PROTECTED — it can't be popped/removed. Do NOT
             # silently return its live value (the caller would believe they removed it):
@@ -128,6 +221,7 @@ class _PolicyStore(dict):
         return dict.pop(self, key, *default)
 
     def popitem(self):
+        self._require_writable()
         if _STORE_UNSEALED:
             return dict.popitem(self)
         for _k in reversed(list(self.keys())):        # remove the last NON-default entry
@@ -138,9 +232,11 @@ class _PolicyStore(dict):
         raise KeyError("popitem: only immutable default policies remain")
 
     def setdefault(self, key, default=None):
+        self._require_writable()
         return dict.setdefault(self, key, default)    # never REPLACES an existing key
 
     def update(self, other=(), **kwargs):
+        self._require_writable()
         if hasattr(other, "keys"):
             for _k in other.keys():
                 self[_k] = other[_k]
@@ -155,6 +251,7 @@ class _PolicyStore(dict):
         return self
 
     def clear(self):
+        self._require_writable()
         if _STORE_UNSEALED:
             dict.clear(self)
             return
@@ -174,20 +271,31 @@ def _seal(name: str) -> None:
     if p is not None:
         try:
             p._p_immutable = True                     # idempotent (proxy allows re-set to True)
-        except Exception:
-            pass
+        except Exception as e:
+            # N6: the name-set below still records the seal (the backstop), so this is not a live bug
+            # today — but a flag-set failure would signal a regression in the proxy's __setattr__
+            # lock, silently downgrading to a name-only seal. Surface it rather than swallow.
+            from .proxy import _note                  # local import: break import cycle
+            _note(f"[boot] seal: could not set _p_immutable on {name!r} ({type(e).__name__}: {e})")
     _SEALED_POLICIES.add(name)
 
 
 def _is_sealed_obj(obj) -> bool:
     """Canonical seal check, by OBJECT IDENTITY: True iff `obj` is the registered policy for some
-    name in `_SEALED_POLICIES`. This is the un-spoofable anchor the mutation gates use.
+    name in `_SEALED_POLICIES`. This is the seal anchor the mutation gates use.
 
     A FUNCTION policy's `_p_immutable` flag is write-locked by `_FunctionPolicy.__setattr__`, so the
-    flag faithfully mirrors the seal. A CLASS policy is a RAW type whose `_p_immutable` is freely
-    writable (no __setattr__ freeze on a type) — so the gates must NOT trust that flag alone. They
-    fall back to this registry record, which a cell can't reach as a plain global and which is keyed
-    by identity (so flipping `_p_immutable` OR rebinding `__name__` can't dodge it).
+    flag faithfully mirrors the seal AND this name-set backstops it — for a function proxy the seal
+    is effectively un-spoofable. A CLASS policy is a RAW type whose `_p_immutable` is freely writable
+    (no __setattr__ freeze on a type), so the gates must NOT trust that flag alone; they fall back to
+    this name-set, keyed by identity (so flipping `_p_immutable` or rebinding `__name__` can't dodge
+    it). the name-set is a `_SealedNames` set whose REMOVAL is gated (un-recordable outside the
+    harness `_unsealed()` context), so even an imported reference can't un-seal a name — which makes a
+    class policy's freely-writable `_p_immutable` flip MOOT (this set is the backstop). The residual
+    boundary is the same class as the store's: a deliberate `set.discard(_SEALED_POLICIES, x)` (calling
+    the base method directly) or rebinding `registry._SEALED_POLICIES = set()` still bypasses it —
+    integrity hardening of the casual/obvious path, not a sandbox. (When a sealed CLASS default ever
+    ships, also freeze its `_p_immutable` via a metaclass `__setattr__` for belt-and-suspenders.)
 
     Guards `obj is None` FIRST: callers pass `dict.get(_PLM_POLICIES, key)` (None for an absent key),
     and `dict.get` ALSO returns None for a sealed name missing from the registry — so without this
@@ -228,11 +336,18 @@ def _sync() -> None:
     the registry must go through `@policy` / `_install_policy_source`.
     """
     g = _main()
-    for n in list(_PLM_POLICIES):
-        if n in _SEALED_POLICIES:
-            continue                       # immutable: registry-canonical, never evict
-        if n not in g:
-            _PLM_POLICIES.pop(n, None)
+    # In a parallel() branch, do NOT evict: __main__ is process-global (NOT copied by copy_context),
+    # so a sibling branch's `del <name>` would make this read-helper-triggered `_sync` evict from the
+    # SHARED registry — a membership mutation on a "free read" (M2). Defer all reconciliation to the
+    # next main-loop pass / Guard C; reads still return live contents.
+    if _IN_PARALLEL_BRANCH.get():
+        return
+    with _store_writable():                # authorize the registry write (the ONLY mutation path)
+        for n in list(_PLM_POLICIES):
+            if n in _SEALED_POLICIES:
+                continue                   # immutable: registry-canonical, never evict
+            if n not in g:
+                _PLM_POLICIES.pop(n, None)
 
 
 # --- by-name helpers (called from cells) -------------------------------------
@@ -378,6 +493,21 @@ def duplicate_policy(name: str, new_name: str):
         return _fail_value(PolicyOp.NAME_INVALID, f"duplicate: {reason}")
     if new_name in _PLM_POLICIES or new_name in _main():
         return _fail_value(PolicyOp.NAME_TAKEN, f"duplicate: {new_name!r} is already taken")
-    new_src = _compute_rename(_PLM_POLICIES[name]._p_source, new_name)
-    _install_policy_source("@policy\n" + new_src, "<policy-dup-" + new_name + ">")
+    # honor the documented "ALWAYS returns a PolicyValueResult, NO raise" contract — a
+    # syntax / class-body error in the duplicated source (the install execs it) must surface as a
+    # falsy result, not escape raw to the model's by-name call.
+    try:
+        new_src = _compute_rename(_PLM_POLICIES[name]._p_source, new_name)
+        _install_policy_source("@policy\n" + new_src, "<policy-dup-" + new_name + ">")
+    except Exception as e:
+        # Same contract as edit_policy/rewrite_policy: a bad-source install returns a FALSY result,
+        # never raises. Carry the install's source-rich note (`_install_policy_source` add_note's a
+        # traceback saying WHERE in the duplicated source it failed) into the detail, so the caller
+        # sees where the node came from — not just the exception type.
+        _detail = f"{type(e).__name__}: {e}"
+        _notes = getattr(e, "__notes__", None)
+        if _notes:
+            _detail += "\n" + "\n".join(_notes)
+        return _fail_value(PolicyOp.BAD_SOURCE,
+                           f"duplicate: rebuilding {name!r} as {new_name!r} failed ({_detail})")
     return PolicyValueResult(PolicyOp.OK, value=_PLM_POLICIES.get(new_name))   # fresh → MUTABLE

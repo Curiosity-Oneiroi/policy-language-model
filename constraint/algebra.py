@@ -52,6 +52,15 @@ def _require_constraints(op_symbol: str, *ops: Any) -> None:
                 f"`{op_symbol}` combines Constraints; got {o!r} ({type(o).__name__}). A field must "
                 f"satisfy a constraint — compose `Constraint.field(...)` constraints with `& | ^ ~`. "
                 f"(Constraints have no nullable/Optional; `| None` is not valid.)")
+        # the bare ABSTRACT base `Constraint` has no fields/rules, so its empty model rejects
+        # every scalar (`{}` is all it accepts). As an operand that silently breaks: `A & Constraint`
+        # rejects EVERYTHING and `A | Constraint` is a dead branch — neither is ever intended. Reject
+        # it loudly (you always mean a concrete constraint, never the base) instead of either silent trap.
+        if o is Constraint:
+            raise TypeError(
+                f"`{op_symbol}` got the bare base `Constraint` (the abstract base, no fields/rules) — "
+                f"`A & Constraint` would reject ALL values and `A | Constraint` is a dead branch. Use a "
+                f"concrete constraint: a `Constraint` subclass or `Constraint.field(...)`.")
 
 
 def _and(a: type, b: type) -> type:
@@ -245,6 +254,47 @@ def _rewrite_schema_refs(node, rename):
     elif isinstance(node, list):
         for _it in node:
             _rewrite_schema_refs(_it, rename)
+
+
+def _inline_defs(schema):
+    """Return a `$defs`-free copy of a composite's json_schema, with every `#/$defs/<X>` ref
+    replaced by the definition's body (recursively).
+
+    Needed ONLY when a composite is EMBEDDED as a struct field (the `__get_pydantic_json_schema__`
+    hook): the composite hand-builds its `$defs` + root-relative `#/$defs/X` refs, but pydantic owns
+    the PARENT document's `$defs` and does not hoist a hook-injected one — so a `#/$defs/X` ref
+    dangles against the parent root and pydantic raises `KeyError: '#/$defs/X'` (H5). Inlining makes
+    the field schema self-contained so it embeds cleanly. (The TOP-LEVEL composite schema keeps its
+    `$defs` — there the refs resolve at the document root.) A self/mutually-recursive def can't be
+    inlined; those rare defs are kept in a local `$defs` (best effort)."""
+    if not isinstance(schema, dict) or "$defs" not in schema:
+        return schema
+    schema = dict(schema)
+    defs = schema.pop("$defs")
+    inlining: set = set()
+    cyclic: set = set()
+
+    def _resolve(node):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):]
+                if name in defs and name not in inlining:
+                    inlining.add(name)
+                    body = _resolve(dict(defs[name]))
+                    inlining.discard(name)
+                    return body
+                cyclic.add(name)                 # recursive ref — leave it, keep its def local
+                return dict(node)
+            return {k: _resolve(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_resolve(v) for v in node]
+        return node
+
+    out = {k: _resolve(v) for k, v in schema.items()}
+    if cyclic:
+        out["$defs"] = {n: _resolve(dict(defs[n])) for n in cyclic if n in defs}
+    return out
 
 
 def _tighten_field_infos(a_info, b_info):
@@ -637,7 +687,8 @@ def _make_composite_wrapper(
         # of letting pydantic build a schema for an empty-fields model (a composite has NO pydantic
         # fields), which rejects EVERY scalar and accepts garbage (D1). Mirrors the `.field()`
         # factory's core-schema hook (base.py `_get_core`). Top-level use goes through `.validate()`
-        # directly and never hits this; list_of/dict_of elements still route via `_resolve_elem_type`.
+        # directly and never hits this; as a generic element (`type=list[A | B]`) pydantic invokes
+        # this hook per item, so OR/AND/XOR/NOT apply element-wise.
         return core_schema.with_info_plain_validator_function(
             lambda v, info, _c=cls: _c.validate(
                 v, context=(info.context if info is not None else None)))
@@ -645,9 +696,11 @@ def _make_composite_wrapper(
     def _get_json_schema(cls, schema, handler):  # noqa: ANN001
         # The plain-validator core schema above carries no auto JSON schema, so a struct WITH a
         # composite field would otherwise raise PydanticInvalidForJsonSchema. Supply the composite's
-        # OWN json_schema() (allOf/anyOf/oneOf/not + hoisted child $defs) — the same shape the
-        # top-level composite emits — so `Struct.model_json_schema()` / structured-output works (D1).
-        return cls.json_schema()
+        # OWN json_schema() (allOf/anyOf/oneOf/not) — but INLINE its $defs first: pydantic owns the
+        # parent document's $defs and won't hoist a hook-injected one, so a raw `#/$defs/X` ref would
+        # dangle at the parent root → `KeyError: '#/$defs/X'` (H5). Inlining makes the field schema
+        # self-contained so `Struct.model_json_schema()` / structured-output works (D1 + H5).
+        return _inline_defs(cls.json_schema())
 
     def _json_schema(cls):  # noqa: ANN001
         sub = [c.json_schema() if hasattr(c, "json_schema") else {} for c in children]

@@ -107,7 +107,10 @@ def parallel(*tasks, max_workers=None):
             _ids = set()
             for _p in _t.policies:
                 _pid = id(_p)
-                if _pid in _granted:
+                if _pid in _ids:
+                    continue                              # N1: same policy listed twice in ONE grant
+                                                          # (with_edit(task, p, p)) -> harmless, dedup
+                if _pid in _granted:                      # already granted to ANOTHER branch -> the real breach
                     raise ParallelMutationError(
                         f"policy {getattr(_p, '_p_name', '?')!r} is granted to more than one "
                         f"parallel() branch; at most ONE branch may edit a given policy.")

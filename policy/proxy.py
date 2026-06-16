@@ -67,6 +67,7 @@ from .registry import (
     _PLM_POLICIES,
     _is_sealed_obj,
     _main,
+    _store_writable,
 )
 
 
@@ -360,7 +361,8 @@ class _FunctionPolicy:
                          f"It is part of the LLM-default base.")
         g = _main()                          # kernel __main__ (where @policy injected)
         g.pop(self._p_name, None)
-        _PLM_POLICIES.pop(self._p_name, None)
+        with _store_writable():              # sanctioned deletion path -> authorize the registry write
+            _PLM_POLICIES.pop(self._p_name, None)
         linecache.cache.pop(self._p_filename, None)   # reclaim the <policy-{name}> slot
         return _ok()
 
@@ -444,10 +446,11 @@ class _FunctionPolicy:
             len(new_source), None, new_source.splitlines(True), new_filename)
         if new_filename != old_filename:
             linecache.cache.pop(old_filename, None)   # drop the renamed-from slot
-        if new_name != old_name:
-            cell_globals.pop(old_name, None); cell_globals[new_name] = self
-            _PLM_POLICIES.pop(old_name, None)
-        _PLM_POLICIES[new_name] = self
+        with _store_writable():              # sanctioned edit/rename path -> authorize registry writes
+            if new_name != old_name:
+                cell_globals.pop(old_name, None); cell_globals[new_name] = self
+                _PLM_POLICIES.pop(old_name, None)
+            _PLM_POLICIES[new_name] = self   # in-place edit: same key+value -> idempotent no-op
         return _ok()
 
 
@@ -494,6 +497,12 @@ def _rebind_class_cells(v, cls):
 
 def _attach_class_policy_metadata(cls, source, filename):
     cls._p_source, cls._p_version, cls._p_filename = source, 0, filename
+    # `_p_name` COMPLETES the uniform `_p_*` policy interface for CLASS policies too (a function
+    # proxy sets it in __init__). Without it, generic code that keys on `_p_name` for identity (e.g.
+    # with_edit / _rename_guard) silently breaks for classes, which carry their name only as the
+    # native `__name__`. Mirror `__name__` here; the two rename sites keep them in sync, and the
+    # class-rewrite diff preserves `_p_*` keys across in-place edits.
+    cls._p_name = cls.__name__
     cls._p_immutable = False             # a "default policy" iff True; set only by _seal()
                                          # (preserved across rewrites — _p_* keys skip the diff)
     # Attach the edit API as CLASSMETHODS so `Net._rewrite(src)` mirrors
@@ -565,7 +574,8 @@ def _class_remove(cls):
                      f"It is part of the LLM-default base.")
     g = _main()
     g.pop(cls.__name__, None)
-    _PLM_POLICIES.pop(cls.__name__, None)
+    with _store_writable():              # sanctioned deletion path -> authorize the registry write
+        _PLM_POLICIES.pop(cls.__name__, None)
     linecache.cache.pop(getattr(cls, "_p_filename", None), None)   # reclaim <policy-{name}> slot (
                                                                   # mirrors the function-policy _remove)
     return _ok()
@@ -677,12 +687,14 @@ def _rewrite_class_policy(cls, new_source):
     cls._p_version += 1
     cls._p_filename = new_filename
     old = cls.__name__
-    if new_name != old:
-        cls.__name__ = cls.__qualname__ = new_name
-        g = _main()
-        g.pop(old, None); g[new_name] = cls
-        _PLM_POLICIES.pop(old, None)
-    _PLM_POLICIES[new_name] = cls
+    with _store_writable():              # sanctioned edit/rename path -> authorize registry writes
+        if new_name != old:
+            cls.__name__ = cls.__qualname__ = new_name
+            cls._p_name = new_name       # keep the uniform `_p_name` in sync with `__name__`
+            g = _main()
+            g.pop(old, None); g[new_name] = cls
+            _PLM_POLICIES.pop(old, None)
+        _PLM_POLICIES[new_name] = cls    # in-place edit: same key+value -> idempotent no-op
 
     # If the rewrite re-introduced a fresh `__call__` (user content changed),
     # re-wrap it with `_policy_call` so the depth cap continues to fire. Gate on
@@ -716,15 +728,16 @@ def _remove_and_recreate(old_cls, new_cls, new_source):
     # a fully-editable policy, with its filename tracking its (possibly new) name.
     name = old_cls.__name__
     g = _main()
-    _PLM_POLICIES.pop(name, None); g.pop(name, None)
-    new_filename = f"<policy-{new_cls.__name__}>"
-    _attach_class_policy_metadata(new_cls, new_source, new_filename)
-    new_cls._p_version = old_cls._p_version + 1
-    linecache.cache[new_filename] = (
-        len(new_source), None, new_source.splitlines(True), new_filename)
-    if new_filename != old_cls._p_filename:
-        linecache.cache.pop(old_cls._p_filename, None)
-    _PLM_POLICIES[new_cls.__name__] = g[new_cls.__name__] = new_cls
+    with _store_writable():              # sanctioned structural-edit path -> authorize registry writes
+        _PLM_POLICIES.pop(name, None); g.pop(name, None)
+        new_filename = f"<policy-{new_cls.__name__}>"
+        _attach_class_policy_metadata(new_cls, new_source, new_filename)
+        new_cls._p_version = old_cls._p_version + 1
+        linecache.cache[new_filename] = (
+            len(new_source), None, new_source.splitlines(True), new_filename)
+        if new_filename != old_cls._p_filename:
+            linecache.cache.pop(old_cls._p_filename, None)
+        _PLM_POLICIES[new_cls.__name__] = g[new_cls.__name__] = new_cls
     _note(
         f"{name!r}: structural edit couldn't apply in place; replaced the class. "
         f"Existing instances created before this edit remain on the OLD class and "

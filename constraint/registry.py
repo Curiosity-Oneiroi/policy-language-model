@@ -11,7 +11,7 @@ PLM (or downstream code) can extend the registry at runtime:
         if rdkit.Chem.MolFromSmiles(s) is None:
             raise ValueError("not a valid SMILES string")
     Constraint.registry["smiles"] = _smiles_check
-    Constraint.field(kind="smiles").validate("CCO")
+    Constraint.field(type=str, kind="smiles").validate("CCO")
 """
 
 from __future__ import annotations

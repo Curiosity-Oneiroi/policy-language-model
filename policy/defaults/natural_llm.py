@@ -40,15 +40,17 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         messages: a str (treated as one user turn) / a dict (a single
             message) / a list of message dicts. The conversation context.
 
-        constraint=None: optional Constraint CLASS (not instance). When
-            set, MUST be JSON-schema-expressible — a structural
-            Pydantic-class Constraint or a composite of such via `& | ^ ~`.
-            Factory/predicate Constraints (built via `Constraint.field(...)`
-            carrying Python AfterValidator predicates) are REJECTED upfront
-            with TypeError because the model has no way to read Python
-            predicates from a schema — retrying would be pure waste.
-            For predicate validation use `react_llm(..., constraint=C)`,
-            which runs the model's python code and can re-validate.
+        constraint=None: optional Constraint CLASS (not instance). When set,
+            the model is steered by the constraint's JSON schema (the SHAPE)
+            plus its describe() text (the rules, in words), then the answer is
+            validated with retry. Predicates / coercers / @model_validators are
+            fine — the model is told about them via describe() and can comply.
+            The ONE requirement: every user predicate/coercer/@model_validator
+            must carry a `@constraint("...")` description (built-ins
+            auto-describe). A constraint with an UNDESCRIBED check is REJECTED
+            upfront with TypeError — natural_llm can't steer toward a rule it
+            can't state in words. For checks better validated by running the
+            model's code, use `react_llm(..., constraint=C)`.
 
 
         return_budget=5: how many retries on ConstraintViolation. Total
@@ -71,8 +73,8 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
 
     Raises:
 
-        - TypeError: `constraint` is a factory/predicate Constraint
-          (not JSON-schema-expressible).
+        - TypeError: `constraint` carries an UNDESCRIBED user predicate /
+          coercer / @model_validator (natural_llm can't state it to the model).
         - ConstraintViolation: `return_budget` exhausted; the most recent
           validation error propagates.
         - LLMDepthExceeded: the LLM-recursion-depth budget is at 0
@@ -90,8 +92,20 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
     """
     import json
     from plm.policy.defaults._llm_infra import _make_backend, llm_call, check_depth_or_raise
-    from plm.constraint.base import _contains_factory
+    from plm.constraint.base import _all_checks_described, _has_generatable_structure
     generate_kwargs = {} if generate_kwargs is None else generate_kwargs
+
+    # reserved-key guard (mirrors react_llm). natural_llm passes `messages` itself, and — when a
+    # constraint is set — hard-sets `response_format` from the constraint's schema. A caller-supplied
+    # one would be silently dropped, so reject it loudly instead.
+    _reserved_gk = ({"messages", "tools"} | ({"response_format"} if constraint is not None else set())) \
+        & set(generate_kwargs)
+    if _reserved_gk:
+        raise ValueError(
+            f"natural_llm: generate_kwargs may not contain {sorted(_reserved_gk)} — natural_llm "
+            f"supplies messages itself and (with a constraint) hard-sets response_format from the "
+            f"constraint's schema. Drop those keys."
+        )
 
     def _norm(m):
         if isinstance(m, str):
@@ -127,58 +141,51 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
                 f"(it needs json_schema()/validate()); got {constraint!r}"
             )
 
-        # Constraint shape check: must be schema-expressible. Factory constraints
-        # carry predicate/coercer callables the model can't read, so retry is
-        # pointless. `_contains_factory` walks composites (`&`/`|`/`^`/`~`) too, so
-        # a factory HIDDEN inside a composite (e.g. StructA & Constraint.field(...))
-        # is rejected as well — not just a directly-factory constraint. A purely
-        # structural constraint, or a composite of structural ones, passes.
-        if _contains_factory(constraint):
+        # COMMUNICABILITY GATE: natural_llm steers a single-shot model with the schema (the SHAPE)
+        # + describe() (the rules, IN WORDS). A check it cannot state in words is invisible to the
+        # model — it can only fail it. So reject up front iff ANY user predicate / coercer /
+        # @model_validator anywhere in the tree (composites + struct fields + generic elements) has
+        # NO description. Built-in refinements (int_range/str_pattern/...) and framework validators
+        # (exactly_one_of) auto-describe, so they pass. A DESCRIBED predicate/coercer/validator is
+        # fine — the model is told about it and can comply (and validate+retry gates it). This is a
+        # natural_llm-only rule; the general constraint mechanism does NOT require descriptions.
+        if not _all_checks_described(constraint):
             raise TypeError(
                 f"natural_llm: constraint {getattr(constraint, '__name__', repr(constraint))!r} "
-                f"carries predicate/AfterValidator callables (built via "
-                f"Constraint.field(...), possibly inside a `&`/`|`/`^`/`~` composite) "
-                f"that the language model has no way to read from a JSON schema, "
-                f"so single-shot generation would retry to exhaustion. natural_llm "
-                f"requires a structural Constraint (Pydantic-class) or a composite "
-                f"of purely structural ones, whose json_schema() is a complete spec "
-                f"the model can follow. For predicate validation use "
-                f"`react_llm(..., constraint=C)` — the ReAct loop lets the model see "
-                f"the violation in the tool result and self-correct."
+                f"has a predicate/coercer/@model_validator with NO description — natural_llm can "
+                f"only steer the model toward checks it can state in words, so an undescribed check "
+                f"is one the model can only fail. Tag each user predicate/coercer/validator with "
+                f"@constraint('...'), or use `react_llm(..., constraint=C)` (it runs the model's "
+                f"code and lets it self-correct on the violation)."
             )
 
-        # HARD-SET the schema on response_format — the constraint defines the output,
-        # so it ALWAYS wins (we do NOT let a caller-passed response_format override it).
-        # A constraint with NO JSON-schema representation — an `is_instance_of=`/predicate rule,
-        # INCLUDING one hidden inside a struct field built via `Constraint.field(...)` (which the
-        # `_contains_factory` guard above can't see, as it walks only `&|^~` composites, not struct
-        # field annotations) — is, like a factory, something the model can't converge on. Surface it
-        # as the SAME clear TypeError instead of an uncaught PydanticInvalidForJsonSchema crash.
-        # General: catches ANY non-exportable schema, not just is_instance_of.
-        from pydantic.errors import PydanticInvalidForJsonSchema
-        try:
-            schema = constraint.json_schema()
-        except PydanticInvalidForJsonSchema as e:
-            raise TypeError(
-                f"natural_llm: constraint {getattr(constraint, '__name__', repr(constraint))!r} "
-                f"has no JSON-schema representation ({e}) — e.g. an `is_instance_of=`/predicate rule "
-                f"(possibly inside a struct field built via `Constraint.field(...)`) compiles to a "
-                f"pydantic is-instance schema that can't be exported, so the model has nothing to "
-                f"converge on. Use a purely structural Constraint, or route predicate/isinstance "
-                f"validation through `react_llm(..., constraint=C)`."
-            ) from e
-        gk = dict(generate_kwargs)
-        gk["response_format"] = {"type": "json_schema",
-                                 "json_schema": {"name": "answer", "schema": schema}}
-
         from plm._react_helper import _coerce_budget, _safe_describe, _strip_md_fence
+        # json_schema() is AIRTIGHT (never raises post-reframe). Hard-set it as response_format ONLY
+        # when it pins a concrete shape (type/enum/properties/anyOf) — then the constraint defines
+        # the output and ALWAYS wins over a caller-passed response_format. For a STRUCTURELESS
+        # constraint (e.g. a bare described predicate on `type=object`) there is no shape to force,
+        # so fall back to describe-only steering (no response_format) — the model generates freely
+        # and validate+retry gates it.
+        schema = constraint.json_schema()
+        gk = dict(generate_kwargs)
+        if _has_generatable_structure(schema):
+            gk["response_format"] = {"type": "json_schema",
+                                     "json_schema": {"name": "answer", "schema": schema}}
+        # Feed the FULL contract upfront (describe() — every check in words) as a leading system
+        # note, so the model is steered toward bounds/predicates/cross-field rules from the FIRST
+        # attempt, not only after a failed retry. Built fresh per call; NOT woven into the caller's
+        # message list.
+        _contract = _safe_describe(constraint)
+        _steer = ([{"role": "system",
+                    "content": "Produce output that satisfies ALL of this contract:\n" + _contract}]
+                  if _contract else [])
         last_err = None
         # `return_budget` is model-controlled; coerce None/non-int/negative -> a
         # sane non-negative int (no raw TypeError at the range bound; see #18).
         rb = _coerce_budget(return_budget, 5)
         for _ in range(1 + rb):
             check_depth_or_raise()
-            content = _content(backend.generate(msgs, **gk))
+            content = _content(backend.generate(_steer + msgs, **gk))
             try:
                 # Strip a structural ```json ... ``` fence first. response_format is
                 # hard-set to json_schema (so OpenAI/vLLM structured outputs return
@@ -199,11 +206,14 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
                 # validation failure as a retry — surface the last one if the
                 # budget is exhausted — instead of letting it abort the call.
                 last_err = e
-                msgs = msgs + [
+                # M6: append IN PLACE (extend, not `msgs = msgs + [...]`) so the failed answer +
+                # violation weave back into the caller's trajectory by reference, matching react_llm.
+                # The contract (describe()) is already fed UPFRONT via `_steer`, so the retry turn
+                # carries ONLY the violation — no redundant re-describe.
+                msgs.extend([
                     {"role": "assistant", "content": content},
-                    {"role": "user", "content": _safe_describe(constraint)
-                     + "\n\nYour previous answer failed validation: " + str(e)},
-                ]
+                    {"role": "user", "content": "Your previous answer failed validation: " + str(e)},
+                ])
         # Budget exhausted: ALWAYS surface a clear budget-exhaustion
         # ConstraintViolation to the CALLER (PLM / a policy / a function),
         # chaining the last error so its detail is preserved. Constraint.validate()

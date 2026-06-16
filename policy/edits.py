@@ -183,6 +183,8 @@ def _compute_insert(src: str, after_line: int, content: str):
             or after_line < 0):                       # after_line: a 0-based int count;
         return None                                   # non-int -> no-op, not a raw TypeError
     L = src.splitlines(keepends=True)
+    if after_line > len(L):                           # after a line that doesn't exist -> NO_MATCH,
+        return None                                   # not a silent clamp-to-EOF (mirrors _compute_delete)
     before = "".join(L[:after_line])
     tail = "".join(L[after_line:])
     # If the prefix doesn't already END on a line boundary (e.g. inserting after

@@ -20,7 +20,7 @@ snapshotted as a small picklable RECIPE and REBUILT on rehydrate, instead of by 
 
 The recipe is RECURSIVE: a Constraint that appears NESTED inside another (a struct field
 typed as a Constraint — `addr: Address` / `currency: Constraint.field(...)` — or a
-Constraint passed as a factory kwarg — `list_of=Constraint.field(...)`) is itself a class
+Constraint passed as a factory kwarg — `type=list[Constraint.field(...)]`) is itself a class
 that can't pickle, so it is stored as a NESTED recipe rather than kept live. Without this
 the inner class re-introduces exactly the unpicklable / by-reference failure the recipe
 exists to avoid (and the by-reference case would sink the whole snapshot). `_NESTED` marks
@@ -125,12 +125,17 @@ def _spec_to_ann(spec: Any) -> Any:
 
 
 def _value_to_spec(v: Any) -> Any:
-    """A factory-kwarg VALUE as a picklable spec: a Constraint class (e.g. `list_of=`,
-    `is_instance_of=`, `dict_of=`) -> nested recipe; list/tuple/dict containers are walked;
-    plain values pass through."""
+    """A factory-kwarg VALUE as a picklable spec: a Constraint class (e.g. `type=SomeStruct`, `is_instance_of=`) -> nested recipe; a typing generic wrapping a Constraint
+    (e.g. `type=list[SomeStruct]`) -> ("__generic__", origin, [arg-specs]); list/tuple/dict
+    containers are walked; plain values pass through."""
     if is_constraint_class(v):
         r = to_recipe(v)
         return (_NESTED, r) if r is not None else v
+    origin = get_origin(v)
+    if origin is not None:
+        args = get_args(v)
+        if args and any(_ann_contains_constraint(a) for a in args):
+            return (_GENERIC, origin, tuple(_value_to_spec(a) for a in args))
     if isinstance(v, list):
         return [_value_to_spec(x) for x in v]
     if isinstance(v, tuple):
@@ -144,6 +149,10 @@ def _spec_to_value(s: Any) -> Any:
     """Inverse of `_value_to_spec`."""
     if isinstance(s, tuple) and len(s) == 2 and s[0] == _NESTED:
         return from_recipe(s[1])
+    if isinstance(s, tuple) and len(s) == 3 and s[0] == _GENERIC:
+        _, origin, arg_specs = s
+        args = tuple(_spec_to_value(a) for a in arg_specs)
+        return origin[args[0]] if len(args) == 1 else origin[args]
     if isinstance(s, list):
         return [_spec_to_value(x) for x in s]
     if isinstance(s, tuple):
@@ -207,7 +216,7 @@ def _to_recipe_build(c: Any) -> Optional[Tuple]:
         kw = getattr(c, "_constraint_factory_kwargs", None)
         if kw is None:
             return None
-        # Recurse: a kwarg value may itself be a Constraint (list_of=Constraint.field(...),
+        # Recurse: a kwarg value may itself be a Constraint (type=Constraint struct,
         # is_instance_of=SomeConstraint, ...) which can't pickle -> store it as a nested recipe.
         return ("field", {k: _value_to_spec(v) for k, v in dict(kw).items()})
     if is_constraint_class(c):

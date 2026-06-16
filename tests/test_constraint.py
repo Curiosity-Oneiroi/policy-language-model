@@ -42,7 +42,7 @@ def test_subclass_validates_struct():
 
 
 def test_of_int_range_returns_scalar():
-    c = Constraint.of(int_range=(0, 9))
+    c = Constraint.of(type=int, int_range=(0, 9))
     assert c.validate(5) == 5
     with pytest.raises(ConstraintViolation):
         c.validate(10)
@@ -56,7 +56,7 @@ def test_of_int_range_returns_scalar():
 
 
 def test_of_float_strict_bounds():
-    c = Constraint.of(float_gt=0.0, float_lt=1.0)
+    c = Constraint.of(type=float, float_gt=0.0, float_lt=1.0)
     assert c.validate(0.5) == 0.5
     with pytest.raises(ConstraintViolation):
         c.validate(0.0)  # gt → must be strictly above 0
@@ -70,7 +70,7 @@ def test_of_float_strict_bounds():
 
 
 def test_of_one_of_literal():
-    c = Constraint.of(one_of=["red", "green", "blue"])
+    c = Constraint.of(type=Literal["red", "green", "blue"])
     assert c.validate("red") == "red"
     with pytest.raises(ConstraintViolation):
         c.validate("yellow")
@@ -82,7 +82,7 @@ def test_of_one_of_literal():
 
 
 def test_of_str_pattern_length():
-    c = Constraint.of(str_pattern=r"^[A-Z]+$", str_length=(2, 5))
+    c = Constraint.of(type=str, str_pattern=r"^[A-Z]+$", str_length=(2, 5))
     assert c.validate("ABC") == "ABC"
     with pytest.raises(ConstraintViolation):
         c.validate("ab")  # lowercase, also too short
@@ -99,7 +99,7 @@ def test_of_str_pattern_length():
 
 def test_of_list_of_with_modifiers():
     c = Constraint.of(
-        list_of=Constraint.of(int_range=(0, 9)),
+        type=list[Constraint.field(type=int, int_range=(0, 9))],
         list_length=(3, 5),
         unique=True,
         sorted="asc",
@@ -121,7 +121,7 @@ def test_of_list_of_with_modifiers():
 
 
 def test_of_dict_of():
-    c = Constraint.of(dict_of=(str, Constraint.of(float_range=(0.0, 1.0))))
+    c = Constraint.of(type=dict[str, Constraint.field(type=float, float_range=(0.0, 1.0))])
     out = c.validate({"a": 0.5, "b": 0.9})
     assert out == {"a": 0.5, "b": 0.9}
     with pytest.raises(ConstraintViolation):
@@ -138,7 +138,9 @@ def test_of_is_instance_of_arbitrary_class():
         def __init__(self, depth):
             self.depth = depth
 
-    c = Constraint.of(is_instance_of=MCTS, description="an MCTS policy")
+    # is_instance_of is a PURE check now; pair it with type=object (no coercion) so the
+    # isinstance predicate is the sole gate.
+    c = Constraint.of(type=object, is_instance_of=MCTS, description="an MCTS policy")
     m = MCTS(depth=3)
     assert c.validate(m) is m
 
@@ -156,7 +158,7 @@ def test_of_predicate_passes_and_fails():
         if x < 2 or any(x % i == 0 for i in range(2, int(x**0.5) + 1)):
             raise ValueError("not prime")
 
-    c = Constraint.of(predicate=is_prime, description="prime")
+    c = Constraint.of(type=int, predicate=is_prime, description="prime")
     assert c.validate(7) == 7
     with pytest.raises(ConstraintViolation):
         c.validate(8)
@@ -172,7 +174,7 @@ def test_predicate_callable_pass_and_fail():
         if x % 2 != 0:
             raise ValueError("not even")
 
-    c = Constraint.of(predicate=even)
+    c = Constraint.of(type=int, predicate=even)
     assert c.validate(4) == 4
     with pytest.raises(ConstraintViolation):
         c.validate(5)
@@ -184,7 +186,7 @@ def test_predicate_callable_pass_and_fail():
 
 
 def test_of_kind_registry():
-    c = Constraint.of(kind="semver")
+    c = Constraint.of(type=str, kind="semver")
     assert c.validate("1.2.3") == "1.2.3"
     with pytest.raises(ConstraintViolation):
         c.validate("not-semver")
@@ -220,7 +222,7 @@ def test_and_composition():
         if x % 2 != 0:
             raise ValueError("not even")
 
-    c = Constraint.of(int_range=(0, 100)) & Constraint.of(predicate=is_even)
+    c = Constraint.of(type=int, int_range=(0, 100)) & Constraint.of(type=int, predicate=is_even)
     assert c.validate(42) == 42
     with pytest.raises(ConstraintViolation):
         c.validate(43)  # not even
@@ -234,7 +236,7 @@ def test_and_composition():
 
 
 def test_or_composition_first_success():
-    c = Constraint.of(int_range=(0, 9)) | Constraint.of(one_of=["x", "y"])
+    c = Constraint.of(type=int, int_range=(0, 9)) | Constraint.of(type=Literal["x", "y"])
     assert c.validate(5) == 5
     assert c.validate("x") == "x"
     with pytest.raises(ConstraintViolation):
@@ -247,7 +249,7 @@ def test_or_composition_first_success():
 
 
 def test_not_negation_on_predicate():
-    c = ~Constraint.of(int_lt=0)  # NOT (x < 0)  i.e.  x >= 0
+    c = ~Constraint.of(type=int, int_lt=0)  # NOT (x < 0)  i.e.  x >= 0
     assert c.validate(0) == 0
     assert c.validate(5) == 5
     with pytest.raises(ConstraintViolation):
@@ -273,7 +275,7 @@ def test_not_on_structural_raises_at_compose():
 
 
 def test_xor_exactly_one():
-    c = Constraint.of(int_range=(0, 9)) ^ Constraint.of(str_length=(1, 1))
+    c = Constraint.of(type=int, int_range=(0, 9)) ^ Constraint.of(type=str, str_length=(1, 1))
     assert c.validate(5) == 5
     assert c.validate("a") == "a"
     with pytest.raises(ConstraintViolation):
@@ -313,7 +315,7 @@ def test_describe_renders_struct_subclass():
 
 
 def test_describe_renders_factory_kwargs():
-    c = Constraint.of(int_range=(0, 9), description="a digit")
+    c = Constraint.of(type=int, int_range=(0, 9), description="a digit")
     desc = c.describe()
     assert "int" in desc and "0" in desc and "9" in desc
     assert "a digit" in desc
@@ -325,8 +327,8 @@ def test_describe_renders_factory_kwargs():
 
 
 def test_describe_renders_composition():
-    a = Constraint.of(int_range=(0, 100))
-    b = Constraint.of(predicate=lambda x: None, description="some rule")
+    a = Constraint.of(type=int, int_range=(0, 100))
+    b = Constraint.of(type=object, predicate=lambda x: None, description="some rule")
 
     composed = a | ~b
     desc = composed.describe()
@@ -385,6 +387,7 @@ def test_exactly_one_of_decorator():
 
 def test_callable_with_behaves_like():
     c = Constraint.of(
+        type=object,
         callable=True,
         behaves_like=[((2,), 4), ((3,), 9), ((10,), 100)],
         description="squares its int input",
@@ -402,7 +405,7 @@ def test_callable_with_behaves_like():
 
 
 def test_approx_equality():
-    c = Constraint.of(approx=(3.14159, 1e-3))
+    c = Constraint.of(type=float, approx=(3.14159, 1e-3))
     assert c.validate(3.142) == 3.142
     assert c.validate(3.141) == 3.141
     with pytest.raises(ConstraintViolation):
@@ -415,17 +418,17 @@ def test_approx_equality():
 
 
 def test_negative_kwargs():
-    c1 = Constraint.of(not_one_of=[1, 2, 3])
+    c1 = Constraint.of(type=int, not_one_of=[1, 2, 3])
     assert c1.validate(5) == 5
     with pytest.raises(ConstraintViolation):
         c1.validate(2)
 
-    c2 = Constraint.of(not_pattern=r"\bsecret\b")
+    c2 = Constraint.of(type=str, not_pattern=r"\bsecret\b")
     assert c2.validate("hello world") == "hello world"
     with pytest.raises(ConstraintViolation):
         c2.validate("this is a secret")
 
-    c3 = Constraint.of(not_empty=True)
+    c3 = Constraint.of(type=object, not_empty=True)
     assert c3.validate("hi") == "hi"
     assert c3.validate([1]) == [1]
     with pytest.raises(ConstraintViolation):
@@ -440,7 +443,7 @@ def test_negative_kwargs():
 
 
 def test_constraint_violation_aggregation_or():
-    c = Constraint.of(int_range=(0, 9)) | Constraint.of(one_of=["x", "y"])
+    c = Constraint.of(type=int, int_range=(0, 9)) | Constraint.of(type=Literal["x", "y"])
     try:
         c.validate("z")
     except ConstraintViolation as e:
@@ -472,7 +475,7 @@ def test_pydantic_field_passthrough():
 
 
 def test_validate_returns_coerced_value():
-    c = Constraint.of(int_range=(0, 9))
+    c = Constraint.of(type=int, int_range=(0, 9))
     assert c.validate("5") == 5  # pydantic coerces string→int
     assert isinstance(c.validate("5"), int)
 
@@ -550,7 +553,7 @@ def test_json_schema_predicate_x_description():
         if x < 2 or any(x % i == 0 for i in range(2, int(x**0.5) + 1)):
             raise ValueError("not prime")
 
-    c = Constraint.of(int_range=(0, 9), predicate=is_prime, description="prime digit")
+    c = Constraint.of(type=int, int_range=(0, 9), predicate=is_prime, description="prime digit")
     schema = c.json_schema()
     # Structural bits come through (int with min/max).
     assert schema.get("type") == "integer"
@@ -573,6 +576,7 @@ def test_functional_on_structural_via_and():
 
     # Compose: shape + predicate on the instance.
     small_trade = Trade & Constraint.of(
+        type=object,
         predicate=lambda t: None if t.qty < 1000 else (_ for _ in ()).throw(
             ValueError("qty >= 1000")
         ),
@@ -714,11 +718,11 @@ def test_merge_instance_is_isinstance_of_both_parents():
 
 def test_sorted_false_and_monotonic_false_skip():
     # sorted=False should NOT install a sorted check (no error, no validation).
-    c1 = Constraint.of(list_of=int, sorted=False)
+    c1 = Constraint.of(type=list[int], sorted=False)
     assert c1.validate([3, 1, 2]) == [3, 1, 2]  # would fail if check were on
 
     # monotonic=False should also skip.
-    c2 = Constraint.of(list_of=int, monotonic=False)
+    c2 = Constraint.of(type=list[int], monotonic=False)
     assert c2.validate([3, 1, 2]) == [3, 1, 2]
 
 
@@ -736,7 +740,7 @@ def test_predicate_coercer_style_fails_loudly():
         # User mistake: wrote a coercer instead of a predicate.
         return s.lower().strip()
 
-    c = Constraint.of(predicate=bad_normalize)
+    c = Constraint.of(type=str, predicate=bad_normalize)
     with pytest.raises(ConstraintViolation) as excinfo:
         c.validate("  HELLO  ")
     # The error must explain the protocol so the LLM author can fix the mistake.
@@ -761,14 +765,14 @@ def test_predicate_coercer_style_fails_loudly():
         return s
 
     for fn in (ok_returns_none, ok_returns_true, ok_returns_input):
-        c = Constraint.of(predicate=fn)
+        c = Constraint.of(type=str, predicate=fn)
         assert c.validate("hello") == "hello"
 
     # `return False` is a contract violation too — should fail loudly.
     def returns_false(s):
         return False
 
-    c = Constraint.of(predicate=returns_false)
+    c = Constraint.of(type=str, predicate=returns_false)
     with pytest.raises(ConstraintViolation) as excinfo:
         c.validate("x")
     assert "returned False" in str(excinfo.value)
@@ -776,7 +780,7 @@ def test_predicate_coercer_style_fails_loudly():
 
 def test_coercer_transforms_value():
     """`coercer=fn` transforms the value before validation."""
-    c = Constraint.of(coercer=lambda s: s.lower().strip())
+    c = Constraint.of(type=str, coercer=lambda s: s.lower().strip())
     assert c.validate("  HELLO  ") == "hello"
     assert c.validate("WORLD") == "world"
 
@@ -785,6 +789,7 @@ def test_coercer_then_field_constraint():
     """Coercer runs BEFORE field constraints — `Field(pattern=...)` checks
     the *coerced* value, not the original."""
     c = Constraint.of(
+        type=str,
         coercer=lambda s: s.lower().strip(),
         str_pattern=r"^[a-z]+$",
     )
@@ -798,7 +803,7 @@ def test_coercer_then_field_constraint():
 
 def test_multiple_coercers_chain_in_order():
     """`coercers=[fn1, fn2, fn3]` chains: fn1's output feeds fn2, etc."""
-    c = Constraint.of(coercers=[
+    c = Constraint.of(type=str, coercers=[
         str.strip,                      # "  HELLO WORLD  " → "HELLO WORLD"
         str.lower,                      # "HELLO WORLD"     → "hello world"
         lambda s: s.replace(" ", "_"),  # "hello world"     → "hello_world"
@@ -806,34 +811,41 @@ def test_multiple_coercers_chain_in_order():
     assert c.validate("  HELLO WORLD  ") == "hello_world"
 
 
-def test_int_range_plus_strict_bound_rejected_at_compose():
-    """B5: mixing int_range with int_gt/int_lt/etc. raises at compose time
-    instead of producing an opaque pydantic SchemaError later."""
-    with pytest.raises(ValueError, match="int_range.*cannot be combined"):
-        Constraint.of(int_range=(0, 100), int_gt=5)
-    with pytest.raises(ValueError, match="float_range.*cannot be combined"):
-        Constraint.of(float_range=(0.0, 1.0), float_le=0.5)
+def test_int_range_plus_strict_bound_compose_as_predicates():
+    """Reframe: int_range and int_gt/int_lt are now both PREDICATES (no pydantic Field), so
+    they freely COMPOSE on one type coercer — each is an independent AfterValidator check
+    (no more SchemaError, no mutual-exclusion needed)."""
+    c = Constraint.of(type=int, int_range=(0, 100), int_gt=5)   # in [0,100] AND > 5  -> (5,100]
+    assert c.validate(50) == 50
+    with pytest.raises(ConstraintViolation):
+        c.validate(5)                                           # fails int_gt
+    with pytest.raises(ConstraintViolation):
+        c.validate(101)                                         # fails int_range
+    f = Constraint.of(type=float, float_range=(0.0, 1.0), float_le=0.5)
+    assert f.validate(0.25) == 0.25
+    with pytest.raises(ConstraintViolation):
+        f.validate(0.75)                                        # fails float_le
     # Pure strict bounds (no range) still work.
-    Constraint.of(int_gt=0, int_lt=10)
+    Constraint.of(type=int, int_gt=0, int_lt=10)
 
 
 def test_invalid_monotonic_value_rejected():
     """B17: monotonic= must be True/False/'strict'; typos fail at compose."""
     with pytest.raises(ValueError, match="monotonic.*must be"):
-        Constraint.of(list_of=int, monotonic="strictt")
+        Constraint.of(type=list[int], monotonic="strictt")
     with pytest.raises(ValueError, match="monotonic.*must be"):
-        Constraint.of(list_of=int, monotonic="ascending")
+        Constraint.of(type=list[int], monotonic="ascending")
 
 
 def test_describe_skips_falsey_sorted_and_monotonic():
     """B9: sorted=False and monotonic=False are opt-outs and should NOT
     appear in the rendered describe text."""
-    c1 = Constraint.of(list_of=int, sorted=False, not_empty=True)
+    c1 = Constraint.of(type=list[int], sorted=False, not_empty=True)
     desc1 = c1.describe()
     assert "sorted" not in desc1.lower()  # must not render the opt-out
     assert "non-empty" in desc1  # other kwargs still render
 
-    c2 = Constraint.of(list_of=int, monotonic=False)
+    c2 = Constraint.of(type=list[int], monotonic=False)
     desc2 = c2.describe()
     assert "monotonic" not in desc2.lower()
 
@@ -849,6 +861,7 @@ def test_coercer_then_predicate_ordering():
             raise ValueError("predicate saw uppercase — coercer didn't run first")
 
     c = Constraint.of(
+        type=str,
         coercer=lambda s: s.lower().strip(),
         predicate=check_lowercase,
     )
@@ -861,6 +874,7 @@ def test_single_coercer_and_coercers_list_compose():
     The single coercer is added before the list (per declaration order in
     _interpret_kwargs)."""
     c = Constraint.of(
+        type=str,
         coercer=str.strip,
         coercers=[str.lower, lambda s: s + "!"],
     )
@@ -868,19 +882,25 @@ def test_single_coercer_and_coercers_list_compose():
     assert c.validate("  HELLO  ") == "hello!"
 
 
-def test_w3_kind_plus_int_range_rejected_at_compose():
-    """W3: `kind="semver"` + `int_range=(0,9)` would silently produce a broken
-    constraint (str-shaped predicate against int value); now rejected at compose."""
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
+def test_w3_missing_or_nullable_type_rejected_at_compose():
+    """Reframe: the type coercer is mandatory and ALWAYS spelled `type=`. A field with only
+    predicates errors; a nullable / union type errors (alternatives go through the `|` algebra,
+    not inside one field's type)."""
+    import typing
+    with pytest.raises(ValueError, match="no type coercer"):
         Constraint.of(kind="semver", int_range=(0, 9))
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
+    with pytest.raises(ValueError, match="no type coercer"):
         Constraint.of(is_instance_of=int, str_pattern=r"^x$")
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.of(one_of=["a", "b"], int_range=(0, 9))
+    with pytest.raises(ValueError, match="nullable"):
+        Constraint.of(type=typing.Optional[int])
+    with pytest.raises(ValueError, match="Union"):
+        Constraint.of(type=int | str)
+    with pytest.raises(ValueError, match="nullable"):                # nested nullable too
+        Constraint.of(type=list[typing.Optional[int]])
 
-    # Same-group combinations still work fine.
-    Constraint.of(str_pattern=r"^[a-z]+$", str_length=(1, 10))  # both in 'str' group
-    Constraint.of(list_of=int)                                   # 'list' group alone
+    # One type coercer + same-shape refinement predicates compose fine.
+    Constraint.of(type=str, str_pattern=r"^[a-z]+$", str_length=(1, 10))
+    Constraint.of(type=list[int])
 
 
 def test_b22_composite_model_validate_fires_children():
@@ -892,7 +912,7 @@ def test_b22_composite_model_validate_fires_children():
         if x != 5:
             raise ValueError("not 5")
 
-    c = Constraint.of(int_range=(0, 10)) & Constraint.of(predicate=must_be_5)
+    c = Constraint.of(type=int, int_range=(0, 10)) & Constraint.of(type=int, predicate=must_be_5)
     # Both interfaces should behave identically:
     assert c.validate(5) == 5
     assert c.model_validate(5) == 5
@@ -909,17 +929,16 @@ def test_nb1_exactly_one_of_empty_rejected():
             x: int
 
 
-def test_b33_list_length_plus_int_range_rejected():
-    """B33: list_length + int_range targets two conflicting base types
-    (int + list-shape). Now rejected at compose time instead of producing
-    a confusing pydantic SchemaError about min_length on an int."""
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.of(int_range=(0, 9), list_length=(1, 5))
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.of(list_of=int, dict_of=(str, int))
+def test_b33_removed_container_sugars_are_unknown_kwargs():
+    """Reframe: list_of/dict_of/tuple_of/set_of/frozenset_of/one_of are GONE — express them
+    through `type=` (type=list[int], type=Literal[...]). The old spellings are unknown kwargs."""
+    for sugar in (dict(list_of=int), dict(dict_of=(str, int)), dict(tuple_of=int),
+                  dict(set_of=int), dict(frozenset_of=int), dict(one_of=["a", "b"])):
+        with pytest.raises(TypeError, match="unknown kwargs"):
+            Constraint.of(**sugar)
 
-    # list_length alone (with list_of) still works.
-    c = Constraint.of(list_of=int, list_length=(2, 4))
+    # list_length (a predicate) composes onto a type=list[...] coercer.
+    c = Constraint.of(type=list[int], list_length=(2, 4))
     c.validate([1, 2, 3])
 
 
@@ -944,19 +963,16 @@ def test_i6_describe_dedups_aliased_descriptions():
     assert desc.count("x must be even") == 1
 
 
-def test_i10_type_compatibility_error_lists_conflicts_clearly():
-    """I10: the multi-group error message should make it easy for PLM
-    to see WHICH kwargs from WHICH groups conflicted."""
-    with pytest.raises(ValueError) as excinfo:
-        Constraint.of(kind="semver", int_range=(0, 9), str_pattern=r"^x$")
-    msg = str(excinfo.value)
-    # Three groups present: kind, int, str — each should appear by name.
-    assert "'kind'" in msg
-    assert "'int'" in msg
-    assert "'str'" in msg
-    assert "int_range" in msg or "int_range" in str(msg)
-    # The corrective hint about composing with `&` should be present.
-    assert "compose" in msg or "&" in msg
+def test_i10_type_error_messages_are_clear():
+    """The mandatory-type and nullable errors name the problem clearly so PLM can fix it
+    (point at `type=`, and at the `|` algebra for alternatives)."""
+    import typing
+    with pytest.raises(ValueError) as e1:
+        Constraint.of(int_range=(0, 9))
+    assert "no type coercer" in str(e1.value) and "type=" in str(e1.value)
+    with pytest.raises(ValueError) as e2:
+        Constraint.of(type=typing.Optional[int])
+    assert "nullable" in str(e2.value) and "| algebra" in str(e2.value)
 
 
 def test_nb2_a_and_a_short_circuits():
@@ -974,7 +990,7 @@ def test_coercer_can_raise_to_reject():
     def parse_int(s):
         return int(s)  # raises ValueError on bad input — pydantic propagates
 
-    c = Constraint.of(coercer=parse_int, int_range=(0, 100))
+    c = Constraint.of(type=int, coercer=parse_int, int_range=(0, 100))
     assert c.validate("42") == 42
     with pytest.raises(ConstraintViolation):
         c.validate("not-an-int")  # parse_int raises → ConstraintViolation
@@ -993,7 +1009,7 @@ def test_and_fails_fast():
         side_effect.append("second")
 
     # Use AND-wrapper path (factory & factory → run-both wrapper):
-    c = Constraint.of(predicate=first_fails) & Constraint.of(predicate=second_runs)
+    c = Constraint.of(type=int, predicate=first_fails) & Constraint.of(type=int, predicate=second_runs)
     with pytest.raises(ConstraintViolation):
         c.validate(42)
     # second predicate must NOT have run — fail-fast.
@@ -1001,21 +1017,34 @@ def test_and_fails_fast():
     assert "second" not in side_effect
 
 
-def test_contains_factory_walks_composites():
-    """_contains_factory detects a factory anywhere in the &/|/^ tree (finding #5)."""
-    from plm.constraint.base import _contains_factory
+def test_all_checks_described_walks_tree():
+    """`_all_checks_described` (natural_llm's M12 gate, which replaced `_contains_factory`) detects an
+    UNDESCRIBED user check anywhere in the &/|/^ tree OR a struct field; built-ins and described user
+    checks pass."""
+    from plm.constraint.base import _all_checks_described
+    from plm.constraint import constraint
 
     class S(Constraint):
         x: int
-    F = Constraint.of(int_range=(0, 9))                 # a factory
-    assert _contains_factory(F) is True
-    assert _contains_factory(S) is False
-    assert _contains_factory(S & F) is True             # factory hidden in a composite
-    assert _contains_factory(F | F) is True
-    # a composite of purely-structural constraints is NOT a factory
-    class T(Constraint):
-        y: int
-    assert _contains_factory(S & T) is False
+    Builtin = Constraint.of(type=int, int_range=(0, 9))           # built-in refinement -> auto-described
+    Undesc = Constraint.of(type=int, predicate=lambda v: v > 0)   # untagged user predicate
+
+    @constraint("positive")
+    def pos(v):
+        if v <= 0:
+            raise ValueError("nope")
+    Desc = Constraint.of(type=int, predicate=pos)
+
+    assert _all_checks_described(S) is True
+    assert _all_checks_described(Builtin) is True
+    assert _all_checks_described(Desc) is True
+    assert _all_checks_described(Undesc) is False
+    assert _all_checks_described(S & Undesc) is False             # undescribed hidden in a composite
+    assert _all_checks_described(S & Desc) is True
+
+    class HasField(Constraint):
+        f: Constraint.field(type=int, predicate=lambda v: v > 0)  # undescribed in a struct FIELD
+    assert _all_checks_described(HasField) is False               # the old struct-field blind spot, caught
 
 
 def test_json_schema_factory_preserves_defs_for_nested_model():
@@ -1025,7 +1054,7 @@ def test_json_schema_factory_preserves_defs_for_nested_model():
 
     class Inner(Constraint):
         x: int
-    C = Constraint.of(list_of=Inner)                    # value = List[Inner] -> $ref + $defs
+    C = Constraint.of(type=list[Inner])                 # value = List[Inner] -> $ref + $defs
     sch = C.json_schema()
     assert "$defs" in sch and "Inner" in _json.dumps(sch) and "$ref" in _json.dumps(sch)
 
@@ -1038,11 +1067,11 @@ def test_json_schema_factory_preserves_defs_for_nested_model():
 # =============================================================================
 
 @pytest.mark.parametrize("ctor,bad_value", [
-    (lambda: Constraint.of(sorted=True),          [1, "a", 2]),     # not mutually comparable
-    (lambda: Constraint.of(sorted=True),          123),             # not iterable
-    (lambda: Constraint.of(monotonic=True),       [1, "a"]),        # not comparable
-    (lambda: Constraint.of(monotonic=True),       123),             # not iterable
-    (lambda: Constraint.of(kind="path_exists"),   123),             # wrong type
+    (lambda: Constraint.of(type=object, sorted=True),          [1, "a", 2]),     # not mutually comparable
+    (lambda: Constraint.of(type=object, sorted=True),          123),             # not iterable
+    (lambda: Constraint.of(type=object, monotonic=True),       [1, "a"]),        # not comparable
+    (lambda: Constraint.of(type=object, monotonic=True),       123),             # not iterable
+    (lambda: Constraint.of(type=str, kind="path_exists"),   123),             # wrong type
 ])
 def test_37_predicate_typeerror_becomes_constraint_violation(ctor, bad_value):
     c = ctor()
@@ -1053,7 +1082,7 @@ def test_37_predicate_typeerror_becomes_constraint_violation(ctor, bad_value):
 def test_37b_sorted_does_not_consume_generator_then_pass():
     """_check_sorted materializes once: a generator that IS sorted must pass
     (the old code consumed it in sorted() then compared against an empty list)."""
-    c = Constraint.of(sorted=True)
+    c = Constraint.of(type=object, sorted=True)
     c.validate(iter([1, 2, 3]))                    # sorted generator → no ConstraintViolation
     with pytest.raises(ConstraintViolation):
         c.validate(iter([3, 1, 2]))                # genuinely unsorted still rejected
@@ -1073,7 +1102,7 @@ def test_38_composite_non_violation_exception_stays_in_contract():
         def _boom(self):
             raise KeyError("structural validator raised a non-ValueError")
 
-    okdict = Constraint.of(is_instance_of=dict)
+    okdict = Constraint.of(type=object, is_instance_of=dict)
 
     # AND: erroring child -> ConstraintViolation (NOT a raw KeyError).
     with pytest.raises(ConstraintViolation):
@@ -1093,7 +1122,7 @@ def test_38_composite_non_violation_exception_stays_in_contract():
 # =============================================================================
 
 def test_39_not_one_of_unhashable_members():
-    c = Constraint.of(not_one_of=[[1], [2]])       # unhashable members -> must BUILD, not raise
+    c = Constraint.of(type=list, not_one_of=[[1], [2]])       # unhashable members -> must BUILD, not raise
     with pytest.raises(ConstraintViolation):
         c.validate([1])                            # forbidden
     c.validate([3])                                # allowed
@@ -1281,7 +1310,7 @@ def test_44_describe_one_shot_iterable_kwargs():
     describe() correctly and not crash — they're materialized before the describe
     snapshot, while the live validation path is unchanged."""
     # one_of from a generator: describe shows the options, not "one of []"
-    c1 = Constraint.of(one_of=(x for x in ("a", "b", "c")))
+    c1 = Constraint.of(type=Literal["a", "b", "c"])
     d1 = c1.describe()
     assert "a" in d1 and "b" in d1 and "c" in d1 and "one of []" not in d1
     assert c1.validate("a") == "a"                          # live path intact
@@ -1289,12 +1318,12 @@ def test_44_describe_one_shot_iterable_kwargs():
         c1.validate("z")
 
     # coercers from a generator: describe must not crash on len()
-    c2 = Constraint.of(coercers=(f for f in (str.strip, str.lower)))
+    c2 = Constraint.of(type=str, coercers=(f for f in (str.strip, str.lower)))
     assert "2 coercer(s)" in c2.describe()
     assert c2.validate("  AB  ") == "ab"                    # both coercers applied
 
     # not_one_of from a generator: describe shows the forbidden values
-    c3 = Constraint.of(not_one_of=(x for x in (1, 2)))
+    c3 = Constraint.of(type=int, not_one_of=(x for x in (1, 2)))
     assert "1" in c3.describe() and "2" in c3.describe()
     with pytest.raises(ConstraintViolation):
         c3.validate(1)
@@ -1304,7 +1333,7 @@ def test_45_unique_one_shot_generator_with_unhashable_dup():
     """#8: unique= over a one-shot generator with unhashable elements + a dup must
     still reject — the set fast path no longer half-consumes the generator before
     the unhashable fallback (materialized once, like sorted/monotonic)."""
-    c = Constraint.of(unique=True)
+    c = Constraint.of(type=object, unique=True)
     # generator yielding an unhashable duplicate ([1] twice)
     with pytest.raises(ConstraintViolation):
         c.validate(x for x in ([1], [2], [1]))
@@ -1319,7 +1348,7 @@ def test_46_json_schema_survives_describe_failure():
     """#6 (completeness): a describe() failure must NOT propagate out of
     json_schema() — natural_llm calls it to build response_format OUTSIDE its
     retry loop, so an escape there would abort the call. x-description is omitted."""
-    c = Constraint.of(int_ge=0, description="d")
+    c = Constraint.of(type=int, int_ge=0, description="d")
 
     def _boom(cls):
         raise RuntimeError("describe boom")
@@ -1336,7 +1365,7 @@ def test_47_validate_wraps_raw_non_value_errors():
     a coercer raising on the wrong type (via _wrap_coercer), and a struct
     @model_validator raising KeyError (via the widened validate()). Closes the
     contract gap the predicate-only net left."""
-    c1 = Constraint.of(coercer=str.lower)
+    c1 = Constraint.of(type=str, coercer=str.lower)
     assert c1.validate("AB") == "ab"               # coercer transforms on success
     with pytest.raises(ConstraintViolation):
         c1.validate(5)                             # str.lower(5) -> TypeError -> CV
@@ -1353,8 +1382,8 @@ def test_47_validate_wraps_raw_non_value_errors():
 def test_48_list_of_composite_element_validates():
     """#R4-3: list_of/dict_of of a COMPOSITE element runs the composite's own
     validate() per element (not pydantic against the composite's empty model)."""
-    elem = Constraint.of(int_range=(0, 9)) | Constraint.of(str_pattern="^x")
-    c = Constraint.of(list_of=elem)
+    elem = Constraint.of(type=int, int_range=(0, 9)) | Constraint.of(type=str, str_pattern="^x")
+    c = Constraint.of(type=list[elem])
     assert c.validate([5, "xyz"]) == [5, "xyz"]    # 5 -> int branch, 'xyz' -> str branch
     with pytest.raises(ConstraintViolation):
         c.validate([99])                           # out of range AND not ^x
@@ -1365,7 +1394,7 @@ def test_48_list_of_composite_element_validates():
 def test_49_not_one_of_hashable_members_allow_unhashable_value():
     """#R4-4: not_one_of with HASHABLE members must ALLOW an unhashable value
     (it can't equal a scalar) — symmetric with the unhashable-members path."""
-    c = Constraint.of(not_one_of=[1, 2, 3])        # hashable members -> set
+    c = Constraint.of(type=object, not_one_of=[1, 2, 3])        # hashable members -> set
     c.validate([1])                                # unhashable non-member -> ALLOWED (was rejected)
     c.validate(9)                                  # hashable non-member -> allowed
     with pytest.raises(ConstraintViolation):
@@ -1444,7 +1473,7 @@ def test_52_composite_list_element_threads_context():
     with pytest.raises(ConstraintViolation):
         Comp.validate({"value": 50}, context={"max": 10})
     # element-level: the context must now reach the per-element composite validate.
-    LC = Constraint.of(list_of=Comp)
+    LC = Constraint.of(type=list[Comp])
     with pytest.raises(ConstraintViolation):
         LC.validate([{"value": 50}], context={"max": 10})      # was ACCEPTED (context dropped)
     LC.validate([{"value": 5}], context={"max": 10})           # within the context bound -> ok
@@ -1701,8 +1730,8 @@ def test_60_struct_and_describe_surfaces_noncombinable_constraints():
 
 def test_61_field_embeds_flat_in_struct():
     class Order(Constraint):
-        currency: Constraint.field(coercer=str.upper, one_of=["USD", "EUR"])
-        qty:      Constraint.field(int_range=(1, 1000))
+        currency: Constraint.field(coercer=str.upper, type=Literal["USD", "EUR"])
+        qty:      Constraint.field(type=int, int_range=(1, 1000))
     o = Order.validate({"currency": "usd", "qty": 10})
     assert o.currency == "USD" and type(o.currency) is str        # FLAT + coerced
     assert o.qty == 10 and type(o.qty) is int                     # not nested {value: ..}
@@ -1713,33 +1742,31 @@ def test_61_field_embeds_flat_in_struct():
 
 
 def test_62_field_standalone_parity_with_of():
-    f = Constraint.field(int_range=(0, 9), description="a digit")
-    o = Constraint.of(int_range=(0, 9), description="a digit")
+    f = Constraint.field(type=int, int_range=(0, 9), description="a digit")
+    o = Constraint.of(type=int, int_range=(0, 9), description="a digit")
     assert f.validate(5) == 5
     with pytest.raises(ConstraintViolation):
         f.validate(10)
     assert f.describe() == o.describe()                            # delegate to the factory
     assert f.json_schema() == o.json_schema()
-    from plm.constraint.base import _contains_factory
-    assert _contains_factory(Constraint.field(predicate=lambda v: None)) is True
 
 
 def test_63_field_composes_like_a_constraint():
-    nf = ~Constraint.field(one_of=["banned"])
+    nf = ~Constraint.field(type=Literal["banned"])
     assert nf.validate("ok") == "ok"
     with pytest.raises(ConstraintViolation):
         nf.validate("banned")
 
     class S(Constraint):
         n: int
-    (S & Constraint.field(predicate=lambda d: None)).validate({"n": 1})
+    (S & Constraint.field(type=object, predicate=lambda d: None)).validate({"n": 1})
 
 
 def test_64_field_describe_in_struct_is_complete():
     class Account(Constraint):
-        email: Constraint.field(kind="email")
-        role:  Constraint.field(one_of=["admin", "user"])
-        score: Constraint.field(int_range=(0, 100), multiple_of=5)
+        email: Constraint.field(type=str, kind="email")
+        role:  Constraint.field(type=Literal["admin", "user"])
+        score: Constraint.field(type=int, int_range=(0, 100), multiple_of=5)
     d = Account.describe()
     assert "email (str)" in d and "kind='email'" in d
     assert "one of ['admin', 'user']" in d
@@ -1752,11 +1779,11 @@ def test_64_field_describe_in_struct_is_complete():
 def test_65_multiple_of_and_finite():
     import math
     for ctor in (Constraint.of, Constraint.field):
-        c = ctor(multiple_of=5)
+        c = ctor(type=int, multiple_of=5)
         assert c.validate(15) == 15
         with pytest.raises(ConstraintViolation):
             c.validate(7)
-        fin = ctor(finite=True)
+        fin = ctor(type=float, finite=True)
         assert fin.validate(1.5) == 1.5
         for bad in (math.inf, math.nan, -math.inf):
             with pytest.raises(ConstraintViolation):
@@ -1765,17 +1792,17 @@ def test_65_multiple_of_and_finite():
 
 def test_66_tuple_set_frozenset_bytes():
     for ctor in (Constraint.of, Constraint.field):
-        t = ctor(tuple_of=(int, str))
+        t = ctor(type=tuple[int, str])
         assert t.validate((1, "a")) == (1, "a")
         with pytest.raises(ConstraintViolation):
             t.validate((1, 2))
-        assert ctor(tuple_of=int).validate((1, 2, 3)) == (1, 2, 3)   # homogeneous
-        s = ctor(set_of=int)
+        assert ctor(type=tuple[int, ...]).validate((1, 2, 3)) == (1, 2, 3)   # homogeneous
+        s = ctor(type=set[int])
         assert s.validate({1, 2}) == {1, 2}
         with pytest.raises(ConstraintViolation):
             s.validate({1, "a"})
-        assert ctor(frozenset_of=str).validate(frozenset({"a"})) == frozenset({"a"})
-        b = ctor(bytes_length=(2, 4))
+        assert ctor(type=frozenset[str]).validate(frozenset({"a"})) == frozenset({"a"})
+        b = ctor(type=bytes, bytes_length=(2, 4))
         assert b.validate(b"abc") == b"abc"
         with pytest.raises(ConstraintViolation):
             b.validate(b"x")
@@ -1783,49 +1810,49 @@ def test_66_tuple_set_frozenset_bytes():
 
 def test_67_string_and_collection_conveniences():
     for ctor in (Constraint.of, Constraint.field):
-        assert ctor(str_prefix="AB").validate("ABC") == "ABC"
+        assert ctor(type=str, str_prefix="AB").validate("ABC") == "ABC"
         with pytest.raises(ConstraintViolation):
-            ctor(str_prefix="AB").validate("xyz")
-        assert ctor(str_suffix="Z").validate("abZ") == "abZ"
-        assert ctor(str_contains="@").validate("a@b") == "a@b"
-        assert ctor(dict_length=(1, 2)).validate({"a": 1}) == {"a": 1}
+            ctor(type=str, str_prefix="AB").validate("xyz")
+        assert ctor(type=str, str_suffix="Z").validate("abZ") == "abZ"
+        assert ctor(type=str, str_contains="@").validate("a@b") == "a@b"
+        assert ctor(type=dict, dict_length=(1, 2)).validate({"a": 1}) == {"a": 1}
         with pytest.raises(ConstraintViolation):
-            ctor(dict_length=(1, 2)).validate({"a": 1, "b": 2, "c": 3})
-        assert ctor(set_length=(1, 2)).validate({1, 2}) == {1, 2}
-        assert ctor(subset_of=[1, 2, 3]).validate([1, 2]) == [1, 2]
+            ctor(type=dict, dict_length=(1, 2)).validate({"a": 1, "b": 2, "c": 3})
+        assert ctor(type=set, set_length=(1, 2)).validate({1, 2}) == {1, 2}
+        assert ctor(type=list, subset_of=[1, 2, 3]).validate([1, 2]) == [1, 2]
         with pytest.raises(ConstraintViolation):
-            ctor(subset_of=[1, 2, 3]).validate([1, 9])
-        assert ctor(superset_of=[1, 2]).validate([1, 2, 3]) == [1, 2, 3]
-        assert ctor(list_contains=7).validate([5, 7]) == [5, 7]
+            ctor(type=list, subset_of=[1, 2, 3]).validate([1, 9])
+        assert ctor(type=list, superset_of=[1, 2]).validate([1, 2, 3]) == [1, 2, 3]
+        assert ctor(type=list, list_contains=7).validate([5, 7]) == [5, 7]
         with pytest.raises(ConstraintViolation):
-            ctor(list_contains=7).validate([5, 9])
+            ctor(type=list, list_contains=7).validate([5, 9])
 
 
 def test_68_complex_constraints():
     for ctor in (Constraint.of, Constraint.field):
-        a = ctor(abs_range=(0, 2))
+        a = ctor(type=complex, abs_range=(0, 2))
         assert a.validate(1 + 1j) == 1 + 1j
         with pytest.raises(ConstraintViolation):
             a.validate(3 + 3j)
-        r = ctor(real_range=(0, 5))
+        r = ctor(type=complex, real_range=(0, 5))
         assert r.validate(3 + 9j) == 3 + 9j
         with pytest.raises(ConstraintViolation):
             r.validate(9 + 1j)
-        im = ctor(imag_range=(-1, 1))
+        im = ctor(type=complex, imag_range=(-1, 1))
         assert im.validate(5 + 0.5j) == 5 + 0.5j
         with pytest.raises(ConstraintViolation):
             im.validate(5 + 9j)
 
 
 def test_69_new_kwargs_registered_and_conflict_checked():
-    c = Constraint.of(int_range=(0, 100), multiple_of=10)          # multiple_of is un-grouped
+    c = Constraint.of(type=int, int_range=(0, 100), multiple_of=10)  # both predicates on one type
     assert c.validate(50) == 50
     with pytest.raises(ConstraintViolation):
         c.validate(55)
-    with pytest.raises(ValueError):                                # str group vs int group
+    with pytest.raises(ValueError, match="no type coercer"):       # refinements, no type coercer
         Constraint.of(int_range=(0, 9), str_prefix="A")
-    with pytest.raises(ValueError):                                # set group vs tuple group
-        Constraint.of(set_of=int, tuple_of=int)
+    with pytest.raises(TypeError):                                 # removed sugar -> unknown kwarg
+        Constraint.of(set_of=int)
     with pytest.raises(TypeError):                                 # unknown kwarg still rejected
         Constraint.of(nonsense=1)
 
@@ -1837,26 +1864,26 @@ def test_70_multiple_of_zero_rejected_at_build():
     .of and .field alike."""
     for ctor in (Constraint.of, Constraint.field):
         for zero in (0, 0.0):
-            with pytest.raises(ValueError):
-                ctor(multiple_of=zero)
+            with pytest.raises(ValueError, match="non-zero"):
+                ctor(type=int, multiple_of=zero)
     # a valid multiple_of still works
-    assert Constraint.of(multiple_of=3).validate(9) == 9
+    assert Constraint.of(type=int, multiple_of=3).validate(9) == 9
 
 
 def test_71_field_usable_as_collection_element():
     """A .field is a strict superset of .of, so it must work as a list_of/set_of/
     dict_of element too (it has no `value` field, so _resolve_elem_type uses its
     stored flat annotation). The element constraint must actually apply."""
-    LF = Constraint.of(list_of=Constraint.field(int_range=(0, 9)))
+    LF = Constraint.of(type=list[Constraint.field(type=int, int_range=(0, 9))])
     assert LF.validate([1, 5, 9]) == [1, 5, 9]
     with pytest.raises(ConstraintViolation):
         LF.validate([1, 99])
-    DF = Constraint.of(dict_of=(str, Constraint.field(int_range=(0, 9))))
+    DF = Constraint.of(type=dict[str, Constraint.field(type=int, int_range=(0, 9))])
     assert DF.validate({"a": 5}) == {"a": 5}
     with pytest.raises(ConstraintViolation):
         DF.validate({"a": 50})
-    # nested: .field(list_of=.field(...))
-    assert Constraint.field(list_of=Constraint.field(int_range=(0, 9))).validate([3]) == [3]
+    # nested: .field(type=list[.field(...)])
+    assert Constraint.field(type=list[Constraint.field(type=int, int_range=(0, 9))]).validate([3]) == [3]
 
 
 def test_72_struct_and_merges_same_name_field_fields():
@@ -1865,9 +1892,9 @@ def test_72_struct_and_merges_same_name_field_fields():
     must normalize them to their flat type and INTERSECT (not fall to the broken
     run-both composite, which for two structs rejects every input)."""
     class A(Constraint):
-        code: Constraint.field(int_ge=0)
+        code: Constraint.field(type=int, int_ge=0)
     class B(Constraint):
-        code: Constraint.field(int_le=100)
+        code: Constraint.field(type=int, int_le=100)
     M = A & B
     assert getattr(M, "_constraint_is_composite", False) is False   # merged, not run-both
     assert M.validate({"code": 50}).code == 50
@@ -1876,7 +1903,7 @@ def test_72_struct_and_merges_same_name_field_fields():
             M.validate(bad)
     # .field merges with a plain typed field of the same name too
     class D(Constraint):
-        n: Constraint.field(int_ge=0)
+        n: Constraint.field(type=int, int_ge=0)
     class E(Constraint):
         n: int = Field(le=9)
     assert (D & E).validate({"n": 5}).n == 5
@@ -1884,9 +1911,9 @@ def test_72_struct_and_merges_same_name_field_fields():
         (D & E).validate({"n": 50})
     # genuinely incompatible same-name field types fail LOUD at compose time
     class F(Constraint):
-        code: Constraint.field(int_ge=0)
+        code: Constraint.field(type=int, int_ge=0)
     class G(Constraint):
-        code: Constraint.field(str_pattern="^x$")
+        code: Constraint.field(type=str, str_pattern="^x$")
     with pytest.raises(TypeError):
         F & G
 
@@ -1895,18 +1922,18 @@ def test_73_subset_superset_tolerate_unhashable_members():
     """subset_of/superset_of must not leak a raw TypeError on UNHASHABLE members
     (mirrors not_one_of) — they compare element-wise (==), not via set()."""
     for ctor in (Constraint.of, Constraint.field):
-        c = ctor(subset_of=[[1], [2], [3]])          # unhashable members: builds cleanly
+        c = ctor(type=list, subset_of=[[1], [2], [3]])          # unhashable members: builds cleanly
         assert c.validate([[1], [2]]) == [[1], [2]]
         with pytest.raises(ConstraintViolation):
             c.validate([[1], [9]])
-        s = ctor(superset_of=[[1], [2]])
+        s = ctor(type=list, superset_of=[[1], [2]])
         assert s.validate([[1], [2], [3]]) == [[1], [2], [3]]
         with pytest.raises(ConstraintViolation):
             s.validate([[1]])
     # hashable members still work
-    assert Constraint.of(subset_of=[1, 2, 3]).validate([1, 2]) == [1, 2]
+    assert Constraint.of(type=list, subset_of=[1, 2, 3]).validate([1, 2]) == [1, 2]
     with pytest.raises(ConstraintViolation):
-        Constraint.of(superset_of=[1, 2]).validate([1])
+        Constraint.of(type=list, superset_of=[1, 2]).validate([1])
 
 
 # =============================================================================
@@ -1924,7 +1951,7 @@ def test_predicates_list_all_pass():
         if x % 2 != 0:
             raise ValueError("not even")
 
-    c = Constraint.of(predicates=[positive, even])
+    c = Constraint.of(type=int, predicates=[positive, even])
     assert c.validate(4) == 4
     assert c.validate(10) == 10
 
@@ -1939,7 +1966,7 @@ def test_predicates_list_second_fails():
         if x % 2 != 0:
             raise ValueError("not even")
 
-    c = Constraint.of(predicates=[positive, even])
+    c = Constraint.of(type=int, predicates=[positive, even])
     with pytest.raises(ConstraintViolation):
         c.validate(3)  # positive passes, even fails
 
@@ -1958,7 +1985,7 @@ def test_predicate_and_predicates_compose():
         if x >= 100:
             raise ValueError("not < 100")
 
-    c = Constraint.of(predicate=positive, predicates=[even, lt_100])
+    c = Constraint.of(type=int, predicate=positive, predicates=[even, lt_100])
     assert c.validate(4) == 4
     with pytest.raises(ConstraintViolation):
         c.validate(-2)  # fails positive (single)
@@ -1974,7 +2001,7 @@ def test_predicates_list_non_value_error_surfaces_as_violation():
     def boom(v):
         raise TypeError("wrong shape")
 
-    c = Constraint.of(predicates=[boom])
+    c = Constraint.of(type=int, predicates=[boom])
     with pytest.raises(ConstraintViolation) as excinfo:
         c.validate(5)
     # _wrap_predicate re-raises non-ValueError as ValueError mentioning the
@@ -1984,7 +2011,7 @@ def test_predicates_list_non_value_error_surfaces_as_violation():
 
 def test_predicates_empty_list_is_noop():
     """`predicates=[]` empty list -> no-op, value validates."""
-    c = Constraint.of(predicates=[])
+    c = Constraint.of(type=object, predicates=[])
     assert c.validate(5) == 5
     assert c.validate("anything") == "anything"
 
@@ -1993,9 +2020,9 @@ def test_predicates_non_callable_rejected():
     """A non-callable in `predicates=` raises a clear TypeError at compose
     time, matching the `coercers=` behavior."""
     with pytest.raises(TypeError, match="predicates= contains a non-callable item"):
-        Constraint.of(predicates=[lambda x: None, "not-a-fn"])
+        Constraint.of(type=object, predicates=[lambda x: None, "not-a-fn"])
     with pytest.raises(TypeError, match="predicates= must be an iterable of callables"):
-        Constraint.of(predicates=123)
+        Constraint.of(type=object, predicates=123)
 
 
 def test_predicates_work_in_constraint_field():
@@ -2009,14 +2036,14 @@ def test_predicates_work_in_constraint_field():
         if x % 2 != 0:
             raise ValueError("not even")
 
-    F = Constraint.field(predicates=[positive, even])
+    F = Constraint.field(type=int, predicates=[positive, even])
     assert F.validate(4) == 4
     with pytest.raises(ConstraintViolation):
         F.validate(3)
 
     # And as a struct field — embeds FLAT just like coercers=.
     class Container(Constraint):
-        n: Constraint.field(predicates=[positive, even])
+        n: Constraint.field(type=int, predicates=[positive, even])
 
     inst = Container.validate({"n": 4})
     assert inst.n == 4
@@ -2038,7 +2065,7 @@ def test_predicates_list_ordering_preserved():
     def p3(v):
         seen.append("p3")
 
-    c = Constraint.of(predicates=[p1, p2, p3])
+    c = Constraint.of(type=str, predicates=[p1, p2, p3])
     assert c.validate("x") == "x"
     assert seen == ["p1", "p2", "p3"]
 
@@ -2055,6 +2082,7 @@ def test_predicates_plus_coercers_compose():
             raise ValueError("too long")
 
     c = Constraint.of(
+        type=str,
         coercers=[str.strip, str.lower],
         predicates=[must_be_lowercase, must_be_short],
     )
@@ -2067,36 +2095,30 @@ def test_74_list_contains_edge_cases():
     and describe()."""
     for ctor in (Constraint.of, Constraint.field):
         with pytest.raises(ConstraintViolation):           # non-list -> base_type=list rejects
-            ctor(list_contains=5).validate(42)
+            ctor(type=list, list_contains=5).validate(42)
         with pytest.raises(ConstraintViolation):           # empty list can't contain the probe
-            ctor(list_contains="x").validate([])
-        assert ctor(list_contains=None).validate([1, None, 3]) == [1, None, 3]   # None is a valid probe
+            ctor(type=list, list_contains="x").validate([])
+        assert ctor(type=list, list_contains=None).validate([1, None, 3]) == [1, None, 3]   # None is a valid probe
         with pytest.raises(ConstraintViolation):
-            ctor(list_contains=None).validate([1, 2, 3])
+            ctor(type=list, list_contains=None).validate([1, 2, 3])
         # unhashable probe -> element equality, no hashing
-        assert ctor(list_contains=[1, 2]).validate([[1, 2], [3, 4]]) == [[1, 2], [3, 4]]
+        assert ctor(type=list, list_contains=[1, 2]).validate([[1, 2], [3, 4]]) == [[1, 2], [3, 4]]
         with pytest.raises(ConstraintViolation):
-            ctor(list_contains=[1, 2]).validate([[5, 6]])
+            ctor(type=list, list_contains=[1, 2]).validate([[5, 6]])
         # with list_of: element constraint AND membership both enforced
-        c = ctor(list_of=Constraint.field(int_range=(0, 9)), list_contains=5)
+        c = ctor(type=list[Constraint.field(type=int, int_range=(0, 9))], list_contains=5)
         assert c.validate([5, 7]) == [5, 7]
         with pytest.raises(ConstraintViolation):
             c.validate([1, 2])                             # no 5
         with pytest.raises(ConstraintViolation):
             c.validate([5, 99])                            # 99 out of element range
-    assert "42" in Constraint.field(list_contains=42).describe()
+    assert "42" in Constraint.field(type=list, list_contains=42).describe()
 
 
-def test_75_list_contains_rejects_cross_container_combos():
-    """finding C: list_contains is in the 'list' type group, so combining it with a
-    different container kwarg (dict_of/set_of) is rejected at build time instead of
-    silently doing dict-key / set membership."""
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.field(dict_of=(str, int), list_contains="foo")
-    with pytest.raises(ValueError, match="multiple type-shifting groups"):
-        Constraint.field(set_of=int, list_contains=5)
-    # same-group companions still compose fine
-    c = Constraint.field(list_of=int, list_length=(1, 3), list_contains=2)
+def test_75_list_contains_composes_with_type_list():
+    """Reframe: list_contains is a PREDICATE (no type) — it composes onto a type=list[...] coercer."""
+    # list_contains (a predicate) composes with its list type coercer
+    c = Constraint.field(type=list[int], list_length=(1, 3), list_contains=2)
     assert c.validate([1, 2]) == [1, 2]
     with pytest.raises(ConstraintViolation):
         c.validate([1, 3])                                 # no 2
@@ -2121,20 +2143,20 @@ def test_76_predicate_constraint_descriptions_surface_in_describe():
             raise ValueError("neg")
 
     # single: tagged surfaces its text; untagged falls back
-    assert "must be even" in Constraint.field(predicate=is_even).describe()
-    assert Constraint.field(predicate=untagged).describe() == "1 predicate(s) checked"
+    assert "must be even" in Constraint.field(type=int, predicate=is_even).describe()
+    assert Constraint.field(type=int, predicate=untagged).describe() == "int, 1 predicate(s) checked"
 
     # plural all tagged: each text, no count line
-    d = Constraint.field(predicates=[is_even, not_42]).describe()
+    d = Constraint.field(type=int, predicates=[is_even, not_42]).describe()
     assert "must be even" in d and "must not equal 42" in d and "predicate(s) checked" not in d
 
     # plural mixed: tagged surface individually, untagged collapse to a count
-    d2 = Constraint.field(predicates=[is_even, untagged, not_42]).describe()
+    d2 = Constraint.field(type=int, predicates=[is_even, untagged, not_42]).describe()
     assert "must be even" in d2 and "must not equal 42" in d2 and "1 predicate(s) checked" in d2
 
     # flows through a struct .field member
     class Form(Constraint):
-        n: Constraint.field(int_range=(0, 100), predicates=[is_even])
+        n: Constraint.field(type=int, int_range=(0, 100), predicates=[is_even])
     assert "must be even" in Form.describe()
 
 
@@ -2153,20 +2175,20 @@ def test_77_coercer_constraint_descriptions_render_as_transform():
     def untagged(s):
         return s.lower()
 
-    assert Constraint.field(coercer=trim).describe() == "coerced (strips whitespace)"
-    assert Constraint.field(coercers=[trim, up]).describe() == "coerced (strips whitespace), coerced (uppercases)"
+    assert Constraint.field(type=str, coercer=trim).describe() == "str, coerced (strips whitespace)"
+    assert Constraint.field(type=str, coercers=[trim, up]).describe() == "str, coerced (strips whitespace), coerced (uppercases)"
     # mixed: tagged render individually, untagged collapse to a count
-    d = Constraint.field(coercers=[trim, untagged]).describe()
+    d = Constraint.field(type=str, coercers=[trim, untagged]).describe()
     assert "coerced (strips whitespace)" in d and "1 coercer(s) applied" in d
     # untagged-only stays a count
-    assert Constraint.field(coercer=untagged).describe() == "1 coercer(s) applied"
+    assert Constraint.field(type=str, coercer=untagged).describe() == "str, 1 coercer(s) applied"
 
     # coerce vs test are visibly different in the SAME constraint
     @constraint("must be uppercase")
     def is_upper(s):
         if not s.isupper():
             raise ValueError("not upper")
-    full = Constraint.field(coercer=up, predicate=is_upper).describe()
+    full = Constraint.field(type=str, coercer=up, predicate=is_upper).describe()
     assert "coerced (uppercases)" in full and "must be uppercase" in full
 
 
@@ -2208,8 +2230,8 @@ def test_79_describe_recurses_into_nested_struct_fields():
     """describe() expands nested structural Constraint fields inline (so the sub-LLM
     sees the full contract), unwraps Optional, and terminates on cycles."""
     class Leg(Constraint):
-        symbol: Constraint.field(str_length=(1, 5))
-        qty:    Constraint.field(int_range=(1, 100))
+        symbol: Constraint.field(type=str, str_length=(1, 5))
+        qty:    Constraint.field(type=int, int_range=(1, 100))
 
     class Order(Constraint):
         leg:  Leg                                    # nested structural
@@ -2224,7 +2246,7 @@ def test_79_describe_recurses_into_nested_struct_fields():
 
     # a self-referential constraint must TERMINATE (no infinite recursion)
     class Node(Constraint):
-        val:  Constraint.field(int_ge=0)
+        val:  Constraint.field(type=int, int_ge=0)
         next: Optional["Node"] = None
     Node.model_rebuild()
     nd = Node.describe()
@@ -2235,26 +2257,26 @@ def test_80_generator_subset_superset_survive_describe():
     """G1: a generator passed to subset_of/superset_of must be materialized before
     the describe() snapshot — else describe() re-reads an exhausted generator and
     drops the elements ('a subset of []'). Validation was always correct."""
-    c = Constraint.field(subset_of=(x for x in [1, 2, 3]))
+    c = Constraint.field(type=list, subset_of=(x for x in [1, 2, 3]))
     assert "[1, 2, 3]" in c.describe()
     assert c.validate([1, 2]) == [1, 2]
-    s = Constraint.field(superset_of=(x for x in [9, 8]))
+    s = Constraint.field(type=list, superset_of=(x for x in [9, 8]))
     assert "[9, 8]" in s.describe()
 
 
 def test_81_range_kwargs_reject_swapped_bounds_at_build():
     """Range guard: a (lo, hi) range kwarg with lo > hi is a typo that would reject
     every value — reject it at BUILD time (like multiple_of=0). Open/equal bounds ok."""
-    for k, v in [("int_range", (10, 1)), ("float_range", (1.0, 0.0)),
-                 ("str_length", (5, 2)), ("list_length", (3, 1)),
-                 ("bytes_length", (4, 2)), ("abs_range", (2, 0)),
-                 ("real_range", (5, 0)), ("imag_range", (1, -1))]:
+    for t, k, v in [(int, "int_range", (10, 1)), (float, "float_range", (1.0, 0.0)),
+                    (str, "str_length", (5, 2)), (list, "list_length", (3, 1)),
+                    (bytes, "bytes_length", (4, 2)), (complex, "abs_range", (2, 0)),
+                    (complex, "real_range", (5, 0)), (complex, "imag_range", (1, -1))]:
         with pytest.raises(ValueError, match="lo > hi"):
-            Constraint.field(**{k: v})
+            Constraint.field(**{"type": t, k: v})
     # valid / open / single-value bounds still build + validate
-    assert Constraint.field(int_range=(0, 9)).validate(5) == 5
-    assert Constraint.field(int_range=(0, None)).validate(999) == 999
-    assert Constraint.field(int_range=(5, 5)).validate(5) == 5
+    assert Constraint.field(type=int, int_range=(0, 9)).validate(5) == 5
+    assert Constraint.field(type=int, int_range=(0, None)).validate(999) == 999
+    assert Constraint.field(type=int, int_range=(5, 5)).validate(5) == 5
 
 
 def test_crash_restart_recipe_roundtrip():
@@ -2278,14 +2300,14 @@ def test_crash_restart_recipe_roundtrip():
         r2 = dill.loads(dill.dumps(r))             # the recipe pickles (the dynamic class does NOT)
         return from_recipe(r2)
 
-    A = Constraint.field(is_instance_of=int)
-    B = Constraint.field(is_instance_of=int, predicate=lambda x: x > 0)
+    A = Constraint.field(type=object, is_instance_of=int)
+    B = Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 0)
     cases = [
-        (Constraint.field(is_instance_of=int, predicate=lambda x: x > 1000), 2000, 5),         # field + predicate
+        (Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 1000), 2000, 5),         # field + predicate
         (A & B, 5, -1),                                                                      # AND
         (A | B, 5, "str"),                                                                   # OR
         (~B, -1, 5),                                                                         # NOT
-        (A & (B | Constraint.field(is_instance_of=int, predicate=lambda x: x == 0)), 5, -1),    # nested
+        (A & (B | Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x == 0)), 5, -1),    # nested
     ]
     for c, good, bad in cases:
         c2 = roundtrip(c)
@@ -2353,8 +2375,8 @@ def test_crash_restart_recipe_nested_constraints():
 
     # (b) `Constraint.field(...)`-typed field (the README's canonical Pattern-2)
     class Order(Constraint):
-        currency: Constraint.field(one_of=["USD", "EUR"])
-        qty: Constraint.field(int_range=(1, 100))
+        currency: Constraint.field(type=Literal["USD", "EUR"])
+        qty: Constraint.field(type=int, int_range=(1, 100))
 
     O2 = roundtrip(Order)
     g = O2.validate({"currency": "USD", "qty": 10})
@@ -2362,8 +2384,8 @@ def test_crash_restart_recipe_nested_constraints():
     assert rejects(O2, {"currency": "GBP", "qty": 10})         # one_of preserved
     assert rejects(O2, {"currency": "USD", "qty": 999})        # int_range preserved
 
-    # (c) a Constraint nested inside a factory kwarg (list_of=Constraint.field(...))
-    N2 = roundtrip(Constraint.field(list_of=Constraint.field(int_range=(1, 5))))
+    # (c) a Constraint nested inside a factory kwarg (type=list[Constraint.field(...)])
+    N2 = roundtrip(Constraint.field(type=list[Constraint.field(type=int, int_range=(1, 5))]))
     assert N2.validate([1, 2, 3]) == [1, 2, 3]
     assert rejects(N2, [1, 99])
 
@@ -2495,14 +2517,14 @@ def test_crash_restart_recipe_generator_kwargs_survive():
     def roundtrip(c):
         return from_recipe(dill.loads(dill.dumps(to_recipe(c))))
 
-    # generator one_of: the recipe must carry the MATERIALIZED list, not an exhausted gen
-    c = Constraint.field(one_of=(x for x in ["USD", "EUR"]))
-    assert to_recipe(c)[1] == {"one_of": ["USD", "EUR"]}     # materialized at snapshot time
+    # the recipe must carry the type= membership and survive a roundtrip
+    c = Constraint.field(type=Literal["USD", "EUR"])
+    assert to_recipe(c)[1] == {"type": Literal["USD", "EUR"]}     # recorded at snapshot time
     c2 = roundtrip(c)
     assert not rejects(c2, "USD") and rejects(c2, "GBP")
 
     # generator coercers: normalize-then-check must survive (a silent no-op if dropped)
-    c3 = roundtrip(Constraint.field(coercers=(f for f in [str.strip, str.upper]), one_of=["USD", "EUR"]))
+    c3 = roundtrip(Constraint.field(coercers=(f for f in [str.strip, str.upper]), type=Literal["USD", "EUR"]))
     assert not rejects(c3, "  usd ")                          # coerced to "USD" -> accepted
     assert rejects(c3, "gbp")
 
@@ -2556,8 +2578,8 @@ def test_nc34_facade_factory_kwargs_deepcopied():
     """NC3-4: a field facade's `_constraint_factory_kwargs` must DEEP-copy the inner's, not alias
     its mutable list values — mutating the facade's copy must not leak into the constraint."""
     from plm.constraint import Constraint
-    c = Constraint.field(one_of=["USD", "EUR"])
-    c._constraint_factory_kwargs["one_of"].append("GBP")
+    c = Constraint.field(type=str, not_one_of=["USD", "EUR"])
+    c._constraint_factory_kwargs["not_one_of"].append("GBP")
     assert "GBP" not in c.describe()
 
 
@@ -2567,8 +2589,8 @@ def test_f6_field_kwargs_copy_tolerates_non_deepcopyable_value():
     strictly worse than the rare residual aliasing for such a value."""
     import threading
     from plm.constraint import Constraint
-    Constraint.field(one_of=[threading.Lock()])      # must NOT raise (old shallow dict didn't; bare deepcopy did)
-    assert Constraint.field(one_of=["USD", "EUR"]).validate("USD") == "USD"   # normal case still fine
+    Constraint.field(type=object, not_one_of=[threading.Lock()])  # must NOT raise (old shallow dict didn't; bare deepcopy did)
+    assert Constraint.field(type=Literal["USD", "EUR"]).validate("USD") == "USD"   # normal case still fine
 
 
 def test_nc31_recursive_constraint_recipe_no_stack_overflow():
@@ -2682,23 +2704,23 @@ def test_all_constraint_shapes_rehydrate_via_recipe():
 
     of = Constraint.of
     cases = [
-        ("int_range", of(int_range=(0, 9)), [5, -1, 10]),
-        ("float_gt/lt", of(float_gt=0.0, float_lt=1.0), [0.5, 0.0, 1.0]),
-        ("one_of", of(one_of=["a", "b"]), ["a", "c"]),
-        ("not_one_of", of(not_one_of=["x"]), ["y", "x"]),
-        ("str_pattern+len", of(str_pattern=r"^[A-Z]+$", str_length=(2, 5)), ["ABC", "ab", "ABCDEF"]),
-        ("list unique+sorted+nested", of(list_of=of(int_range=(0, 9)), list_length=(1, 3),
+        ("int_range", of(type=int, int_range=(0, 9)), [5, -1, 10]),
+        ("float_gt/lt", of(type=float, float_gt=0.0, float_lt=1.0), [0.5, 0.0, 1.0]),
+        ("one_of", of(type=Literal["a", "b"]), ["a", "c"]),
+        ("not_one_of", of(type=str, not_one_of=["x"]), ["y", "x"]),
+        ("str_pattern+len", of(type=str, str_pattern=r"^[A-Z]+$", str_length=(2, 5)), ["ABC", "ab", "ABCDEF"]),
+        ("list unique+sorted+nested", of(type=list[Constraint.field(type=int, int_range=(0, 9))], list_length=(1, 3),
                                          unique=True, sorted=True), [[1, 2, 3], [1, 1], [3, 2, 1], [1, 2, 99]]),
-        ("dict_of nested", of(dict_of=(str, of(float_le=1.0))), [{"a": 0.5}, {"a": 1.5}]),
-        ("set_of", of(set_of=int), [{1, 2}, {1, 2.5}]),
-        ("tuple_of", of(tuple_of=int), [(1, 2), (1, "a")]),
-        ("coercer", of(coercer=str.upper, one_of=["AB"]), ["ab", "xy"]),
-        ("coercers chain", of(coercers=[str.strip, str.upper], one_of=["AB"]), [" ab ", "x"]),
-        ("multiple_of", of(multiple_of=3), [9, 10]),
-        ("str_prefix/suffix", of(str_prefix="a", str_suffix="z"), ["abz", "bz", "ab"]),
-        ("is_instance_of", of(is_instance_of=int), [5, "5", 5.0, True]),   # strict survives rehydrate
+        ("dict_of nested", of(type=dict[str, Constraint.field(type=float, float_le=1.0)]), [{"a": 0.5}, {"a": 1.5}]),
+        ("set_of", of(type=set[int]), [{1, 2}, {1, 2.5}]),
+        ("tuple_of", of(type=tuple[int, ...]), [(1, 2), (1, "a")]),
+        ("coercer", of(coercer=str.upper, type=Literal["AB"]), ["ab", "xy"]),
+        ("coercers chain", of(coercers=[str.strip, str.upper], type=Literal["AB"]), [" ab ", "x"]),
+        ("multiple_of", of(type=int, multiple_of=3), [9, 10]),
+        ("str_prefix/suffix", of(type=str, str_prefix="a", str_suffix="z"), ["abz", "bz", "ab"]),
+        ("is_instance_of", of(type=object, is_instance_of=int), [5, "5", 5.0, True]),   # strict survives rehydrate
     ]
-    A, B, C = of(int_ge=0), of(int_le=10), of(not_one_of=[5])
+    A, B, C = of(type=int, int_ge=0), of(type=int, int_le=10), of(type=int, not_one_of=[5])
     cases += [
         ("A & B", A & B, [3, -1, 11]), ("A | B", A | B, [3, -1, 11, 100]),
         ("A ^ B", A ^ B, [3, -1, 100]), ("~A", ~A, [-1, 3]),
@@ -2800,11 +2822,13 @@ def test_describe_robust_against_pathological_member():
 
 
 def test_is_instance_of_is_strict_no_coercion():
-    """NC-9: `is_instance_of=T` is a STRICT type check (pydantic Strict) — NO coercion. For a
-    builtin it rejects other types INCLUDING a bool for int (a bool is not a real int). For an
-    arbitrary class it stays an isinstance check (Strict can't annotate an is-instance schema,
-    and such classes don't coerce). The old `instance_of=` name is gone (renamed)."""
-    of = Constraint.of
+    """Reframe: `is_instance_of=T` is a PURE isinstance predicate (sets NO type, NO schema). Paired
+    with `type=object` (which does NO coercion) it is a STRICT type check: for a builtin it rejects
+    other types INCLUDING a bool for int (a bool is not a real int); for an arbitrary class it is a
+    plain isinstance check; and there is NO promotion / NO build-from-dict / NO subclass flatten,
+    because object passes the value through untouched and the predicate is the sole gate."""
+    def of(**kw):                                     # every is_instance_of field gets type=object
+        return Constraint.of(type=object, **kw)
 
     ci = of(is_instance_of=int)
     assert ci.validate(5) == 5
@@ -2822,7 +2846,7 @@ def test_is_instance_of_is_strict_no_coercion():
     with pytest.raises(ConstraintViolation):
         cb.validate(1)                               # an int is not a bool
 
-    class W:                                          # arbitrary class -> isinstance (unchanged)
+    class W:                                          # arbitrary class -> isinstance
         pass
     w = W()
     cw = of(is_instance_of=W)
@@ -2830,7 +2854,7 @@ def test_is_instance_of_is_strict_no_coercion():
     with pytest.raises(ConstraintViolation):
         cw.validate("x")
 
-    # NC3-3: pydantic Strict() left THREE coercions open; the is-instance schema closes them.
+    # No coercion: promotion / build-from-dict / subclass-flatten are all closed.
     with pytest.raises(ConstraintViolation):
         of(is_instance_of=float).validate(5)          # int is NOT promoted to float
     class P(Constraint):
@@ -2847,14 +2871,94 @@ def test_is_instance_of_is_strict_no_coercion():
     assert "strictly an instance of int" in of(is_instance_of=int).describe()
 
 
+def test_is_instance_of_target_kinds_and_rejections():
+    """L3: is_instance_of accepts a plain class, a STRUCT Constraint, or a TUPLE of those (Python's
+    native type-union). It REJECTS a composite (`& | ^ ~` — that algebra is VALIDATION, not type
+    membership; for 'A or B' use a tuple) and a `.field`/`.of` factory (a value is never an instance
+    of the dynamic wrapper). describe() renders cleanly — no mangled wrapper name."""
+    of = lambda **kw: Constraint.of(type=object, **kw)
+
+    class Addr(Constraint):
+        city: str
+    class Person(Constraint):
+        name: str
+
+    # struct target: accepts a REAL instance, rejects a dict (use type= to build from a dict)
+    addr = Addr.validate({"city": "NYC"})
+    assert of(is_instance_of=Addr).validate(addr) is addr
+    with pytest.raises(ConstraintViolation):
+        of(is_instance_of=Addr).validate({"city": "NYC"})
+
+    # tuple target = the native "instance of A OR B"
+    either = of(is_instance_of=(Addr, Person))
+    assert either.validate(addr) is addr
+    assert either.validate(Person.validate({"name": "x"})) is not None
+    with pytest.raises(ConstraintViolation):
+        either.validate(123)
+    assert "(Addr / Person)" in either.describe()                       # clean tuple render
+
+    # composite target -> rejected at build, routed to the tuple / algebra-as-type
+    with pytest.raises(TypeError, match="composite"):
+        Constraint.field(type=object, is_instance_of=(Addr | Person))
+    # .field / .of factory target -> rejected at build (not a Python instance type)
+    with pytest.raises(TypeError, match="factory"):
+        Constraint.field(type=object, is_instance_of=Constraint.field(type=int, int_range=(0, 9)))
+
+
+def test_is_instance_of_json_schema_is_airtight():
+    """Regression (was the H4 crash): `is_instance_of` is a pure predicate now (no
+    is_instance_schema), so json_schema() must NEVER raise for ANY class — it degrades to
+    an x-description, contributing no `type`. Covers builtins AND an arbitrary class."""
+    class Weird:
+        pass
+    for target in (int, str, Weird):
+        c = Constraint.of(type=object, is_instance_of=target)
+        sch = c.json_schema()                          # must NOT raise (the old crash)
+        assert isinstance(sch, dict)
+        assert "type" not in sch                       # is_instance_of contributes NO type
+        assert "x-description" in sch                  # the check surfaces here instead
+        assert "instance of" in sch["x-description"]
+
+
+def test_h5_composite_struct_field_with_nested_defs_resolves():
+    """Regression (H5): a composite whose structural children carry NESTED model refs (so each
+    child schema emits `$ref: #/$defs/<Model>` + a `$defs`) used as a DIRECT struct field used to
+    crash `Parent.model_json_schema()` with `KeyError: '#/$defs/<Model>'` — pydantic owns the
+    parent document's `$defs` and won't hoist the composite hook's injected one, so the ref dangled.
+    The composite's json-schema hook now INLINES its `$defs`, making the field schema self-contained."""
+    class City(Constraint):
+        name: str
+    class Leg(Constraint):
+        origin: City                  # nested ref -> Leg schema uses $ref + $defs[City]
+    class Hub(Constraint):
+        center: City
+
+    class Route(Constraint):
+        stop: Leg | Hub
+
+    sch = Route.model_json_schema()    # must NOT raise (was KeyError: '#/$defs/City')
+    assert isinstance(sch, dict)
+    # every $ref in the field schema resolves at the document root (or is inlined away)
+    import json as _json
+    txt = _json.dumps(sch["properties"]["stop"])
+    top_defs = set(sch.get("$defs", {}))
+    for ref in [r.split("/")[-1] for r in __import__("re").findall(r'"#/\$defs/([^"]+)"', txt)]:
+        assert ref in top_defs, f"dangling $ref to {ref}"
+    # validation still correct: either branch accepted, garbage rejected
+    assert Route.validate({"stop": {"origin": {"name": "NYC"}}}).stop.origin.name == "NYC"
+    assert Route.validate({"stop": {"center": {"name": "LA"}}}).stop.center.name == "LA"
+    with pytest.raises(ConstraintViolation):
+        Route.validate({"stop": {"nope": 1}})
+
+
 def test_d1_composite_as_direct_struct_field():
     """D1: a composite (`A | B`, `&`, `^`, `~`) used as a DIRECT struct-field annotation must
     validate the field value through the composite's own `.validate()` — NOT against an empty-fields
     model (which rejected EVERY scalar and accepted garbage), and must `describe()` the OR/AND tree
     rather than leak the mangled internal class name. Fixed via the composite's
     `__get_pydantic_core_schema__` hook + a composite branch in `_struct_body`."""
-    A = Constraint.field(int_ge=0)
-    B = Constraint.field(str_pattern="^x")
+    A = Constraint.field(type=int, int_ge=0)
+    B = Constraint.field(type=str, str_pattern="^x")
 
     class S(Constraint):
         v: A | B
@@ -2897,14 +3001,19 @@ def test_algebra_rejects_non_constraint_operands():
     non-Constraint operand to the algebra (`A | None`, `A & 5`, `A ^ "x"`) — a model's likely way of
     fumbling 'optional' — must FAIL LOUD at composition, not silently build a dead 'branch' that
     quietly rejects everything (a D1-class trap). Legitimate Constraint-only algebra is unaffected."""
-    A = Constraint.field(int_ge=0)
-    B = Constraint.field(str_pattern="^x")
+    A = Constraint.field(type=int, int_ge=0)
+    B = Constraint.field(type=str, str_pattern="^x")
     for bad in (lambda: A | None, lambda: None | A, lambda: A & 5, lambda: A ^ "x", lambda: A & None):
         with pytest.raises(TypeError, match="combines Constraints"):
+            bad()
+    # L2: the bare ABSTRACT base Constraint is also rejected — `A & Constraint` would reject
+    # everything and `A | Constraint` is a dead branch; both are silent traps.
+    for bad in (lambda: A | Constraint, lambda: Constraint & A, lambda: A ^ Constraint):
+        with pytest.raises(TypeError, match="bare base"):
             bad()
     # constraint-only algebra still composes
     assert (A | B).validate(5) == 5
     assert (A | B).validate("xyz") == "xyz"
-    assert (A & Constraint.field(int_le=10)).validate(5) == 5
+    assert (A & Constraint.field(type=int, int_le=10)).validate(5) == 5
     assert (A ^ B).validate(5) == 5
     assert (~A).validate("not-an-int") == "not-an-int"

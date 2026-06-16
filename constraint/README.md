@@ -14,32 +14,44 @@ model — `validate()` (the gate), `describe()` (the natural-language contract),
 **1. A shape** — subclass `Constraint`; each field is a `Constraint.field(...)`:
 ```python
 class Order(Constraint):
-    currency: Constraint.field(coercer=str.upper, one_of=["USD", "EUR"])
-    qty:      Constraint.field(int_range=(1, 1000), multiple_of=5)
+    currency: Constraint.field(coercer=str.upper, type=Literal["USD", "EUR"])  # enum via type=
+    qty:      Constraint.field(type=int, int_range=(1, 1000), multiple_of=5)
 ```
 
 **2. A value rule** — `Constraint.field(...)` standalone (no class):
 ```python
-Prob = Constraint.field(float_range=(0.0, 1.0))
+Prob = Constraint.field(type=float, float_range=(0.0, 1.0))
 ```
+
+Every field has a **mandatory type coercer, always spelled `type=`**: a builtin, a typing
+generic (`list[int]`, `dict[str,int]`, `tuple[..]`, `set[int]`, `frozenset[int]`), a
+`Literal[...]` (an enum of values), or a `Constraint` struct. It is the sole source of the
+schema's `"type"`. Everything else (`int_range`, `str_pattern`, `is_instance_of`, …) is a
+**predicate** — a pure check that never sets a type (some enrich the schema with non-`"type"`
+keywords like `minimum`/`pattern`). A field with no `type=` is an error; the type is never
+nullable and never a `Union`/`X | Y` (use the `|` algebra across whole constraints instead).
 
 `Constraint.field(...)` is the **single public authoring entry**. It embeds *flat* as a
 struct field (the field is the bare value, not a `{value: ..}` wrapper) and works
 standalone too. `Constraint.of(...)` is the internal engine `.field` rides on — **not**
 used outside this module. Author everything through `.field` + structural subclassing +
 the algebra; do **not** reach for plain pydantic `Field(...)`, bare `x: Annotation`
-defaults, or raw `Enum` types — the constraint mechanism covers those (`multiple_of`,
-`one_of`, etc.) and only the constraint mechanism is rendered by `describe()`.
+defaults, or raw `Enum` types — the constraint mechanism covers those (`type=Literal[...]`,
+`multiple_of`, etc.) and only the constraint mechanism is rendered by `describe()`.
 
-## The `.field(**kw)` surface (by type — full catalog in base.py docstring)
+## The `.field(**kw)` surface (full catalog in base.py docstring)
 
-`int_range/ge/gt/le/lt · multiple_of · float_range/approx/finite · one_of/not_one_of ·
-str_pattern/length/prefix/suffix/contains · list_of/length/unique/sorted/monotonic/contains ·
-tuple_of · set_of/frozenset_of/length/subset_of/superset_of · dict_of/length ·
-bytes_length · abs_range/real_range/imag_range · instance_of/callable/behaves_like ·
-kind="email|url|uuid|semver|iso_date|identifier|json|regex|path_exists" ·
-coercer(s)/predicate(s)/description`. Element types in `list_of/set_of/tuple_of/dict_of`
-may themselves be Constraints.
+**Type coercer** (mandatory, always `type=`):
+`type=<int|float|str|bool|bytes|complex | list[T]|dict[K,V]|tuple[..]|set[T]|frozenset[T] |
+Literal[...] | YourStruct>`. The element `T` in a generic may itself be a Constraint
+(`type=list[Constraint.field(...)]`).
+**Predicates** (pure checks; never set a type; some enrich the schema): `int_range/ge/gt/le/lt ·
+multiple_of · float_range/approx/finite · not_one_of · str_pattern/length/prefix/suffix/contains ·
+list_length/unique/sorted/monotonic/contains · set_length/subset_of/superset_of · dict_length ·
+bytes_length · abs_range/real_range/imag_range · is_instance_of (pure isinstance; pair with
+type=object)/callable/behaves_like ·
+kind="email|url|uuid|semver|iso_date|identifier|json|regex|path_exists" (needs type=str) ·
+coercer(s)/predicate(s)/description`.
 
 Custom checks that no kwarg expresses → `predicate=fn` (with `description=`). Transforms →
 `coercer=fn`. Execution order: **coercer(s) → type/Field → predicate(s)**.
@@ -78,7 +90,7 @@ def is_prime(n): ...
 @constraint("trimmed + lowercased")   # COERCER  → rendered as "coerced (trimmed + lowercased)"
 def slugify(s): return s.strip().lower()
 
-Constraint.field(predicate=is_prime, coercer=slugify)
+Constraint.field(type=str, predicate=is_prime, coercer=slugify)
 ```
 
 - **predicates** → tagged render their text bare (a *check*); untagged collapse to

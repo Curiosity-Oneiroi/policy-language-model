@@ -347,10 +347,11 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         _ns_note = ("[namespace] Some granted inputs have names that are not valid Python "
                     "identifiers (or are Python keywords), so you can't use them as bare names — "
                     f"access them via kwargs[<key>]: {sorted(_bad_idents)}.")
-        if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
-            msgs[0]["content"] = (msgs[0].get("content") or "") + "\n\n" + _ns_note
-        else:
-            msgs.insert(0, {"role": "system", "content": _ns_note})
+        # add a FRESH, dedicated system message — NEVER mutate one of the caller's own message
+        # dicts (the by-reference weaving contract is append-only). (L8: re-passing the SAME woven
+        # thread through react_llm re-adds this note — an accepted artifact of weaving, deliberately
+        # NOT de-duplicated here.)
+        msgs.insert(0, {"role": "system", "content": _ns_note})
     # ---- the sub-agent's OWN repl namespace (`ns`) ----
     # ONE dict, used as BOTH globals and locals in `_exec`, so it behaves like
     # the sub-agent's private "repl globals" — modeled on how PLM's kernel runs
