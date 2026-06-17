@@ -26,9 +26,10 @@ Two DISTINCT concepts (kept separate):
     LLM defaults, a metaparam's sealed extras, and (in future) any policy PLM itself
     seals — sealed but NOT blessed by membership. A SUPERSET of the bless set.
 
-This package exports three names the PREFIX bootstrap uses:
+This package exports four names the PREFIX bootstrap uses:
   * `iter_default_policies()` — yields (name, full_source) for each policy file.
   * `_LLM_DEFAULT_POLICIES` — the names blessed (and sealed) after bootstrap.
+  * `_SEALED_DEFAULT_POLICIES` — names sealed but NOT blessed (e.g. `simulate`).
   * `_bless_llm_callers()` — refreshes `_BLESSED_CALLERS` against the
     `_inner.__code__` of the LLM-default proxies. Called from PREFIX
     (post-install) AND from `kernel.py`'s rehydrate handler (post-restore).
@@ -67,6 +68,15 @@ def iter_default_policies():
 # NOTE: `base_verifier` ships as a default file too but is intentionally ABSENT here —
 # that keeps it mutable + duplicable + unblessed (a PLM-forkable reference verifier).
 _LLM_DEFAULT_POLICIES = frozenset({"natural_llm", "react_llm", "react_verifier_llm"})
+
+
+# Seal-ONLY default NAMES — sealed (immutable + un-duplicable) but NOT blessed. These are
+# harness/instrument defaults the model uses but must not edit or fork: e.g. `simulate`, the
+# fixed chess eval harness. DISTINCT from `_LLM_DEFAULT_POLICIES` (which is ALSO blessed for
+# raw `_make_backend`/`llm_call`/`descend` access); membership here grants the SEAL only —
+# bootstrap `_seal`s these without `_bless`ing them, exactly like a user's sealed extras.
+# `policyzero` is deliberately ABSENT (it stays mutable + duplicable — the model improves/forks it).
+_SEALED_DEFAULT_POLICIES = frozenset({"simulate"})
 
 
 def _bless_llm_callers() -> None:

@@ -145,6 +145,19 @@ def _run_uv(cmd: list[str]) -> None:
         )
 
 
+def _venv_python_version(venv_python: str) -> str:
+    """Return the 'major.minor' of an existing venv interpreter (e.g. '3.12'), or
+    '' if it can't be queried (a broken/partial .venv)."""
+    try:
+        out = subprocess.run(
+            [venv_python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return (out.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def _cleanup(control_dir: str, workspace: str, owns_workspace: bool,
              child_pid_box: list[int | None]) -> None:
     """GC/atexit finalizer — SIGKILLs the (current) child process GROUP, reaps it, and
@@ -251,8 +264,24 @@ class PythonReplSession:
         if not venv_python_path.exists():
             shutil.rmtree(venv_dir, ignore_errors=True)
             _run_uv(["uv", "venv", "--python", DEFAULT_PYTHON, str(venv_dir)])
+        else:
+            # REUSE an existing venv (e.g. a caller-supplied persistent workspace) rather
+            # than recreating it — but guard the interpreter first. A .venv built on a
+            # different Python would silently run the kernel on the wrong runtime, so
+            # require major.minor == DEFAULT_PYTHON and raise a clear, actionable error.
+            found = _venv_python_version(str(venv_python_path))
+            if found != DEFAULT_PYTHON:
+                raise RuntimeError(
+                    f"workspace {self.workspace!r} already has a .venv on Python "
+                    f"{found or '<unknown/broken>'!r}, but PLM pins Python {DEFAULT_PYTHON!r}. "
+                    f"Delete {venv_dir} (or use a different workspace) so the kernel runs on "
+                    f"the pinned interpreter."
+                )
         preinstall_list = [p for p in preinstall if p]
         if preinstall_list:
+            # idempotent for BOTH a fresh and a reused venv: `uv pip install` installs any
+            # MISSING preinstall package and no-ops for those already present — so reusing a
+            # venv still ends with the required packages available.
             _run_uv(["uv", "pip", "install", "--python", str(venv_python_path), *preinstall_list])
         self._venv_python = str(venv_python_path)
 

@@ -350,6 +350,7 @@ import json as _repl_json
 from plm.policy.defaults import (
     iter_default_policies as _repl_iter_defaults,
     _LLM_DEFAULT_POLICIES as _repl_llm_defaults,
+    _SEALED_DEFAULT_POLICIES as _repl_sealed_defaults,
     _bless_llm_callers as _repl_bless,
 )
 from plm.policy.registry import (
@@ -390,11 +391,11 @@ if not isinstance(_repl_extra_pols, dict):
 for _repl_pn, _repl_ps in _repl_iter_defaults():   # source already includes the "@policy" line
     _repl_install(_repl_ps, "<policy-bootstrap-" + _repl_pn + ">")
 for _repl_pn, _repl_ps in _repl_extra_pols.items():
-    if _repl_pn in _repl_llm_defaults:                  # an extra must NOT shadow a SEALED default —
-        _repl_stderr_buf.write(                  # it would re-decorate it BEFORE the seal loop below
-            "[boot] extra policy " + repr(_repl_pn) + " collides with a sealed default "
+    if _repl_pn in _repl_llm_defaults or _repl_pn in _repl_sealed_defaults:  # an extra must NOT shadow
+        _repl_stderr_buf.write(                  # a SEALED default — it would re-decorate it BEFORE the
+            "[boot] extra policy " + repr(_repl_pn) + " collides with a sealed default "  # seal loop
             "name; ignored. Rename it, or duplicate_policy the default at runtime.\n")
-        continue                                 # ... and get sealed+blessed as operator code.
+        continue                                 # ... and get sealed (or sealed+blessed) as operator code.
     try:
         _repl_install(_repl_ps, "<policy-bootstrap-" + _repl_pn + ">")
     except BaseException:                        # an injected/extra policy must NOT brick boot —
@@ -447,6 +448,8 @@ for _repl_pn, _repl_ps in _repl_sealed_extras.items():
 # base_verifier; that is allowed, since it stays mutable + duplicable anyway.)
 for _repl_pn in _repl_llm_defaults:
     _repl_seal(_repl_pn)
+for _repl_pn in _repl_sealed_defaults:           # seal-only defaults (e.g. simulate): immutable +
+    _repl_seal(_repl_pn)                         # un-duplicable, but NOT blessed (no raw LLM-infra)
 for _repl_pn in _repl_sealed_extra_names:        # user SEALED extras: immutable + un-duplicable
     _repl_seal(_repl_pn)                         # (NOT blessed — only the defaults below are)
 

@@ -2415,3 +2415,55 @@ def test_proxy_global_rebind_does_not_brick_capture():
         assert out.get("stdout", "").strip() == "after-sms-rebind", out      # output not silently lost
     finally:
         s.close()
+
+
+# ==================== Section: workspace venv reuse + python-version guard ====================
+
+def _make_venv_or_skip(ws_dir):
+    """Build a real DEFAULT_PYTHON venv at <ws_dir>/.venv (skip if uv/python absent)."""
+    import shutil, subprocess
+    from plm.repl import session as _sess
+    if shutil.which("uv") is None:
+        pytest.skip("uv not on PATH")
+    try:
+        subprocess.run(["uv", "venv", "--python", _sess.DEFAULT_PYTHON, str(ws_dir / ".venv")],
+                       check=True, capture_output=True, timeout=120)
+    except Exception as e:                          # pragma: no cover
+        pytest.skip(f"could not create venv: {e}")
+
+
+def test_workspace_reuse_rejects_python_version_mismatch(tmp_path, monkeypatch):
+    """Reusing a workspace whose existing .venv is the WRONG Python raises a clear
+    error in __init__ (before any kernel spawn)."""
+    try:
+        from plm.repl import PythonReplSession
+        from plm.repl import session as _sess
+    except Exception as e:                          # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    ws = tmp_path / "shared_ws"; ws.mkdir()
+    _make_venv_or_skip(ws)                           # a real DEFAULT_PYTHON venv
+    monkeypatch.setattr(_sess, "DEFAULT_PYTHON", "3.11")   # pretend PLM now pins a different Python
+    with pytest.raises(RuntimeError, match="pins Python"):
+        PythonReplSession(workspace=str(ws), preinstall=())   # raises before spawn
+
+
+def test_workspace_reuse_keeps_existing_venv(tmp_path):
+    """Pointing a session at a workspace that already has a matching .venv REUSES it
+    (does not recreate) and the kernel runs."""
+    try:
+        from plm.repl import PythonReplSession
+    except Exception as e:                          # pragma: no cover
+        pytest.skip(f"repl import failed: {e}")
+    ws = tmp_path / "shared_ws"; ws.mkdir()
+    _make_venv_or_skip(ws)
+    marker = ws / ".venv" / "REUSE_MARKER"
+    marker.write_text("keep me")                     # survives iff the venv is reused, not rebuilt
+    try:
+        s = PythonReplSession(workspace=str(ws), preinstall=("dill",), cell_timeout=15.0)
+    except Exception as e:                          # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        assert marker.exists()                       # venv REUSED, not recreated
+        assert "42" in s.execute_cell("print(6 * 7)")["stdout"]
+    finally:
+        s.close()

@@ -38,6 +38,7 @@ from plm.policy import (
 )
 from plm.policy.defaults import (
     _LLM_DEFAULT_POLICIES,
+    _SEALED_DEFAULT_POLICIES,
     _bless_llm_callers,
     iter_default_policies,
 )
@@ -119,6 +120,8 @@ def _install_defaults() -> None:
         _install_policy_source(src, "<policy-bootstrap-" + name + ">")
     for name in _LLM_DEFAULT_POLICIES:
         _seal(name)             # sets the intrinsic _p_immutable flag + the name-sets
+    for name in _SEALED_DEFAULT_POLICIES:   # seal-only defaults (e.g. simulate): sealed, NOT blessed
+        _seal(name)
     _bless_llm_callers()
 
 
@@ -2606,3 +2609,110 @@ def test_react_verifier_llm_expose_messages_read_only_live_view(defaults_install
     assert seen[0] == "user" and "assistant" in seen           # saw the current trajectory
     assert "STRAY" not in [m.get("role") for m in convo]       # append did NOT leak
     assert convo[0]["content"] == "do the task"                # in-place edit did NOT leak
+
+
+# ============ Section: chess policies (simulate = sealed DEFAULT; policyzero = METAPARAM) ============
+
+try:
+    import game.chess as _game_chess          # noqa: F401
+    _HAS_GAME = True
+except Exception:
+    _HAS_GAME = False
+
+_requires_game = pytest.mark.skipif(not _HAS_GAME, reason="game chess package not installed")
+
+# policyzero is NOT a PLM default — it ships as a chess METAPARAM (a mutable extra).
+# Load its source from the metaparam set so we can install it like an extra below.
+_POLICYZERO_SRC = (pathlib.Path(_llm_infra.__file__).parents[2]
+                   / "metaparams" / "chess" / "policies" / "mutable" / "policyzero.py").read_text()
+
+
+class _Greedyish:
+    """A tiny inline test policy: first capture, else first legal move."""
+    name = "greedyish"
+    def call(self, state):
+        for m in state["legal_moves"]:
+            if m.get("is_capture"):
+                return m["uci"]
+        return state["legal_uci"][0]
+
+
+def test_chess_simulate_is_sealed_not_blessed_default(defaults_installed):
+    """simulate ships as a SEALED default (immutable + un-duplicable) — the fixed
+    measuring instrument — but is NOT blessed for raw LLM infra."""
+    assert "simulate" in list_policies()
+    assert "simulate" in _SEALED_POLICIES
+    r = duplicate_policy("simulate", "sim_fork")           # un-duplicable
+    assert not r and r.status.name == "IMMUTABLE"
+    assert "sim_fork" not in _PLM_POLICIES
+    rr = rewrite_policy("simulate", "def simulate(policy, n):\n    return []\n")
+    assert not rr                                          # un-editable
+    sim = _PLM_POLICIES["simulate"]
+    assert sim._inner.__code__ not in _llm_infra._BLESSED_CALLERS   # sealed, NOT blessed
+
+
+def test_chess_policyzero_is_a_mutable_metaparam_not_a_default(defaults_installed):
+    """policyzero is NOT a PLM default; it ships as a metaparam (mutable extra).
+    Installed like an extra it is mutable + duplicable — the model's forkable seed."""
+    assert "policyzero" not in list_policies()             # NOT a default
+    _install_policy_source(_POLICYZERO_SRC, "<policy-bootstrap-policyzero>")   # install as a mutable extra
+    assert "policyzero" in _PLM_POLICIES
+    assert "policyzero" not in _SEALED_POLICIES            # mutable + forkable
+    r = duplicate_policy("policyzero", "cand_zero")
+    assert r.status.name == "OK" and "cand_zero" in _PLM_POLICIES
+
+
+@_requires_game
+def test_chess_policyzero_metaparam_returns_a_legal_move(defaults_installed):
+    """The policyzero metaparam's .call(state) returns a legal UCI move."""
+    from game.chess import Chess
+    _install_policy_source(_POLICYZERO_SRC, "<policy-bootstrap-policyzero>")
+    state = Chess().get_state()
+    mv = _PLM_POLICIES["policyzero"]().call(state)         # instantiate + play
+    assert mv in state["legal_uci"]
+
+
+def test_chess_simulate_eval_conditions_are_not_model_facing(defaults_installed):
+    """The model can't tune its own test: simulate exposes only policy/num_games/
+    seed/return_summary — opponents, clock, max_moves, etc. are NOT parameters."""
+    import inspect as _inspect
+    params = set(_inspect.signature(_PLM_POLICIES["simulate"]._inner).parameters)
+    assert params == {"policy", "num_games", "seed", "return_summary"}
+    assert "opponents" not in params and "clock" not in params and "max_moves" not in params
+
+
+@_requires_game
+def test_chess_simulate_runs_and_returns_trajectories(defaults_installed, monkeypatch):
+    """simulate(policy, n) plays n games under the FIXED (env-set) eval conditions
+    and returns an envelope of trajectories + summary."""
+    monkeypatch.setenv("_PLM_SIMULATE_CONFIG", json.dumps({"opponents": ["random"], "clock": "off"}))
+    sim = _PLM_POLICIES["simulate"]
+    out = sim(_Greedyish(), 2, seed=3)
+    assert set(out) >= {"games", "summary", "config"}
+    assert len(out["games"]) == 2
+    assert out["summary"]["n_games"] == 2
+    assert out["config"]["bot_names"] == ["random"]        # the experiment's opponents, not the model's
+    for g in out["games"]:
+        assert g["result"] in ("1-0", "0-1", "1/2-1/2", "*")
+        assert g["termination"]                            # a non-empty termination string
+
+
+@_requires_game
+def test_chess_simulate_per_move_timeout_forfeits_slow_policy(defaults_installed, monkeypatch):
+    """A deliberately slow policy loses ON TIME under the (env-set) per-move clock."""
+    monkeypatch.setenv("_PLM_SIMULATE_CONFIG", json.dumps(
+        {"opponents": ["random"], "clock": "per_move", "per_move_s": 0.005}))
+
+    class _SlowPolicy:
+        name = "slowpoke"
+        def call(self, state):
+            import time, random
+            time.sleep(0.03)                               # 30ms >> the 5ms budget above
+            return random.choice(state["legal_uci"])
+
+    sim = _PLM_POLICIES["simulate"]
+    out = sim(_SlowPolicy(), 1, seed=1)
+    g = out["games"][0]
+    assert g["termination"] == "timeout"
+    assert g["winner"] == "opponent"
+    assert out["summary"]["policy_timeouts"] == 1

@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 from plm.model_backend import ModelBackend
 from plm._react_helper import (
@@ -169,6 +169,7 @@ class PLM:
         pip_install_packages: str = "",
         tool_timeout: Optional[float] = None,
         session_workspace: Optional[str] = None,
+        simulate_config: Optional[Dict[str, Any]] = None,
     ):
         self.model_backend = model_backend
         self.metaparams = metaparams
@@ -177,12 +178,19 @@ class PLM:
         self.pip_install_packages = pip_install_packages
         self.tool_timeout = tool_timeout
         self.session_workspace = session_workspace
+        # FIXED evaluation conditions for the `simulate` default (opponents, clock /
+        # per_move_s / game_clock_s, max_moves, evaluate / eval_depth / reference_engine,
+        # on_illegal / max_illegal_retries, max_workers). Passed to the kernel as
+        # `_PLM_SIMULATE_CONFIG` so the MODEL cannot pick its own opponents or relax the
+        # clock — it improves the policy, not the test. None -> simulate's built-in defaults.
+        self.simulate_config = simulate_config
 
     async def __call__(
         self,
         messages: List[Dict[str, Any]],
         *,
         constraint: Optional[Type[Constraint]] = None,
+        on_round: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
         **generate_kwargs: Any,
     ) -> Dict[str, Any]:
         """Drive the React loop until RETURN or budget exhaustion.
@@ -226,6 +234,11 @@ class PLM:
             repl_env["_PLM_EXTRA_POLICIES"] = json.dumps(self.metaparams.extra_policies)
         if getattr(self.metaparams, "sealed_policies", None):
             repl_env["_PLM_SEALED_EXTRA_POLICIES"] = json.dumps(self.metaparams.sealed_policies)
+
+        # FIXED simulate eval conditions -> the sealed `simulate` default reads these from
+        # the env; the model cannot choose its own opponents / relax the clock.
+        if self.simulate_config:
+            repl_env["_PLM_SIMULATE_CONFIG"] = json.dumps(self.simulate_config)
 
         # Append the chosen backend's runtime SDK dep so the kernel's per-session
         # uv venv can `import plm.model_backend.<x>` and call it successfully.
@@ -283,9 +296,19 @@ class PLM:
         seeded_count = 0
         seeded_epoch: Optional[int] = None
 
+        # Optional observability hook: called with the running transcript each round (and once
+        # at the end). A harness uses it to stream the live trajectory; failures never break the run.
+        def _emit(_msgs: List[Dict[str, Any]]) -> None:
+            if on_round is not None:
+                try:
+                    on_round(list(_msgs))
+                except Exception:
+                    pass
+
         # ---- React loop ------------------------------------------------------
         try:
             for _round in range(total_rounds_budget):
+                _emit(messages)                  # live trajectory: the running transcript so far
 
                 if _round == self.max_turns - 1:
                     messages.append(_build_last_round_reminder(constraint))
@@ -518,6 +541,7 @@ class PLM:
 
         metrics["main_turns"] = plm_ctx.get("main_turns", 0)
 
+        _emit(messages)                      # final transcript (after the loop completes)
         return {
             "answer": terminal_answer,     # exactly the value PLM passed to RETURN(...)
             "messages": messages,

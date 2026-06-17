@@ -7,3 +7,11 @@ __pycache__/
 .venv/
 *.egg-info/
 .DS_Store
+
+# experiments web app (Node) — build artifacts, never commit
+experiments/web/node_modules/
+experiments/web/dist/
+
+# experiments runtime data (workspace venv pool + run artifacts), if pointed inside the repo
+experiments_data/
+node_modules/
