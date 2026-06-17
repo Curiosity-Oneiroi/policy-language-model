@@ -1,7 +1,7 @@
 @policy
 def react_llm(messages, *, args=(), kwargs=None, objects=None,
               constraint=None, max_turns=8, return_budget=5, depth=None,
-              generate_kwargs=None):
+              generate_kwargs=None, expose_messages=False):
     """ReAct sub-agent: model + python tool, looped in the SAME REPL.
 
     Terminates ONLY when the model calls `RETURN(value)` inside its
@@ -47,7 +47,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         # the model's RETURN value; a ConstraintViolation prints into
         # the tool result and the loop continues):
         class Answer(Constraint):
-            value: int
+            value: Constraint.field(type=int)
         result = react_llm("Compute fact(7)", constraint=Answer)
         # Model writes: `RETURN({"value": 5040})` -> Answer(value=5040)
 
@@ -118,6 +118,15 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             top_p, response_format, ...) forwarded to each
             `backend.generate(...)`.
 
+        expose_messages=False: when True, the sub-LLM's exec scope gets a
+            `react_messages` name bound to a READ-ONLY LIVE VIEW of this loop's
+            conversation — refreshed before each code run so it always reflects
+            the current trajectory (mirroring how `plm_messages` works for PLM).
+            It is a leak-proof per-round snapshot: the model may read/iterate it,
+            but any write is isolated and discarded — it CANNOT edit its own
+            trajectory (use react_verifier_llm for trajectory control). Off by
+            default; when off, nothing is added to the exec scope.
+
     Returns:
 
         Whatever the model passed to `RETURN(value)`, validated by
@@ -179,7 +188,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     """
     import sys, json, keyword
     from plm.plm_tools import _tool_python
-    from plm._react_helper import _strip_code_fences
+    from plm._react_helper import _strip_code_fences, _readonly_messages_view
     from plm.policy.defaults._llm_infra import (
         _make_backend, descend, llm_call, check_depth_or_raise)
 
@@ -486,6 +495,8 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
             # `descend` / the `_exec` call), NOT for cell errors — cell stdout is never lost.
             try:
                 code = _strip_code_fences(code)
+                if expose_messages:                     # read-only live view (leak-proof snapshot) of the trajectory
+                    ns["react_messages"] = _readonly_messages_view(msgs)
                 with descend():                         # decrement for the act phase ONLY
                     out, term, val = _exec(code, ns, _round)
             except SyntaxError as e:

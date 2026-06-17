@@ -1,4 +1,4 @@
-"""Constraint — generic constraint class with a full composition algebra.
+"""Constraint — generic constraint class.
 
 PLM authors constraints two ways:
 
@@ -12,10 +12,9 @@ PLM authors constraints two ways:
 
   Pattern 2 — Value / field rule:  Constraint.field(**kw)
       The single public authoring entry for a value rule. It works BOTH standalone
-      (validate a bare value, compose with & | ^ ~, pass to a sub-LLM) AND as a
-      struct FIELD, where it embeds FLAT (the field IS the bare value, not a
-      {value:..} wrapper) while remaining a real Constraint (validate / describe /
-      json_schema / & | ^ ~ all work):
+      (validate a bare value, pass to a sub-LLM) AND as a struct FIELD, where it embeds
+      FLAT (the field IS the bare value, not a {value:..} wrapper) while remaining a real
+      Constraint (validate / describe / json_schema all work):
           class Order(Constraint):
               currency: Constraint.field(coercer=str.upper, type=Literal["USD","EUR"])
               qty:      Constraint.field(type=int, int_range=(1, 1000), multiple_of=5)
@@ -35,8 +34,8 @@ The Constraint.field(**kw) kwarg surface:
               | type=YourStruct            (a Constraint/model class — coerces a dict into an instance)
               The element T in a generic may ITSELF be a Constraint (e.g.
               type=list[Constraint.field(type=int, int_range=(0,9))]) — pydantic embeds it natively.
-              NOT nullable, NOT a Union/`X|Y` (top-level OR nested) — express alternatives with
-              the `|` algebra across whole constraints.
+              NOT nullable, NOT a Union/`X|Y` (top-level OR nested) — model alternatives with a
+              @model_validator (or type=object + a predicate), not inside one field's type.
   PREDICATES (pure checks; never set a type; some enrich the schema):
     numeric : int_range / float_range, int_ge/gt/le/lt (+ float_*), multiple_of,
               approx=(target,eps), finite=True  (reject nan/inf)
@@ -57,8 +56,8 @@ The Constraint.field(**kw) kwarg surface:
 
 No finite kwarg set is complete: for relations / aggregates / domain logic
 ("sums to 100", "is prime", "compiles") drop to predicate=fn WITH a description=
-(the description is what still steers the model). Compose anything with & | ^ ~;
-~ negates value-tests only (a structural NOT is a @model_validator).
+(the description is what still steers the model). To require several rules/shapes at once,
+author ONE constraint with all of them (+ a @model_validator for cross-field rules).
 
 Two kinds of user-supplied functions, with deliberately different contracts:
 
@@ -93,7 +92,7 @@ Two kinds of user-supplied functions, with deliberately different contracts:
       collapse to a "N coercer(s) applied" count.
 
 Execution order in a single Constraint.field call:
-  coercer(s)  →  type & Field(...) constraints  →  predicate(s)
+  coercer(s)  →  type coercer  →  predicate(s)
 
 Both patterns expose the same API on the class:
 
@@ -114,6 +113,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Mapping,
     Optional,
     Tuple,
     Type,
@@ -186,8 +186,10 @@ def _calls_super_builtin(code: Any) -> bool:
 
 
 class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
-    """Metaclass enabling `Cls1 & Cls2`, `Cls1 | Cls2`, `~Cls`, `Cls1 ^ Cls2`
-    at the class level."""
+    """Constraint metaclass: at class-definition time, rejects any constraint method that calls
+    `super()`. A Constraint is a FLAT structural validator (fields + validators + predicates), not
+    an inheritance hierarchy, and a `super()` method's hidden `__class__` cell can't dill-pickle for
+    crash-restart — so catch the misuse loudly at definition rather than failing later."""
 
     def __init__(cls, *args, **kwargs):
         # Done in __init__, NOT __new__: pydantic resolves forward references by walking the call
@@ -199,7 +201,7 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
         # predicates — NOT an OOP inheritance hierarchy. A method that CALLS `super()` is delegating
         # to a parent constraint, which is unsupported: it doesn't fit the model AND its hidden
         # `__class__` cell can't dill-pickle. Reject it at DEFINITION with a clear message instead of
-        # failing mysteriously later. None of the library's own classes (base / field / composite)
+        # failing mysteriously later. None of the library's own classes (base / field)
         # call super(), so this only fires on a misuse. (Constraint contract; supersedes)
         #
         # Detection: `_calls_super_builtin` — does THIS method LOAD the `super` builtin (global/name/
@@ -222,33 +224,26 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
                     f"+ predicates), not an inheritance hierarchy. Remove the super()/inheritance."
                 )
 
-    def __and__(cls, other: type) -> type:
-        from .algebra import _and
-        return _and(cls, other)
-
-    def __rand__(cls, other: type) -> type:
-        from .algebra import _and
-        return _and(other, cls)
-
-    def __or__(cls, other: type) -> type:
-        from .algebra import _or
-        return _or(cls, other)
-
-    def __ror__(cls, other: type) -> type:
-        from .algebra import _or
-        return _or(other, cls)
-
-    def __invert__(cls) -> type:
-        from .algebra import _not
-        return _not(cls)
-
-    def __xor__(cls, other: type) -> type:
-        from .algebra import _xor
-        return _xor(cls, other)
-
-    def __rxor__(cls, other: type) -> type:
-        from .algebra import _xor
-        return _xor(other, cls)
+        # FIELD-AUTHORING GUARD: every field of a STRUCTURAL constraint must be authored through
+        # `Constraint.field(...)` — the single, elegant authoring path. A bare annotation (`x: int`,
+        # `x: Foo`, a bare nested `leg: Leg`), a raw pydantic `Field(...)`, an `Optional[...]`, or a
+        # default value is rejected at DEFINITION. A `.field`-built class carries `_constraint_is_factory`,
+        # so a field whose RESOLVED annotation has that marker is the only accepted shape — everything
+        # else is a bare annotation. Factory classes are exempt (their own `value` field is the engine's
+        # internal annotation, not user authoring). `model_fields[name].annotation` is the resolved
+        # object (works under `from __future__ import annotations`), and a forward-ref recursion field
+        # `Constraint.field(type=list["X"])` still presents as a factory field here, so recursion passes.
+        if not getattr(cls, "_constraint_is_factory", False):
+            for _fname, _finfo in getattr(cls, "model_fields", {}).items():
+                if not getattr(_finfo.annotation, "_constraint_is_factory", False):
+                    raise TypeError(
+                        f"Constraint {cls.__name__!r}: field {_fname!r} must be authored via "
+                        f"Constraint.field(...), not a bare annotation — write "
+                        f"`{_fname}: Constraint.field(type=...)`. Bare annotations, a bare nested "
+                        f"Constraint, Optional, defaults, and raw pydantic Field(...) are not supported "
+                        f"(every field is a required Constraint.field; nest via type=YourStruct, "
+                        f"recurse via type=list[\"YourClass\"])."
+                    )
 
 
 # ============================================================================
@@ -266,8 +261,8 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     A Constraint is a FLAT structural validator — fields + `@field_validator` /
     `@model_validator` + predicates. It is NOT an OOP inheritance hierarchy: a
     method using bare `super()` (delegating to a parent constraint) is REJECTED at
-    definition. Constraints stay simple and self-contained; compose them with
-    `& | ^ ~` or nest one as another's field type instead of subclassing+super()."""
+    definition. Constraints stay simple and self-contained; nest one as another's
+    field type instead of subclassing+super()."""
 
     model_config = pd.ConfigDict(arbitrary_types_allowed=True)
 
@@ -283,18 +278,6 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     _constraint_field_inner_type: ClassVar[Any] = None
     _constraint_field_annotation: ClassVar[Any] = None   # flat Annotated[type, *meta] for element use
 
-    # Composition markers — set by the `&`/`|`/`^`/`~` wrapper (algebra.py).
-    # Declared ClassVar here (NOT bare `_`-attrs) so they are real, introspectable
-    # class attributes; a bare `_constraint_*` on a pydantic model becomes a
-    # ModelPrivateAttr (instance-only) and reads back as a descriptor on the class.
-    _constraint_is_composite: ClassVar[bool] = False
-    _constraint_children: ClassVar[tuple] = ()
-
-    # Composite operator label ("AND"/"OR"/"XOR"/"NOT") — set by the algebra wrappers.
-    # Declared here (not just set in the wrapper's class dict) so it reads back as the
-    # plain string, not a pydantic ModelPrivateAttr — needed by the crash-restart recipe.
-    _constraint_op_label: ClassVar[Optional[str]] = None
-
     # Original kwargs passed to the factory builder (for .describe() + crash-restart recipe).
     _constraint_factory_kwargs: ClassVar[Optional[Dict[str, Any]]] = None
 
@@ -307,8 +290,9 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     # NL description carried verbatim through .describe().
     _constraint_description: ClassVar[str] = ""
 
-    # Registry of common-kind predicates.
-    registry: ClassVar[Dict[str, Callable[[Any], None]]] = REGISTRY
+    # Read-only table of built-in `kind=` predicates (a MappingProxyType — never mutated at
+    # runtime). For a custom check use `Constraint.field(..., predicate=fn)`, not a runtime write.
+    registry: ClassVar[Mapping[str, Callable[[Any], None]]] = REGISTRY
 
     # ---- Authoring entry points ------------------------------------------------
 
@@ -324,8 +308,8 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     def field(cls, **kwargs: Any) -> Any:
         """The public authoring entry for a value/field rule. Builds a constraint
         from the kwarg surface (see the module docstring); the result works BOTH
-        standalone (`.validate` a bare value, compose with `& | ^ ~`, pass to a
-        sub-LLM) AND as a struct FIELD, where it embeds FLAT — the field IS the
+        standalone (`.validate` a bare value, pass to a sub-LLM) AND as a struct
+        FIELD, where it embeds FLAT — the field IS the
         bare value, carrying the constraints — while remaining a real `Constraint`
         (`.validate` / `.describe` / `.json_schema` all work):
 
@@ -416,75 +400,6 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
         # build a string field running that kind's check.
         return cls.field(type=str, kind=name)
 
-    @classmethod
-    def exactly_one_of(cls, *fields: str) -> Callable[[type], type]:
-        """Class decorator: enforce that *exactly one* of `fields` is non-None.
-
-        Builds a new class (a thin subclass of the decorated one) whose body
-        includes the `@model_validator` — this is the only reliable way to
-        attach a pydantic validator at class-decoration time, since pydantic
-        scans the class namespace during metaclass construction.
-
-        Usage:
-            @Constraint.exactly_one_of("score", "label", "error")
-            class Result(Constraint):
-                score: float | None = None
-                label: str | None = None
-                error: str | None = None
-        """
-        field_names = tuple(fields)
-        if not field_names:
-            raise ValueError(
-                "Constraint.exactly_one_of() requires at least one field name"
-            )
-
-        def deco(klass: type) -> type:
-            from .decorator import _DESCRIPTION_ATTR
-
-            def _check(self):  # noqa: ANN001
-                count = sum(
-                    1 for f in field_names if getattr(self, f, None) is not None
-                )
-                if count != 1:
-                    raise ValueError(
-                        f"exactly one of {field_names} must be non-None; got {count}"
-                    )
-                return self
-
-            setattr(
-                _check,
-                _DESCRIPTION_ATTR,
-                f"exactly one of {list(field_names)} must be non-None",
-            )
-            # The method name is derived from the field names joined by '_',
-            # which is AMBIGUOUS: exactly_one_of("a_b","c") and
-            # exactly_one_of("a","b_c") both join to "_exactly_one_of_a_b_c".
-            # Each decoration builds a subclass, so a prior decoration's
-            # validator is an attribute of `klass`; reusing the name would
-            # SHADOW it (one rule silently dropped). Bump a suffix until the
-            # name is free so BOTH validators survive.
-            base_method = f"_exactly_one_of_{'_'.join(field_names)}"
-            method_name = base_method
-            _suffix = 1
-            while hasattr(klass, method_name):
-                method_name = f"{base_method}__{_suffix}"
-                _suffix += 1
-            wrapped = model_validator(mode="after")(_check)
-
-            # Build a NEW class that subclasses the decorated one and includes
-            # the validator in its namespace. Pydantic's metaclass sees it
-            # during construction and registers it as a model_validator.
-            ns: Dict[str, Any] = {
-                method_name: wrapped,
-                "__annotations__": {},  # no new fields
-                "__module__": getattr(klass, "__module__", __name__),
-                "__qualname__": klass.__qualname__,
-            }
-            new_klass = type(klass)(klass.__name__, (klass,), ns)
-            return new_klass
-
-        return deco
-
     # ---- Validation -----------------------------------------------------------
 
     @classmethod
@@ -541,7 +456,8 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
     def json_schema(cls) -> Dict[str, Any]:
         """Export as JSON Schema — AIRTIGHT (never raises), compositional.
 
-        Structural Constraints export fully via pydantic. For a factory-built
+        Structural Constraints export via pydantic; a field typed as a non-renderable
+        arbitrary class degrades to `{}` + x-description rather than raising. For a factory-built
         Constraint the schema is built in three steps from the reframe pipeline:
           1. the "type" SKELETON comes ONLY from the type coercer (the value
              annotation) — the sole source of `"type"`. A non-renderable type
@@ -554,7 +470,19 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
              can't express (is_instance_of, unique, sorted, user predicates, ...).
         """
         if not cls._constraint_is_factory:
-            return cls.model_json_schema()
+            # AIRTIGHT (mirrors the factory branch below): a structural field typed as an
+            # arbitrary class with no JSON-Schema form makes model_json_schema() raise
+            # PydanticInvalidForJsonSchema. json_schema() must NEVER raise (natural_llm builds
+            # response_format from it OUTSIDE its retry loop), so degrade to a type-less skeleton
+            # + x-description from the (airtight) describe(), exactly as the factory branch does.
+            try:
+                return cls.model_json_schema()
+            except Exception:
+                try:
+                    x_desc = cls.describe()
+                except Exception:
+                    x_desc = ""
+                return {"x-description": x_desc} if x_desc else {}
 
         # 1. Type skeleton from the type coercer. model_json_schema() can raise for an
         #    arbitrary-class type coercer (no JSON-Schema form) — json_schema() must NEVER
@@ -589,7 +517,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
 
 def _iter_constraints_in(ann: Any):
     """Yield every Constraint subclass reachable in a type annotation — the annotation itself
-    if it's a Constraint (a `.field` facade / struct / composite), or any nested inside a typing
+    if it's a Constraint (a `.field` facade / struct), or any nested inside a typing
     generic (`list[X]`, `dict[K,V]`, `tuple[..]`, ...). Used to walk a factory's `type=` spec and
     a struct's field annotations for the natural_llm description gate."""
     if isinstance(ann, type) and issubclass(ann, Constraint) and ann is not Constraint:
@@ -602,24 +530,18 @@ def _iter_constraints_in(ann: Any):
 def _all_checks_described(constraint: type, _seen: Optional[set] = None) -> bool:
     """natural_llm GATE (not a general-constraint rule): True iff EVERY user-supplied
     predicate / coercer / `@model_validator` / `@field_validator` anywhere in `constraint`'s
-    tree carries a description (built-in refinements like int_range/str_pattern AND framework
-    validators like exactly_one_of auto-describe, so they always pass).
+    tree carries a description (built-in refinements like int_range/str_pattern auto-describe,
+    so they always pass).
 
     natural_llm steers a single-shot model with the schema (shape) + `describe()` (the rules);
     a check with NO description is invisible to `describe()` — the model can never be told about
     it, so single-shot generation can only fail it. Such a constraint is rejected up front and
-    routed to `react_llm`. (Walks `& | ^ ~` composites, struct fields, and `type=` generic
-    elements.)"""
+    routed to `react_llm`. (Walks struct fields and `type=` generic elements.)"""
     if _seen is None:
         _seen = set()
     if id(constraint) in _seen:
         return True
     _seen.add(id(constraint))
-
-    # composite -> every child must be fully described
-    if getattr(constraint, "_constraint_is_composite", False):
-        return all(_all_checks_described(ch, _seen)
-                   for ch in getattr(constraint, "_constraint_children", ()) or ())
 
     # factory (.of / .field) -> user predicate/coercer fns must be described; recurse type= elements
     if getattr(constraint, "_constraint_is_factory", False):
@@ -757,7 +679,6 @@ def _wrap_predicate(pred: Callable[[Any], Any]) -> Callable[[Any], Any]:
             f"reject. For value transformation, use `coercer=fn` / "
             f"`coercers=[fn1, fn2, ...]` on Constraint.field instead."
         )
-    _wrapped.__plm_underlying__ = pred  # type: ignore[attr-defined]
     return _wrapped
 
 
@@ -856,13 +777,14 @@ def _merge_schema_fragment(schema: Dict[str, Any], frag: Dict[str, Any]) -> None
 def _reject_nullable_union(spec: Any, where: str = "type=") -> None:
     """A field is NEVER nullable and NEVER a type-union: reject `None`/`NoneType`, `Optional[...]`,
     and any union (`Union[...]` / `X | Y`) — at the top level AND nested inside a generic
-    (`list[Optional[int]]`). Alternatives are expressed with the `|` algebra ACROSS whole
-    constraints, never inside one field's type. (`Literal[...]` VALUES are not types, so its args
-    are not recursed — `Literal[None]` means 'the constant None', which is allowed.)"""
+    (`list[Optional[int]]`). A field has exactly ONE type; model alternatives with a
+    `@model_validator` (or `type=object` + a predicate), never inside one field's type.
+    (`Literal[...]` VALUES are not types, so its args are not recursed — `Literal[None]` means
+    'the constant None', which is allowed.)"""
     if spec is None or spec is type(None):
         raise ValueError(
             f"Constraint.field: {where} cannot be None/NoneType — a field is never nullable. "
-            "Express alternatives with the | algebra across whole constraints."
+            "Model alternatives with a @model_validator (or type=object + a predicate)."
         )
     origin = get_origin(spec)
     import types as _t
@@ -870,12 +792,12 @@ def _reject_nullable_union(spec: Any, where: str = "type=") -> None:
         if type(None) in get_args(spec):                  # Optional[X] / X | None
             raise ValueError(
                 f"Constraint.field: {where} cannot be Optional / nullable (a Union with None) — "
-                "a field is never nullable. Express alternatives with the | algebra across "
-                "whole constraints."
+                "a field is never nullable. Model alternatives with a @model_validator "
+                "(or type=object + a predicate)."
             )
         raise ValueError(
             f"Constraint.field: {where} cannot be a Union / `X | Y` — a field has exactly ONE type. "
-            "Express alternatives with the | algebra across whole constraints."
+            "Model alternatives with a @model_validator (or type=object + a predicate)."
         )
     if origin is not None and origin is not Literal:
         for arg in get_args(spec):
@@ -925,10 +847,8 @@ _CMP_FRAG_KEY: Dict[str, str] = {
 
 # ---- is_instance_of: a STRICT Python isinstance check (type membership) ----
 # It accepts a plain class, a STRUCT Constraint, or a TUPLE of those (Python's native "instance of
-# any of these"). It does NOT accept a `& | ^ ~` COMPOSITE: that algebra composes VALIDATION (a
-# different axis — `&` even merges/builds structs), so re-reading it as set-ops on instance-sets
-# would overload the operators with two meanings. For "an instance of A or B" use a tuple
-# `is_instance_of=(A, B)`; to require the value VALIDATE against a composite, use it as the type.
+# any of these"). For "an instance of A or B" use a tuple `is_instance_of=(A, B)`. It does NOT
+# accept a `.field`/factory — a value is never an instance of the dynamic wrapper class.
 def _isinstance_target_reason(t: Any) -> Optional[str]:
     """Return WHY `t` is not a valid is_instance_of target, or None if it's fine (a plain class, a
     struct Constraint, or a tuple of those)."""
@@ -941,11 +861,6 @@ def _isinstance_target_reason(t: Any) -> Optional[str]:
                 return f"tuple element {x!r}: {r}"
         return None
     if isinstance(t, type) and issubclass(t, Constraint):
-        if getattr(t, "_constraint_is_composite", False):
-            return ("a composite (`& | ^ ~`) — that algebra composes VALIDATION, not type membership. "
-                    "For 'an instance of A or B' use a tuple: is_instance_of=(A, B). To require the "
-                    "value VALIDATE against the composite, use the composite AS the type/constraint, "
-                    "not inside is_instance_of")
         if getattr(t, "_constraint_is_factory", False) or getattr(t, "_constraint_is_field", False):
             return ("a Constraint.field(...)/.of(...) factory — a value is never a Python instance of "
                     "the dynamic wrapper class. Use a struct Constraint or a plain class (or use it as "
@@ -958,7 +873,7 @@ def _isinstance_target_reason(t: Any) -> Optional[str]:
 
 def _isinstance_describe(target: Any) -> str:
     """Render an accepted is_instance_of target for describe(): a class -> its short name; a tuple ->
-    `(A / B)`. (Composites are rejected at build, so there is no mangled wrapper name to render.)"""
+    `(A / B)`."""
     if isinstance(target, tuple):
         return "(" + " / ".join(_short(t) for t in target) + ")"
     return _short(target)
@@ -1134,8 +1049,8 @@ def _interpret_kwargs(
     # --- is_instance_of (PURE isinstance check — sets NO type, contributes NO schema) ---
     if "is_instance_of" in kwargs:
         target = kwargs.pop("is_instance_of")
-        # Accept a plain class / struct Constraint / tuple of those; reject a composite (wrong axis —
-        # use a tuple for type-union) or a factory (never an instance of the wrapper).
+        # Accept a plain class / struct Constraint / tuple of those; reject a factory (a value is
+        # never a Python instance of the dynamic wrapper).
         _reason = _isinstance_target_reason(target)
         if _reason is not None:
             raise TypeError(f"is_instance_of= must be a class, a struct Constraint, or a tuple of "
@@ -1585,23 +1500,6 @@ def _describe_factory(cls: Type[Constraint]) -> str:
     return ", ".join(parts) if parts else "no constraint"
 
 
-def _nested_struct(ann: Any) -> Optional[Type["Constraint"]]:
-    """If `ann` (or the inner type of `Optional[...]` / `X | None`) is a STRUCTURAL
-    Constraint subclass — NOT a `.field`/factory or a composite, which describe
-    themselves — return it, else None. Lets describe() recurse into nested object
-    fields. Containers (`List[...]`/`Dict[...]`) are left to their flat rendering."""
-    args = get_args(ann)
-    if args and type(None) in args:                      # Optional[X] / X | None
-        non_none = [a for a in args if a is not type(None)]
-        if len(non_none) == 1:
-            ann = non_none[0]
-    if (isinstance(ann, type) and issubclass(ann, Constraint)
-            and not getattr(ann, "_constraint_is_factory", False)
-            and not getattr(ann, "_constraint_is_composite", False)):
-        return ann
-    return None
-
-
 def _collect_validator_descriptions(cls: Type[Constraint]) -> List[str]:
     """The `@constraint('...')` descriptions on `cls`'s validators (model + field),
     de-duplicated — for describe()'s 'Additionally:' block. Found via both `dir(cls)`
@@ -1629,31 +1527,17 @@ def _collect_validator_descriptions(cls: Type[Constraint]) -> List[str]:
     return extras
 
 
-def _struct_body(cls: Type[Constraint], base: int, seen: set) -> List[str]:
-    """Field lines (+ this class's 'Additionally:' block) for `cls`: field lines at
-    indent `base+2`, the 'Additionally:' header at `base`. A field whose type is a
-    nested structural Constraint (not already on the path — `seen` breaks cycles) is
-    expanded inline two spaces deeper."""
-    fpad = " " * (base + 2)
-    pad = " " * base
+def _struct_body(cls: Type[Constraint]) -> List[str]:
+    """Field lines (+ this class's 'Additionally:' block) for `cls`: each field at indent 2,
+    the 'Additionally:' header at column 0. Every field is a Constraint.field(...) (or a
+    Constraint.of(...) factory) whose COMPLETE contract is rendered inline from the facade's own
+    describe(); a nested struct is a `.field(type=Struct)` facade rendered the same way (its
+    describe() recurses)."""
+    fpad = "  "
     lines: List[str] = []
     for name, info in cls.model_fields.items():
         ann = info.annotation
         field_desc = info.description or ""
-
-        nested = _nested_struct(ann)
-        if nested is not None:
-            head = f"{fpad}- {name} ({nested.__name__})"
-            if nested in seen:                            # cycle — show the type, don't expand
-                if field_desc:
-                    head += f": {field_desc}"
-                lines.append(head)
-                continue
-            if field_desc:
-                head += f" — {field_desc}"
-            lines.append(head + ":")
-            lines.extend(_struct_body(nested, base + 2, seen | {nested}))
-            continue
 
         if getattr(ann, "_constraint_is_field", False):
             # A `Constraint.field(...)`: its constraints live inside its core-schema
@@ -1669,70 +1553,30 @@ def _struct_body(cls: Type[Constraint], base: int, seen: set) -> List[str]:
             lines.append(line)
             continue
 
-        if getattr(ann, "_constraint_is_composite", False):
-            # A composite (A|B / A&B / ~A / A^B) field: render the composite's OWN describe() (the
-            # OR/AND/XOR/NOT tree), NOT the mangled internal class name `_short(ann)` would emit (D1).
-            summary = ann.describe()
-            head = f"{fpad}- {name}"
-            if field_desc:
-                head += f": {field_desc}"
-            if summary and "\n" not in summary:                  # single-line: inline
-                lines.append(f"{head} — {summary}")
-            elif summary:                                        # multi-line (structural child): block
-                lines.append(head + ":")
-                lines.extend(f"{fpad}    {ln}" for ln in summary.splitlines())
-            else:
-                lines.append(head)
-            continue
-
-        constraints = _field_constraint_summary(info)
+        # A non-.field factory field (a Constraint.of(...) annotation — rare; .field is the
+        # authoring path): render its bare type. There is no pydantic-Field metadata to summarize
+        # under the .field-only model (raw Field is rejected), so the line is just `name (type)`.
         line = f"{fpad}- {name} ({_short(ann)})"
-        if constraints:
-            line += f" — {constraints}"
         if field_desc:
             line += f": {field_desc}"
         lines.append(line)
 
     extras = _collect_validator_descriptions(cls)
     if extras:
-        # Top-level "Additionally:" sits at the header column (base 0); a NESTED
-        # class's sits at its own field column (fpad) so it clearly belongs to that
-        # nested block rather than the enclosing object.
-        a_pad = pad if base == 0 else fpad
         lines.append("")
-        lines.append(f"{a_pad}Additionally:")
+        lines.append("Additionally:")
         for e in extras:
-            lines.append(f"{a_pad}  - {e}")
+            lines.append(f"  - {e}")
     return lines
 
 
 def _describe_structural(cls: Type[Constraint]) -> str:
-    """Render an NL description for a structural Constraint subclass: a header, one
-    line per field (nested structural fields expanded inline, cycle-guarded), and an
+    """Render an NL description for a structural Constraint subclass: a header, one line per
+    field (each a Constraint.field(...) rendered with its full contract inline), and an
     'Additionally:' block for cross-field `@constraint`-tagged validators."""
     lines = [f"Return an object of type {cls.__name__} with fields:"]
-    lines.extend(_struct_body(cls, base=0, seen={cls}))
+    lines.extend(_struct_body(cls))
     return "\n".join(lines)
-
-
-def _field_constraint_summary(info: pd.fields.FieldInfo) -> str:
-    """Render pydantic Field constraints (ge, le, pattern, ...) as a string."""
-    bits: List[str] = []
-    for meta in info.metadata or ():
-        for attr in ("ge", "le", "gt", "lt", "min_length", "max_length", "pattern"):
-            val = getattr(meta, attr, None)
-            if val is not None:
-                bits.append(f"{attr}={val!r}")
-        # A struct-&-struct AUTO-MERGE keeps each side's NON-combinable constraints
-        # (patterns, multiple_of, custom validators + their @constraint descriptions)
-        # only inside its merge enforcer, since they can't reduce to a single visible
-        # marker. The enforcer stashes them as NL phrases on its func, so surface them
-        # here — otherwise the model wouldn't be TOLD about them upfront and would
-        # only meet them on a violation. (#H3/#H4 follow-up)
-        extra = getattr(getattr(meta, "func", None), "_plm_extra_desc", None)
-        if extra:
-            bits.extend(extra)
-    return ", ".join(bits)
 
 
 def _range_phrase(label: str, lo: Any, hi: Any, *, ge: bool, le: bool) -> str:

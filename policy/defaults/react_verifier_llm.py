@@ -1,7 +1,7 @@
 @policy
 def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
                        constraint=None, max_turns=8, return_budget=5, depth=None,
-                       generate_kwargs=None, verifier=None):
+                       generate_kwargs=None, verifier=None, expose_messages=False):
     """ReAct sub-agent (model + python tool, same REPL) + a per-round VERIFIER
     hook — the trajectory control axis.
 
@@ -65,7 +65,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
         # the model's RETURN value; a ConstraintViolation prints into
         # the tool result and the loop continues):
         class Answer(Constraint):
-            value: int
+            value: Constraint.field(type=int)
         result = react_verifier_llm("Compute fact(7)", constraint=Answer)
         # Model writes: `RETURN({"value": 5040})` -> Answer(value=5040)
 
@@ -136,6 +136,15 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
         generate_kwargs=None (resolved to {}): backend kwargs (temperature,
             top_p, response_format, ...) forwarded to each
             `backend.generate(...)`.
+
+        expose_messages=False: when True, the sub-LLM's exec scope gets a
+            `react_verifier_messages` name bound to a READ-ONLY LIVE VIEW of this
+            loop's conversation — refreshed before each code run so it always
+            reflects the current trajectory (mirroring `plm_messages` for PLM). It
+            is a leak-proof per-round snapshot: the model may read/iterate it, but
+            any write is isolated and discarded. (Trajectory CONTROL stays the
+            `verifier`'s job, which edits `msgs` between rounds; this is the
+            sub-agent's read-only window into it.) Off by default.
 
         verifier=None: optional callable `verifier(messages) -> None`,
             invoked after EACH non-terminal round with the LIVE `msgs`
@@ -237,7 +246,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
     """
     import sys, json, keyword
     from plm.plm_tools import _tool_python
-    from plm._react_helper import _strip_code_fences
+    from plm._react_helper import _strip_code_fences, _readonly_messages_view
     from plm.policy.defaults._llm_infra import (
         _make_backend, descend, llm_call, check_depth_or_raise)
 
@@ -541,6 +550,8 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
                             # cell stdout is never lost.
                             try:
                                 code = _strip_code_fences(code)
+                                if expose_messages:             # read-only live view (leak-proof snapshot) of the trajectory
+                                    ns["react_verifier_messages"] = _readonly_messages_view(msgs)
                                 with descend():                 # decrement for the act phase ONLY
                                     out, term, val = _exec(code, ns, _round)
                             except SyntaxError as e:

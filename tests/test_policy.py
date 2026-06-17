@@ -663,10 +663,9 @@ def test_int_constraint_surface_ambient_with_pydantic():
 
 
 def test_int_crash_restart_constraints_survive():
-    """D5 fix — CALL-built constraints survive a hard respawn. A Constraint.field(...)
-    and a composite (A & B) are rebuilt from their snapshot RECIPES; a structural
-    subclass survives by value. All three validate (accept + reject) correctly after the
-    crash. Needs a pydantic kernel (the constraint surface)."""
+    """D5 fix — a CALL-built constraint survives a hard respawn. A Constraint.field(...) is
+    rebuilt from its snapshot RECIPE; a structural subclass survives by value. Both validate
+    (accept + reject) correctly after the crash. Needs a pydantic kernel (the constraint surface)."""
     try:
         from plm.repl import PythonReplSession
     except Exception as e:                              # pragma: no cover
@@ -677,16 +676,14 @@ def test_int_crash_restart_constraints_survive():
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start pydantic kernel: {e}")
     try:
-        # Constraint is AMBIENT in cells. A field + composite (recipes) AND a STRUCTURAL
+        # Constraint is AMBIENT in cells. A field (recipe) AND a STRUCTURAL
         # class with a default, a Field bound, and a validator (reconstructed from fields).
         s.execute_cell(
-            "from pydantic import Field, model_validator\n"
+            "from pydantic import model_validator\n"
             "field_c = Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 100)\n"
-            "comp_c = Constraint.field(type=object, is_instance_of=int) & "
-            "Constraint.field(type=object, is_instance_of=int, predicate=lambda x: x > 0)\n"
             "class StructC(Constraint):\n"
-            "    name: str = 'anon'\n"
-            "    n: int = Field(ge=0)\n"
+            "    name: Constraint.field(type=str)\n"
+            "    n: Constraint.field(type=int, int_ge=0)\n"
             "    @model_validator(mode='after')\n"
             "    def _chk(self):\n"
             "        if self.name == 'BAD':\n"
@@ -695,10 +692,10 @@ def test_int_crash_restart_constraints_survive():
         ep = s.kernel_epoch
         s.execute_cell("import os as _o\n_o._exit(0)")  # hard crash -> respawn + rehydrate
         assert s.kernel_epoch > ep, "expected a respawn"
-        # all three survived and validate the GOOD values (StructC keeps its 'anon' default)
+        # all three survived and validate the GOOD values
         r = s.execute_cell(
-            "print(field_c.validate(200), comp_c.validate(5), StructC.validate({'n': 3}).name)")
-        assert r["stdout"].strip() == "200 5 anon", r
+            "print(field_c.validate(200), StructC.validate({'name': 'ok', 'n': 3}).name)")
+        assert r["stdout"].strip() == "200 ok", r
         # ... and all REJECT bad ones — predicates, operators, the Field bound, AND the validator
         r2 = s.execute_cell(
             "def _rej(c, v):\n"
@@ -706,9 +703,9 @@ def test_int_crash_restart_constraints_survive():
             "        c.validate(v); return False\n"
             "    except Exception:\n"
             "        return True\n"
-            "print(_rej(field_c, 5), _rej(comp_c, -1), "
-            "_rej(StructC, {'n': -1}), _rej(StructC, {'name': 'BAD', 'n': 0}))")
-        assert r2["stdout"].strip() == "True True True True", r2
+            "print(_rej(field_c, 5), "
+            "_rej(StructC, {'name': 'ok', 'n': -1}), _rej(StructC, {'name': 'BAD', 'n': 0}))")
+        assert r2["stdout"].strip() == "True True True", r2
     finally:
         s.close()
 
@@ -732,8 +729,8 @@ def test_int_crash_restart_nested_constraints_survive():
     try:
         s.execute_cell(
             "from typing import Literal\n"
-            "class Address(Constraint):\n    city: str\n"
-            "class Person(Constraint):\n    name: str\n    addr: Address\n"
+            "class Address(Constraint):\n    city: Constraint.field(type=str)\n"
+            "class Person(Constraint):\n    name: Constraint.field(type=str)\n    addr: Constraint.field(type=Address)\n"
             "class Order(Constraint):\n"
             "    currency: Constraint.field(type=Literal['USD','EUR'])\n"
             "    qty: Constraint.field(type=int, int_range=(1,100))\n"
@@ -1004,6 +1001,199 @@ def test_int_crash_restart_identity(repl):
     assert r2["stdout"].strip() == "after after", r2
 
 
+def _pydantic_repl():
+    """A fresh pydantic-enabled kernel session (the module `repl` fixture is dill-only, so the
+    constraint surface isn't available there). Mirrors the other crash-restart constraint tests."""
+    from plm.repl import PythonReplSession
+    return PythonReplSession(workspace=None, preinstall=("dill", "pydantic"),
+                             cell_timeout=15.0, sigint_grace=2.0)
+
+
+def test_int_crash_restart_recursive_constraint_survives():
+    """A self-recursive structural Constraint used to embed a LIVE class in its recipe (the cycle
+    guard bailed), which dill-pickled by-reference and sank the WHOLE snapshot on respawn. The
+    _SELF_REF marker + model_rebuild make the recipe clean, so the recursive class SURVIVES restart
+    and an unrelated sibling var is no longer collateral damage."""
+    try:
+        s = _pydantic_repl()
+    except Exception as e:                                          # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell(
+            "class Node(Constraint):\n"
+            "    val: Constraint.field(type=int)\n"
+            "    kids: Constraint.field(type=list['Node'])\n"
+            "other = 7\n")
+        ep = s.kernel_epoch
+        r0 = s.execute_cell("import os as _o\n_o._exit(0)")         # hard crash -> respawn + rehydrate
+        assert s.kernel_epoch > ep, "expected a respawn"
+        assert not r0.get("rehydrate_error"), r0.get("rehydrate_error")   # must NOT be sunk
+        r = s.execute_cell(
+            "print(other, Node.validate({'val': 5, 'kids': [{'val': 6, 'kids': []}]}).kids[0].val)")
+        assert r["stdout"].strip() == "7 6", r
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_kind_constraint_survives():
+    """(Gap 1) A kind= constraint (a built-in registry predicate) survives a hard respawn: the recipe
+    stores the kind NAME (a string), the respawned kernel rebuilds the read-only REGISTRY fresh, and
+    from_recipe re-resolves the built-in predicate — so the constraint still validates + rejects
+    post-restart. (The registry-freeze closed the old runtime-kind hole; built-ins always re-resolve.)"""
+    try:
+        s = _pydantic_repl()
+    except Exception as e:                                          # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell("email_c = Constraint.field(type=str, kind='email')\nother = 9\n")
+        ep = s.kernel_epoch
+        r0 = s.execute_cell("import os as _o\n_o._exit(0)")         # hard crash -> respawn + rehydrate
+        assert s.kernel_epoch > ep, "expected a respawn"
+        assert not r0.get("rehydrate_error"), r0.get("rehydrate_error")   # must NOT be sunk
+        r = s.execute_cell(
+            "def _rej(c, v):\n"
+            "    try:\n"
+            "        c.validate(v); return False\n"
+            "    except Exception:\n"
+            "        return True\n"
+            "print(other, email_c.validate('a@b.co'), _rej(email_c, 'nope'))")
+        assert r["stdout"].strip() == "9 a@b.co True", r           # built-in kind re-resolved + still rejects
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_policy_that_is_constraint_survives():
+    """A class that is BOTH @policy and a Constraint subclass dill-dumps BY-REFERENCE (the probe
+    succeeds), was kept by value, and poisoned the whole blob on respawn. It now rehydrates from its
+    _p_source like any class policy, so it SURVIVES (as both policy and constraint) and a sibling var
+    isn't lost."""
+    try:
+        s = _pydantic_repl()
+    except Exception as e:                                          # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell("@policy\nclass Grade(Constraint):\n    score: Constraint.field(type=int)\n")
+        s.execute_cell("keep = 7")
+        ep = s.kernel_epoch
+        r0 = s.execute_cell("import os as _o\n_o._exit(0)")
+        assert s.kernel_epoch > ep, "expected a respawn"
+        assert not r0.get("rehydrate_error"), r0.get("rehydrate_error")
+        r = s.execute_cell(
+            "print(keep, Grade.validate({'score': 5}).score, 'Grade' in list_policies())")
+        assert r["stdout"].strip() == "7 5 True", r
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_unsnapshottable_var_dropped_with_note():
+    """A var that can't be snapshotted (a foreign pydantic model dill can't pickle) is DROPPED — but
+    NAMED in the rehydrate note, never silent — while everything else survives the restart."""
+    try:
+        s = _pydantic_repl()
+    except Exception as e:                                          # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell("@policy\ndef keep(x): return 'kept'\n")
+        s.execute_cell("good = 42")
+        s.execute_cell(
+            "from pydantic import BaseModel\n"
+            "class Frn(BaseModel):\n    x: int\n"
+            "bad = Frn(x=1)\n")
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")             # crash -> respawn
+        assert s.kernel_epoch > ep, "expected a respawn"
+        r = s.execute_cell("print(good, keep('x'), 'bad' in dir())")
+        assert r["stdout"].strip() == "42 kept False", r           # survivors intact, dropped var gone
+        # the dropped var is NAMED in the post-respawn note (first cell after the respawn), never silent
+        assert "bad" in r["stderr"] and (
+            "did NOT survive" in r["stderr"] or "failed to load" in r["stderr"]), r["stderr"]
+    finally:
+        s.close()
+
+
+def test_int_crash_restart_combined_blob_failure_recovers_per_object():
+    """The per-object RECOVERY backstop: if the combined snapshot blob can't load (one un-loadable
+    object would otherwise sink the WHOLE restore), the kernel loads each object on its own — dropping
+    only the failures (named in the note) and keeping the rest. Exercised by injecting a crafted
+    snapshot whose combined blob is corrupt but whose per-object blobs are sound."""
+    import dill
+    try:
+        s = _pydantic_repl()
+    except Exception as e:                                          # pragma: no cover
+        pytest.skip(f"could not start pydantic kernel: {e}")
+    try:
+        s.execute_cell("seed = 1")                                  # get the kernel running
+        good_blob = dill.dumps(42)
+        wrapper = {
+            "_combined": b"\x80\x05 not a valid pickle stream",     # forces the per-object fallback
+            "vars": {"good": good_blob, "bad": b"\x80\x05 also bad"},   # 'bad' fails -> dropped
+            "policies": {}, "policy_sources": {}, "recipes": {},
+            "dropped": [], "var_dropped": [],
+        }
+        s.cached_vars_blob = dill.dumps(wrapper)                    # inject the crafted snapshot
+        ep = s.kernel_epoch
+        s.execute_cell("import os as _o\n_o._exit(0)")             # crash -> respawn rehydrates our blob
+        assert s.kernel_epoch > ep, "expected a respawn"
+        r = s.execute_cell("print(good, 'bad' in dir())")
+        assert r["stdout"].strip() == "42 False", r                 # 'good' recovered per-object
+        # the fallback + the per-object drop are NAMED in the post-respawn note
+        assert "could not load" in r["stderr"], r["stderr"]         # combined failed -> fallback taken
+        assert "failed to load" in r["stderr"] and "bad" in r["stderr"], r["stderr"]
+    finally:
+        s.close()
+
+
+def test_int_rename_cannot_clobber_builtin_or_dunder(repl):
+    """#2: a policy rename must obey `_reserved_name_reason` (the single source of truth) — it cannot
+    take a builtin's name (which would shadow it session-wide) or a `__`-prefixed name (which would
+    vanish on respawn). The old collision guard only checked names PRESENT in __main__, missing both."""
+    repl.execute_cell("@policy\ndef predict(s): return 'ok'\n")
+    repl.execute_cell("predict._edit('def predict', 'def len')")        # refused (builtin name)
+    r = repl.execute_cell("print('len' in list_policies(), len([1, 2, 3]), predict('x'))")
+    assert r["stdout"].strip() == "False 3 ok", r                       # len untouched; predict intact
+    repl.execute_cell("predict._edit('def predict', 'def __secret')")   # refused (__-prefix)
+    r2 = repl.execute_cell("print('__secret' in list_policies(), predict('x'))")
+    assert r2["stdout"].strip() == "False ok", r2
+
+
+def test_int_guard_allows_walrus_inside_lambda_default(repl):
+    """#11: Guard A must NOT false-positive on a walrus inside a LAMBDA BODY sitting in a signature
+    position — it binds a lambda-LOCAL, never the enclosing policy, so the cell is valid."""
+    repl.execute_cell("@policy\ndef predict(s): return 'ok'\n")
+    r = repl.execute_cell(
+        "def f(cb=lambda: (predict := 5)): return cb()\n"
+        "print(f(), predict('x'))")
+    assert r["stdout"].strip() == "5 ok", r                             # ran (not refused); policy intact
+
+
+def test_edit_grant_keyed_by_name_survives_identity_swap():
+    """#6 (Option B): edit grants are keyed by policy NAME, not id — so a structural recreate (which
+    swaps the class object's id under the SAME name) does not invalidate the branch's own grant, while
+    an un-granted name is still refused."""
+    from plm._branch_state import (
+        _IN_PARALLEL_BRANCH, _BRANCH_EDIT_GRANTS, _edit_guard, ParallelMutationError)
+
+    class _P1:
+        _p_name = "predict"
+
+    class _P2:                                   # a DIFFERENT object, SAME name (as after a recreate)
+        _p_name = "predict"
+
+    class _Q:
+        _p_name = "other"
+
+    _tb = _IN_PARALLEL_BRANCH.set(True)
+    _tg = _BRANCH_EDIT_GRANTS.set(frozenset({"predict"}))
+    try:
+        _edit_guard(_P1())                       # granted name -> allowed
+        _edit_guard(_P2())                       # same NAME, new object -> still allowed (the fix)
+        with pytest.raises(ParallelMutationError):
+            _edit_guard(_Q())                    # un-granted name -> refused
+    finally:
+        _BRANCH_EDIT_GRANTS.reset(_tg)
+        _IN_PARALLEL_BRANCH.reset(_tb)
+
+
 def test_int_policy_creates_policy(repl):
     repl.execute_cell(
         "@policy\n"
@@ -1175,6 +1365,26 @@ def test_int_plm_messages_additive_accumulation():
         assert run("print([m['role'] for m in plm_messages])") == "['user', 'assistant']"  # no delta -> unchanged
         assert run("plm_messages.clear(); print(len(plm_messages))") == "0"               # public copy cleared
         assert run("print(len(plm_messages))", [{"role": "tool", "content": "c"}]) == "3"  # accumulator intact -> 3
+    finally:
+        s.close()
+
+
+def test_int_plm_messages_in_place_edit_does_not_leak():
+    """The public plm_messages is a DEEP copy of the accumulator each cell, so a cell editing a turn
+    IN PLACE (not just append/clear/reassign) cannot corrupt the accumulator — the next cell's fresh
+    copy still shows the original. (Closes the shallow-copy content-edit leak.)"""
+    from plm.repl import PythonReplSession
+    try:
+        s = PythonReplSession(workspace=None, preinstall=("dill",),
+                              cell_timeout=10.0, sigint_grace=2.0)
+    except Exception as e:                              # pragma: no cover
+        pytest.skip(f"could not start kernel session: {e}")
+    try:
+        def run(code, delta=None):
+            return s.execute_cell(code, None, delta)["stdout"].strip()
+        run("pass", [{"role": "user", "content": "original"}])          # seed one turn
+        run("plm_messages[0]['content'] = 'HACKED'")                    # in-place edit on the public copy
+        assert run("print(plm_messages[0]['content'])") == "original"   # accumulator untouched -> no leak
     finally:
         s.close()
 

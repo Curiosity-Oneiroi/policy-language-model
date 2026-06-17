@@ -171,12 +171,21 @@ def _audit_extras(node, names, immutable_names):
     BODY is a separate scope (skipped), but its SIGNATURE positions evaluate here, so they are
     substituted in and audited too."""
     _TypeAlias = getattr(ast, "TypeAlias", ())
-    children = []
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            children.extend(_enclosing_scope_nodes(child))   # body skipped; signature audited
-        else:
-            children.append(child)
+    _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    if isinstance(node, _SCOPES):
+        # THIS node is itself a nested scope — e.g. a lambda handed in as a default value via
+        # `_enclosing_scope_nodes` (the signature of an OUTER def). Audit ONLY its signature: its BODY
+        # is a separate scope, so a binding there (a walrus / `except as` / match capture) is LOCAL and
+        # is NOT a policy rebind. Without this, recursing into such a lambda walked its body and
+        # false-positived on a lambda-local walrus (e.g. `def f(cb=lambda: (predict := 5)): ...`).
+        children = list(_enclosing_scope_nodes(node))
+    else:
+        children = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _SCOPES):
+                children.extend(_enclosing_scope_nodes(child))   # body skipped; signature audited
+            else:
+                children.append(child)
     for child in children:
         if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
             if child.target.id in names:

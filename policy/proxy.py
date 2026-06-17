@@ -172,8 +172,16 @@ def _do_insert(name, source, rewrite, after_line, content):
                      f"{after_line!r}); nothing changed")
     ns = _compute_insert(source, after_line, content)
     if ns is None:
+        # _compute_insert returns None for TWO distinct reasons; name the RIGHT one (the misattributed
+        # 'empty content' for an out-of-range after_line steers the model to re-check its content instead
+        # of its line number — mirrors _do_delete's out-of-range message).
+        if not content:
+            return _fail(PolicyOp.NO_MATCH,
+                         f"{name}._insert: nothing to insert (empty content); nothing changed")
+        _nlines = len(source.splitlines(keepends=True))
         return _fail(PolicyOp.NO_MATCH,
-                     f"{name}._insert: nothing to insert (empty content); nothing changed")
+                     f"{name}._insert: after_line {after_line} is past end of source "
+                     f"({_nlines} line(s)); nothing changed")
     return rewrite(ns)
 
 
@@ -406,6 +414,17 @@ class _FunctionPolicy:
         # is a namespace change, parent-only. No-op outside a branch. (Also forecloses the
         # two-branches-rename-to-the-same-new-name race that per-policy exclusivity can't see.)
         _rename_guard(self, new_name)
+        # Reserved-name guard: a rename must obey the SAME name rules as `@policy` / `duplicate_policy`
+        # — `_reserved_name_reason` is the single source of truth (rejects builtins like `len`, keywords,
+        # `_RESERVED`, and `__`/`_repl`/`_REPL` prefixes). The collision guard below only catches names
+        # already PRESENT in __main__; a builtin lives in __builtins__ (not __main__.__dict__) and an
+        # unbound `__name` is in none of these sets, so without this BOTH slip through.
+        if new_name != self._p_name:
+            from .decorator import _reserved_name_reason   # lazy: proxy <- decorator import cycle
+            _rn = _reserved_name_reason(new_name)
+            if _rn is not None:
+                return _fail(PolicyOp.NAME_INVALID,
+                             f"{self._p_name}._rewrite: cannot rename to {new_name!r} — {_rn}")
         # Rename-collision guard: a rename must not CLOBBER another policy or a
         # kernel-internal name. Without this, `mutable._rewrite("def natural_llm():
         # ...")` would take over the immutable default's slot (the gate above only
@@ -612,6 +631,15 @@ def _rewrite_class_policy(cls, new_source):
     new_name = tree.body[0].name
     # Parallel-branch gate (mirrors _FunctionPolicy._rewrite): renaming is parent-only.
     _rename_guard(cls, new_name)
+    # Reserved-name guard (mirrors _FunctionPolicy._rewrite): obey the SAME name rules as @policy /
+    # duplicate_policy via the single source of truth (builtins/keywords/reserved/__-prefix), which
+    # the collision guard below — present-in-__main__ only — does not cover.
+    if new_name != cls.__name__:
+        from .decorator import _reserved_name_reason   # lazy: proxy <- decorator import cycle
+        _rn = _reserved_name_reason(new_name)
+        if _rn is not None:
+            return _fail(PolicyOp.NAME_INVALID,
+                         f"{cls.__name__}._rewrite: cannot rename to {new_name!r} — {_rn}")
     # Rename-collision guard (mirrors _FunctionPolicy._rewrite): a rename must not
     # clobber another policy or a kernel-internal name. Edit in place (new_name ==
     # old) is fine.

@@ -28,6 +28,7 @@ from __future__ import annotations
 import linecache as _linecache
 import sys
 from contextlib import contextmanager as _contextmanager
+from contextvars import ContextVar
 
 from plm._branch_state import _IN_PARALLEL_BRANCH, _no_branch_mutation   # parallel-branch state/gate
 
@@ -54,7 +55,7 @@ class _SealedNames(set):
     hardening of the obvious/casual path, not a sandbox.)"""
 
     def _require_unsealed(self, op: str) -> None:
-        if not _STORE_UNSEALED:
+        if not _STORE_UNSEALED.get():
             raise TypeError(
                 f"_SEALED_POLICIES.{op}() is not allowed — a sealed (default) policy cannot be "
                 f"un-sealed. Removal is permitted only inside the harness registry-rebuild context "
@@ -113,23 +114,26 @@ _SEALED_POLICIES: "_SealedNames" = _SealedNames()
 # privilege escalation regardless (a hijacked default still cannot reach
 # `_make_backend`). This is integrity hardening of the edit API, not a sandbox.
 
-_STORE_UNSEALED: bool = False
+# A ContextVar (NOT a module-global bool) so the unsealed/writable window is PRIVATE to the
+# thread/context that opened it: `parallel()` copies the context per branch, so a granted edit in one
+# branch can't clobber another branch's flag via a shared global save/restore (the concurrent-mutation
+# race). `_unsealed` is additionally parent-only (gated below); `_store_writable` is reachable from a
+# granted branch, which is exactly why it MUST be per-context.
+_STORE_UNSEALED: "ContextVar[bool]" = ContextVar("_plm_store_unsealed", default=False)
 
 
 @_contextmanager
 def _unsealed():
     """Temporarily lift default-policy protection on `_PLM_POLICIES`. HARNESS ONLY
-    (crash-restart rehydrate / test reset). Re-entrant-safe."""
-    global _STORE_UNSEALED
+    (crash-restart rehydrate / test reset). Re-entrant-safe (per-context token)."""
     # Parallel-branch gate: unsealing lifts default-policy protection on the shared store — a
     # world-level operation, parent-only (harness rehydrate/test reset run in the main thread).
     _no_branch_mutation("unsealing the policy store")
-    _prev = _STORE_UNSEALED
-    _STORE_UNSEALED = True
+    _tok = _STORE_UNSEALED.set(True)
     try:
         yield
     finally:
-        _STORE_UNSEALED = _prev
+        _STORE_UNSEALED.reset(_tok)
 
 
 # The registry (`_PLM_POLICIES`, a `_PolicyStore`) is injected into kernel `__main__`, so a cell can
@@ -139,21 +143,22 @@ def _unsealed():
 # / `.clear()` / `[...] = ...` bypasses that API (its PolicyResult, notes, guards, and the parallel
 # edit-grant model), so every `_PolicyStore` MUTATOR refuses unless this flag is set. The sanctioned
 # paths set it via `_store_writable()` for the span of their write; nothing else does. Reads are free.
-_STORE_WRITABLE: bool = False
+_STORE_WRITABLE: "ContextVar[bool]" = ContextVar("_plm_store_writable", default=False)
 
 
 @_contextmanager
 def _store_writable():
-    """Authorize DIRECT `_PLM_POLICIES` mutation for the duration. Re-entrant-safe (mirrors
-    `_unsealed`). Wraps the registry-write span of every sanctioned mutation path so cell/model code,
-    which never enters this context, cannot mutate the registry directly."""
-    global _STORE_WRITABLE
-    _prev = _STORE_WRITABLE
-    _STORE_WRITABLE = True
+    """Authorize DIRECT `_PLM_POLICIES` mutation for the duration. Re-entrant-safe, PER-CONTEXT
+    (mirrors `_unsealed`). A ContextVar — NOT a global bool — so a granted in-place edit inside a
+    `parallel()` branch (which runs in its own copied context) opens the writable window for THAT
+    branch alone; concurrent branch edits never race a shared save/restore. Wraps the registry-write
+    span of every sanctioned mutation path so cell/model code, which never enters this context,
+    cannot mutate the registry directly."""
+    _tok = _STORE_WRITABLE.set(True)
     try:
         yield
     finally:
-        _STORE_WRITABLE = _prev
+        _STORE_WRITABLE.reset(_tok)
 
 
 def _is_default(value) -> bool:
@@ -175,7 +180,7 @@ class _PolicyStore(dict):
         # Direct registry mutation is not a supported surface. The sanctioned API (`@policy` /
         # `edit_policy` / `delete_policy` / `duplicate_policy`) wraps its writes in `_store_writable()`;
         # a bare `_PLM_POLICIES.pop/clear/[..]=` from cell code does not, so it is refused LOUDLY.
-        if not _STORE_WRITABLE:
+        if not _STORE_WRITABLE.get():
             raise TypeError(
                 "_PLM_POLICIES is not directly mutable. Author a policy with `@policy`, edit one with "
                 "`edit_policy(name, ...)` or `<policy>._edit(...)`, delete one with "
@@ -183,7 +188,7 @@ class _PolicyStore(dict):
                 "(The registry changes only through that API — never a bare `_PLM_POLICIES` write.)")
 
     def _blocked(self, key) -> bool:
-        if _STORE_UNSEALED:
+        if _STORE_UNSEALED.get():
             return False
         if _is_default(dict.get(self, key)):
             from .proxy import _note                  # local import: break import cycle
@@ -222,7 +227,7 @@ class _PolicyStore(dict):
 
     def popitem(self):
         self._require_writable()
-        if _STORE_UNSEALED:
+        if _STORE_UNSEALED.get():
             return dict.popitem(self)
         for _k in reversed(list(self.keys())):        # remove the last NON-default entry
             if not _is_default(dict.get(self, _k)):
@@ -252,7 +257,7 @@ class _PolicyStore(dict):
 
     def clear(self):
         self._require_writable()
-        if _STORE_UNSEALED:
+        if _STORE_UNSEALED.get():
             dict.clear(self)
             return
         for _k in [k for k in list(self.keys()) if not _is_default(dict.get(self, k))]:

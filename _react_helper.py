@@ -37,6 +37,21 @@ def public_trajectory(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+def _readonly_messages_view(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A fully-isolated (LEAK-PROOF) snapshot of a message trajectory, for exposing as a read-only
+    live view to a sub-agent's exec scope (`react_messages` / `react_verifier_messages`): the reader
+    may read/iterate/append/edit it with ZERO effect on the real `messages` it mirrors. Deep-copies
+    per turn; a turn carrying a non-deepcopyable value falls back to a top-level dict() copy (still
+    isolates the turn) so this never raises on an exotic woven value."""
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        try:
+            out.append(copy.deepcopy(m))
+        except Exception:
+            out.append(dict(m) if isinstance(m, dict) else m)
+    return out
+
+
 # ---------- python tool-arg sanitization -----------------------------------
 
 _PYTHON_FENCE_LANGS = frozenset({"python", "py", "python3", "py3", ""})

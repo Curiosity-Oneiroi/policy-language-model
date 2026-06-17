@@ -244,6 +244,16 @@ class PLM:
 
         tools = [_tool_python()]
 
+        # Reserved-kwarg guard (mirrors react_llm / react_verifier_llm / natural_llm): the per-round
+        # call passes `messages` and `tools` explicitly, then splats **clean_generate_kwargs — so a
+        # caller-supplied `tools=`/`messages=` in generate_kwargs would collide into a cryptic
+        # `TypeError: got multiple values for keyword argument`. Reject it up front with a clear message.
+        _reserved_gk = {"messages", "tools"} & set(generate_kwargs)
+        if _reserved_gk:
+            raise ValueError(
+                f"generate_kwargs may not contain {sorted(_reserved_gk)} — PLM passes `messages` and "
+                f"`tools` itself; put backend params (temperature, max_tokens, ...) here")
+
         clean_generate_kwargs = {
             k: v for k, v in generate_kwargs.items() if k not in _INTERNAL_KWARGS
         }

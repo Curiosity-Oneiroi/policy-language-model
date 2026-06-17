@@ -71,7 +71,7 @@ _repl_ks.reset_buffers = _repl_reset_buffers
 # boot path stays pydantic-free). Done BEFORE the `_REPL_INJECTED` freeze so, when
 # present, the names join the frozen set (snapshot-skipped + shadow-protected). Sealed
 # machinery (react_llm) still lazy-imports for self-containment.
-# Crash-restart RECIPE helpers for CALL-built constraints (`Constraint.field` / `& | ^ ~`),
+# Crash-restart RECIPE helpers for CALL-built constraints (`Constraint.field`),
 # used by `_repl_collect_vars` (snapshot) + the kernel's rehydrate. `_repl_`-prefixed so
 # they're kernel-internal (snapshot-skipped, not injected as cell names). None when no
 # constraint surface is present.
@@ -80,7 +80,7 @@ _repl_constraint_from_recipe = None
 _repl_is_constraint_class = None
 try:
     from plm.constraint import (
-        Constraint, ConstraintViolation, Field, constraint, get_description, REGISTRY,
+        Constraint, ConstraintViolation, constraint, get_description, REGISTRY,
         to_recipe as _repl_constraint_to_recipe, from_recipe as _repl_constraint_from_recipe,
         is_constraint_class as _repl_is_constraint_class,
     )
@@ -151,10 +151,18 @@ def _repl_collect_vars():
     _snap = {}
     _constraint_recipes = {}
     _constraint_dropped = []                                  # names dropped at snapshot time
+    _per_var = {}                                             # name -> its OWN dill blob (per-object recovery)
+    _var_dropped = []                                         # vars that couldn't be snapshotted (named on rehydrate)
     for _k, _v in _builtins.list(_builtins.globals().items()):
         if _k in _blocked or _k.startswith(("__", "_repl", "_REPL")):
             continue
-        # A Constraint CLASS can't cross-process dill-pickle: a factory/composite FAILS
+        # A @policy CLASS that is ALSO a Constraint subclass is owned by the registry/source path
+        # below (it rehydrates from its `_p_source`); skip it here so it isn't ALSO recipe'd as a var
+        # — that would rebind __main__ to a DIFFERENT object than the registered policy.
+        if (_repl_is_constraint_class is not None and _repl_is_constraint_class(_v)
+                and _k in _PLM_POLICIES):
+            continue
+        # A Constraint CLASS can't cross-process dill-pickle: a factory FAILS
         # `dumps` (recursive self-ref), and a __main__ structural class pickles BY-REFERENCE
         # (loads fails on the fresh kernel — and would otherwise sink the WHOLE snapshot).
         # Snapshot a replayable RECIPE instead — recursive: a NESTED Constraint becomes a
@@ -183,10 +191,12 @@ def _repl_collect_vars():
         try:
             _probe = _dill.dumps(_v)
         except BaseException:                              # BaseException (not just Exception): even a
+            _var_dropped.append(_k)                        # unpicklable -> won't survive; name it on rehydrate
             continue                                       # late SIGINT must NOT make collect_vars escape
         if _builtins.len(_probe) > _REPL_VAR_SIZE_MAX:
             continue
         _snap[_k] = _v
+        _per_var[_k] = _probe                                # reuse the probe as this var's recovery blob
     # Per-entry registry snapshot. Before, `_PLM_POLICIES` was dumped as ONE value,
     # so a SINGLE unpicklable policy sank the ENTIRE registry blob — and
     # crash-restart then lost ALL authored policies AND resurrected deleted defaults
@@ -202,10 +212,22 @@ def _repl_collect_vars():
     #                   source-rebuild is the ONLY way it survives.
     _reg = {}
     _pol_sources = {}
+    _per_pol = {}                                          # name -> its OWN dill blob (by-value policies only)
     for _pn, _pol in _builtins.list(_PLM_POLICIES.items()):
+        # A Constraint-subclass policy dill-dumps BY-REFERENCE (the probe SUCCEEDS) but fails to load
+        # on a fresh kernel; like any class policy it must rehydrate from `_p_source`, NEVER by value
+        # (a by-value entry would poison the whole blob). Route it to the source path explicitly.
+        if _repl_is_constraint_class is not None and _repl_is_constraint_class(_pol):
+            _csrc = _builtins.getattr(_pol, "_p_source", None)
+            if _builtins.isinstance(_csrc, str):
+                _pol_sources[_pn] = _csrc
+            else:
+                _constraint_dropped.append(_pn)
+            continue
         try:
-            _dill.dumps(_pol)
+            _pol_blob = _dill.dumps(_pol)
             _reg[_pn] = _pol
+            _per_pol[_pn] = _pol_blob
         except BaseException:                              # BaseException: a late SIGINT here falls
             _src = _builtins.getattr(_pol, "_p_source", None)   # back to source, never escapes
             if _builtins.isinstance(_src, str):
@@ -217,10 +239,36 @@ def _repl_collect_vars():
         _snap["_CONSTRAINT_RECIPES"] = _constraint_recipes
     if _constraint_dropped:
         _snap["_CONSTRAINT_DROPPED"] = _constraint_dropped     # surfaced by the rehydrate note
+    # Per-object recovery blobs for the recipe objects (each individually pickled).
+    _per_recipe = {}
+    for _cn, _crec in _constraint_recipes.items():
+        try:
+            _per_recipe[_cn] = _dill.dumps(_crec)
+        except Exception:
+            pass
+    # HYBRID snapshot. The COMBINED blob is the fast path: ONE dill stream, so memoization keeps
+    # cross-object identity (a var aliasing a policy restores to the SAME object). The per-object
+    # blobs are the RECOVERY path: if ONE un-loadable object (a by-reference __main__ class, a foreign
+    # model, an un-rebuildable recipe) would make the combined load throw — sinking the WHOLE restore —
+    # the kernel falls back to loading each object on its own, dropping only the failures and keeping
+    # the rest. The outer wrapper holds ONLY bytes/str/list, so it can never fail to load on content.
     try:
-        return _dill.dumps(_snap)
-    except BaseException:                                  # BaseException: the final blob dump must
-        return b""                                         # return b"" (parent keeps last-good), never escape
+        _combined = _dill.dumps(_snap)
+    except BaseException:
+        _combined = b""
+    _wrapper = {
+        "_combined": _combined,
+        "vars": _per_var,
+        "policies": _per_pol,
+        "policy_sources": _pol_sources,
+        "recipes": _per_recipe,
+        "dropped": _constraint_dropped,
+        "var_dropped": _var_dropped,
+    }
+    try:
+        return _dill.dumps(_wrapper)
+    except BaseException:                                  # wrapper is bytes/str/list only -> belt-and-
+        return b""                                         # suspenders; return b"" (parent keeps last-good)
 
 
 def _rebuild_linecache_from_policies():
@@ -271,9 +319,10 @@ _REPL_INJECTED = {
 # NOTE restoring BY REFERENCE undoes a rebind but NOT an attr MUTATION (`_dill.dumps =
 # ...`) — that residual path degrades gracefully (the snapshot's own try/except drops to "no
 # snapshot this round", never corrupting state); a full fix captures the bound methods at boot.
-# EXCLUDES reseeded state like
-# `plm_messages` (a per-round list) and in-place registries (`_PLM_POLICIES`/`REGISTRY` —
-# non-callable, non-module), since restoring those to a boot value would wipe live state.
+# EXCLUDES reseeded state like `plm_messages` (a per-round list) and the in-place
+# `_PLM_POLICIES` store (non-callable, non-module), since restoring those to a boot value would
+# wipe live state. (`REGISTRY` is a read-only built-in table — the same callable/module filter
+# drops it from the canon, but it has no live state to protect either way.)
 # `_REPL`-prefixed -> not snapshotted, re-derived (fresh) each boot.
 _REPL_INJECTED_CANON = {
     _k: _v for _k in _REPL_INJECTED for _v in (globals().get(_k),)

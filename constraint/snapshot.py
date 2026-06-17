@@ -1,9 +1,9 @@
-"""Crash-restart RECIPE for constraints — `Constraint.field(...)`, `& | ^ ~`, AND
-structural `class X(Constraint)`.
+"""Crash-restart RECIPE for constraints — `Constraint.field(...)` AND structural
+`class X(Constraint)`.
 
 The kernel snapshots user variables with dill, but **no** Constraint CLASS cross-process
 dill-pickles:
-  * a factory (`Constraint.field(...)`) or composite builds a dynamic class with recursive
+  * a factory (`Constraint.field(...)`) builds a dynamic class with recursive
     self-references → dill `dumps` itself FAILS;
   * a structural `class X(Constraint)` defined in a cell is pydantic-forced to pickle
     BY-REFERENCE (`__main__.X`) → `dumps` "succeeds" but `loads` fails on the fresh kernel
@@ -13,7 +13,6 @@ So — mirroring how a CLASS POLICY survives by its `_p_source` — every Constr
 snapshotted as a small picklable RECIPE and REBUILT on rehydrate, instead of by value:
 
   * field      -> ("field", kwargs)                       -> Constraint.field(**kwargs)
-  * composite  -> ("composite", OP, [child, ...])         -> recompose with & | ^ ~
   * structural -> ("structural", name, fields, extra_anns, -> type(name, (Constraint,), ns)
                    extras, model_config, model_validators,     rebuilt from the class's FULL
                    field_validators)                           user namespace
@@ -24,13 +23,13 @@ Constraint passed as a factory kwarg — `type=list[Constraint.field(...)]`) is 
 that can't pickle, so it is stored as a NESTED recipe rather than kept live. Without this
 the inner class re-introduces exactly the unpicklable / by-reference failure the recipe
 exists to avoid (and the by-reference case would sink the whole snapshot). `_NESTED` marks
-a nested constraint; `_GENERIC` marks a generic (`Optional[X]`/`List[X]`/`Dict[K,V]`)
-wrapping one. Each structural field is stored as `(annotation-spec, metadata, field-kwargs)`
-so the Field-bound metadata + the full `_attributes_set` (always picklable) travel separately
-from the recursed annotation.
+a nested constraint; `_GENERIC` marks a generic (`List[X]`/`Dict[K,V]`) wrapping one. Each
+structural field is stored as its `annotation-spec` alone — every field is a required
+`Constraint.field(...)`, so its whole contract (type + predicates) rides in the annotation's
+embedded core schema; there is no per-field default/alias/Field-metadata to carry.
 
-A structural recipe reconstructs the class's FULL user namespace — fields (with defaults,
-Field bounds, aliases, json_schema_extra, ...), non-field annotations (ClassVars), extra
+A structural recipe reconstructs the class's FULL user namespace — fields (each a required
+`Constraint.field(...)`), non-field annotations (ClassVars), extra
 class members (methods / classmethods / staticmethods / ClassVar values), model_config, and
 the model/field validators (stored UNWRAPPED, so a `@classmethod` validator neither drags the
 old class nor binds the rebuilt validator to it). A recipe is picklable iff its inputs are
@@ -40,7 +39,7 @@ unpicklable is not — the snapshot probes + drops it, as today).
 Non-goal (out of scope, NOT a gap): a FOREIGN (non-Constraint) pydantic `BaseModel` used as
 a constraint field type — or kept as a plain top-level variable — pickles BY-REFERENCE and
 is not recipe'd, so it can't be rebuilt on a fresh kernel (a top-level one even fails the
-main blob load). The Constraint authoring surface never produces this: you compose
+main blob load). The Constraint authoring surface never produces this: you nest
 Constraints (which DO recurse here), not raw pydantic models. Recipe-channel isolation does
 not help — such a model is a live variable that sinks via the ordinary var-snapshot path
 regardless — so it is left documented rather than worked around.
@@ -50,14 +49,18 @@ from __future__ import annotations
 
 import typing
 from contextvars import ContextVar
-from typing import Annotated, Any, List, Optional, Tuple, get_args, get_origin
+from typing import Any, Optional, Tuple, get_args, get_origin
 
-_CHILD_KINDS = ("field", "composite", "structural")
 # Markers used inside an annotation-spec / factory-kwarg-spec to flag a value that is itself
 # a Constraint class (recipe'd recursively), or a generic wrapping one. Distinctive strings
 # so they can never collide with a real annotation or kwarg value.
 _NESTED = "__plm_nested_constraint_recipe__"
 _GENERIC = "__plm_generic_annotation__"
+# A field annotation (or factory-kwarg value) pointing BACK at a constraint whose recipe is still
+# building — i.e. self-/mutual recursion. Emitted INSTEAD of the live class (which can't cross-process
+# pickle and would otherwise poison the whole snapshot). On rebuild it becomes a `typing.ForwardRef`
+# that the structural `from_recipe` resolves with `model_rebuild()` once the class object exists.
+_SELF_REF = "__plm_self_ref_constraint__"
 
 # Class members the structural recipe SKIPS — pydantic internals + abc artifacts, never
 # user-authored (users can't use the reserved `model_`/`_pydantic` prefixes).
@@ -73,7 +76,7 @@ def _unbind(fn: Any) -> Any:
 
 
 def is_constraint_class(c: Any) -> bool:
-    """True iff `c` is a Constraint subCLASS (field / composite / structural) other than
+    """True iff `c` is a Constraint subCLASS (field / structural) other than
     the base itself. Such classes cannot cross-process dill-pickle, so the snapshot must
     recipe them rather than keep them by value."""
     try:
@@ -97,9 +100,13 @@ def _ann_contains_constraint(ann: Any) -> bool:
 
 def _ann_to_spec(ann: Any) -> Any:
     """A field ANNOTATION as a picklable spec: a nested Constraint class -> ("__nested__",
-    recipe); a generic wrapping one -> ("__generic__", origin, [arg-specs]); everything else
-    (plain types, generics of plain types) passes through unchanged."""
+    recipe); a generic wrapping one -> ("__generic__", origin, [arg-specs]); a back-reference to a
+    constraint whose recipe is still building (self/mutual recursion) -> ("__self_ref__", name);
+    everything else (plain types, generics of plain types) passes through unchanged."""
     if is_constraint_class(ann):
+        _ip = _RECIPE_IN_PROGRESS.get()
+        if _ip is not None and id(ann) in _ip:
+            return (_SELF_REF, ann.__name__)            # recursion: a ForwardRef on rebuild, NEVER the live class
         r = to_recipe(ann)
         return (_NESTED, r) if r is not None else ann   # un-recipe-able -> leave; dumps-probe drops
     origin = get_origin(ann)
@@ -115,6 +122,8 @@ def _spec_to_ann(spec: Any) -> Any:
     Constraints via `from_recipe`."""
     if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == _NESTED:
         return from_recipe(spec[1])
+    if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == _SELF_REF:
+        return typing.ForwardRef(spec[1])               # resolved by model_rebuild() once the class exists
     if isinstance(spec, tuple) and len(spec) == 3 and spec[0] == _GENERIC:
         _, origin, arg_specs = spec
         args = tuple(_spec_to_ann(a) for a in arg_specs)
@@ -129,6 +138,9 @@ def _value_to_spec(v: Any) -> Any:
     (e.g. `type=list[SomeStruct]`) -> ("__generic__", origin, [arg-specs]); list/tuple/dict
     containers are walked; plain values pass through."""
     if is_constraint_class(v):
+        _ip = _RECIPE_IN_PROGRESS.get()
+        if _ip is not None and id(v) in _ip:
+            return (_SELF_REF, v.__name__)
         r = to_recipe(v)
         return (_NESTED, r) if r is not None else v
     origin = get_origin(v)
@@ -149,6 +161,8 @@ def _spec_to_value(s: Any) -> Any:
     """Inverse of `_value_to_spec`."""
     if isinstance(s, tuple) and len(s) == 2 and s[0] == _NESTED:
         return from_recipe(s[1])
+    if isinstance(s, tuple) and len(s) == 2 and s[0] == _SELF_REF:
+        return typing.ForwardRef(s[1])
     if isinstance(s, tuple) and len(s) == 3 and s[0] == _GENERIC:
         _, origin, arg_specs = s
         args = tuple(_spec_to_value(a) for a in arg_specs)
@@ -205,13 +219,6 @@ def _to_recipe_build(c: Any) -> Optional[Tuple]:
     """Recipe body — always reached through the cycle-guarded public `to_recipe`."""
     if not isinstance(c, type):
         return None
-    if getattr(c, "_constraint_is_composite", False):
-        op = getattr(c, "_constraint_op_label", None)
-        children: List[Any] = []
-        for ch in getattr(c, "_constraint_children", ()):
-            r = to_recipe(ch)
-            children.append(r if r is not None else ch)   # a by-value-picklable child kept as-is
-        return ("composite", op, children)
     if getattr(c, "_constraint_is_factory", False):
         kw = getattr(c, "_constraint_factory_kwargs", None)
         if kw is None:
@@ -222,21 +229,14 @@ def _to_recipe_build(c: Any) -> Optional[Tuple]:
     if is_constraint_class(c):
         # structural subclass -> reconstruct its FULL user namespace (NOT dill / source):
         # fields + non-field annotations (ClassVars) + extra class members (methods/ClassVar
-        # values) + model_config + validators. Each field is (annotation-spec, metadata,
-        # field-kwargs):
-        #   * annotation recursed via _ann_to_spec (a Constraint-typed field -> nested recipe);
-        #   * Field-bound metadata (Gt/Le/MinLen/...) re-wrapped as Annotated on rebuild;
-        #   * `_attributes_set` is pydantic's OWN record of EVERY kwarg the author set on the
-        #     field (default, default_factory, alias(es), description, json_schema_extra,
-        #     frozen, exclude, ...) — faithful + future-proof, unlike an attribute allow-list
-        #     that grows edge cases as pydantic evolves. `annotation` is carried separately so
-        #     it is dropped here (Field() would reject it as an extra kwarg).
+        # values) + model_config + validators. Every field is a required Constraint.field(...),
+        # so its whole contract (type + predicates) lives in the annotation's embedded core
+        # schema — the struct field carries NO pydantic-Field metadata and NO `_attributes_set`
+        # (no defaults/alias/default_factory under the .field-only model). So each field is just
+        # its annotation-spec, recursed via _ann_to_spec (a Constraint-typed field -> nested recipe).
         decs = getattr(c, "__pydantic_decorators__", None)
         _vk = (set(decs.model_validators) | set(decs.field_validators)) if decs else set()
-        fields: dict = {}
-        for fname, fi in c.model_fields.items():
-            _fkw = {_ak: _av for _ak, _av in fi._attributes_set.items() if _ak != "annotation"}
-            fields[fname] = (_ann_to_spec(fi.annotation), tuple(fi.metadata), _fkw)
+        fields = {fname: _ann_to_spec(fi.annotation) for fname, fi in c.model_fields.items()}
         # Non-field annotations (ClassVars etc.) — kept so a validator/method reading a ClassVar
         # still finds it on the rebuilt class (else `cls.MAX` -> AttributeError after respawn).
         extra_anns = {_k: _ann_to_spec(_v) for _k, _v in getattr(c, "__annotations__", {}).items()
@@ -259,7 +259,7 @@ def _to_recipe_build(c: Any) -> Optional[Tuple]:
         cfg = dict(getattr(c, "model_config", None) or {})    # extra/frozen/populate_by_name/...
         # Validators: carry the pydantic decorator KEY (the namespace attr name pydantic
         # identifies the validator by), NOT func.__name__ — two validators can share a __name__
-        # (stacked `exactly_one_of` -> both `_check`; auto-merged A & B -> both `_ck`) while the
+        # (e.g. two `@model_validator`s both written as `def _check`) while the
         # source class kept them under DISTINCT keys; re-deriving from __name__ collides them
         # and silently drops one rule. And store the UNWRAPPED func (`_unbind`): a bound
         # classmethod (`@field_validator @classmethod`) would otherwise drag the whole old class
@@ -271,41 +271,34 @@ def _to_recipe_build(c: Any) -> Optional[Tuple]:
     return None
 
 
+def _spec_has_self_ref(obj: Any) -> bool:
+    """True iff a field/annotation spec tree contains a `_SELF_REF` marker (a recursive
+    back-reference). `from_recipe` uses it to decide whether to `model_rebuild()` the rebuilt class
+    so its ForwardRef self-reference resolves."""
+    if isinstance(obj, tuple):
+        if len(obj) == 2 and obj[0] == _SELF_REF:
+            return True
+        return any(_spec_has_self_ref(x) for x in obj)
+    if isinstance(obj, list):
+        return any(_spec_has_self_ref(x) for x in obj)
+    if isinstance(obj, dict):
+        return any(_spec_has_self_ref(x) for x in obj.values())
+    return False
+
+
 def from_recipe(recipe: Tuple) -> Any:
     """Rebuild a constraint from a recipe produced by `to_recipe`."""
     from plm.constraint import Constraint                  # in-call: constraint surface is optional
     kind = recipe[0]
     if kind == "field":
         return Constraint.field(**{k: _spec_to_value(v) for k, v in recipe[1].items()})
-    if kind == "composite":
-        op, child_specs = recipe[1], recipe[2]
-        children = [from_recipe(s) if (isinstance(s, tuple) and s and s[0] in _CHILD_KINDS) else s
-                    for s in child_specs]
-        if op == "NOT":
-            return ~children[0]
-        result = children[0]
-        for ch in children[1:]:
-            if op == "AND":
-                result = result & ch
-            elif op == "OR":
-                result = result | ch
-            elif op == "XOR":
-                result = result ^ ch
-            else:
-                raise ValueError(f"unknown composite op {op!r}")
-        return result
     if kind == "structural":
-        from pydantic import model_validator, field_validator, Field
+        from pydantic import model_validator, field_validator
         _, name, fields, extra_anns, extras, cfg, mvs, fvs = recipe
         annotations: dict = {}
         ns: dict = {"__module__": "__main__"}
-        for fname, (spec, meta, fkw) in fields.items():
-            ann = _spec_to_ann(spec)
-            if meta:
-                ann = Annotated[tuple([ann, *meta])]
-            annotations[fname] = ann
-            if fkw:
-                ns[fname] = Field(**fkw)            # default/default_factory/alias/description/...
+        for fname, spec in fields.items():           # each field is a required Constraint.field(...);
+            annotations[fname] = _spec_to_ann(spec)  # its whole contract is in the annotation
         for _k, _spec in extra_anns.items():        # ClassVar (and other non-field) annotations
             annotations[_k] = _spec_to_ann(_spec)
         for _k, (_kind, _val) in extras.items():    # ClassVar values, methods, class/staticmethods
@@ -318,6 +311,16 @@ def from_recipe(recipe: Tuple) -> Any:
         for key, mode, vfields, func in fvs:
             ns[key] = field_validator(*vfields, mode=mode)(func)
         new_cls = type(name, (Constraint,), ns)
+        # Self-/mutually-recursive field(s) were emitted as ForwardRefs (see `_SELF_REF`); now that the
+        # class object exists, resolve them so the recursive model is fully defined. SELF recursion
+        # resolves fully here; a MUTUAL cycle (the partner class isn't built yet) may not — model_rebuild
+        # then raises, we swallow it, and the per-recipe replay guard (kernel rehydrate) drops just THIS
+        # constraint with a note rather than poisoning the whole restore.
+        if _spec_has_self_ref(fields) or _spec_has_self_ref(extra_anns):
+            try:
+                new_cls.model_rebuild(force=True, _types_namespace={name: new_cls, "Constraint": Constraint})
+            except Exception:
+                pass
         # Re-bind any captured method's `__class__` free-var cell to the REBUILT class. A method that
         # carries such a cell (at capture time it pointed at the ORIGINAL, now-dead class) otherwise
         # raises "obj is not an instance or subtype of type" on the rebuilt instances. NOTE: a method

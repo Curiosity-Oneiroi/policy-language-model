@@ -3,59 +3,32 @@
 Items intentionally deferred (not bugs; LOW-priority niceties). Each notes why
 it was deferred and what a correct fix needs.
 
-## C25 — memoize composite constraint classes
-
-**What:** Every `A & B` / `A | B` / `A ^ B` / `~A` calls
-`_make_composite_wrapper` (`constraint/algebra.py`), which builds a brand-new
-dynamic class via `_ConstraintMeta` each time. So in a loop that re-evaluates
-`A & B` every round you churn a fresh class object per round, and
-`(A & B) is (A & B)` is False (identity/perf nicety, not a correctness hole —
-the rebuilt class validates identically).
-
-**Why deferred (not the trivial version):** the obvious fix — a module-level
-dict keyed by `(label, tuple(children))` (constraint classes are hashable by
-identity, so the key is hashable) — holds **strong refs to the children and the
-composite forever**. For the churn case that motivates the fix (composites built
-from ever-distinct transient children) that dict grows unboundedly; for the
-common case (same `A`/`B` reused each round) the key is identical so there's
-exactly one entry and *no churn to fix anyway*. A correct fix therefore needs a
-**bounded or weak** cache (LRU, or weak-valued with care around class-identity
-keys), which is more than a trivial change for a LOW-priority nicety.
-
-**If picked up:** add the cache in `_make_composite_wrapper` keyed by
-`(suffix, label, children_tuple)`; use a bounded/weak structure; add a test that
-`(A & B) is (A & B)` and that the cache doesn't retain transient children.
-
 ## C23 — auto consistency (satisfiability) check on constraint construction
 
-**What:** make `Constraint.field(...)` and composite construction (`&`/`|`/`^`/`~`)
-auto-run a fast satisfiability check and raise a new `ConstraintConsistencyError`
-when the constraint is *provably* unsatisfiable — instead of silently building a
-constraint that nothing can ever pass.
+**What:** make `Constraint.field(...)` construction auto-run a fast satisfiability check and
+raise a new `ConstraintConsistencyError` when the constraint is *provably* unsatisfiable —
+instead of silently building a constraint that nothing can ever pass (e.g. one field given both
+`int_ge=5` and `int_le=3`, or `str_length` with min > max).
 
 **Why deferred (complex, sizable, its own change):** general satisfiability is
 **undecidable** here — arbitrary Python `predicate=` / `coercer=` bodies are
 opaque, so the algo can never reason about them. It must therefore be **sound**
 (only ever raise when *provably* empty — NEVER a false positive on a predicate it
-can't see) and confine itself to the **declarative** parts of the constraint.
-That's a real, self-contained algorithm + a `ConstraintConsistencyError` type +
-auto-wiring into `of()`/algebra + a focused test matrix — too big to fold into a
-LOW-cluster pass.
+can't see) and confine itself to the **declarative** kwargs of the field. That's a
+real, self-contained algorithm + a `ConstraintConsistencyError` type + auto-wiring
+into the field builder + a focused test matrix — too big to fold into a LOW-cluster pass.
 
-**Scope when built (sound, structural-only):**
-- Numeric: `int_ge=5 & int_le=3`, `gt=5 & lt=5`, empty `*_range`.
+**Scope when built (sound, declarative-only):**
+- Numeric: `int_ge=5` with `int_le=3`, `int_gt=5` with `int_lt=5`, an empty `*_range`.
 - Length: `str_length` / `list_length` with min > max or negatives.
-- Membership: `one_of ∩ not_one_of` empties the allowed set; empty `one_of`; a
-  `one_of` value that can't match a required `str_pattern`.
-- Type: AND of incompatible `instance_of` / `kind` base types.
-- NOT/AND: `~A & A`, `not_pattern == str_pattern`.
-- Predicate / coercer nodes contribute "unknown" → never trigger a raise.
+- Membership: `not_one_of` covering every value a required `kind`/`Literal` allows; an empty
+  `Literal[...]`; a `Literal` value that can't match a required `str_pattern`.
+- Pattern: `not_pattern` equal to a required `str_pattern`.
+- Predicate / coercer kwargs contribute "unknown" → never trigger a raise.
 
-**How:** walk the constraint tree; at AND nodes intersect the declarative domains
-of children and raise if the intersection is provably empty; OR/XOR raise only if
-*every* branch is independently empty. Run automatically inside `of()` and at
-composite construction. Confirmed scope with user (sound / structural-only;
-predicates stay unchecked).
+**How:** inspect the field's declarative kwargs at build time and raise if their intersection is
+provably empty. Run automatically inside the field builder. Confirmed scope with user (sound /
+declarative-only; predicates stay unchecked).
 
 ## R6-4 — `_tool_python()` flat tool shape is rejected by Chat-Completions backends
 
@@ -117,34 +90,27 @@ leaves the single-trusted-user research setting.
 
 ## D5 — crash-restart fidelity: constraint objects (DONE) + remaining rare gaps
 
-**Constraint OBJECTS now SURVIVE crash-restart** (was a gap): a `Constraint.field(...)`, a
-composite (`& | ^ ~`), and a structural `class X(Constraint)` stored in a variable are
-snapshotted as a picklable RECIPE and rebuilt on rehydrate (`constraint/snapshot.py` —
-`to_recipe`/`from_recipe`/`is_constraint_class`), mirroring how a class POLICY survives by
-its `_p_source`. Field/composite replay their construction; structural classes reconstruct
-from `model_fields` + the validator decorators (fields, defaults, Field bounds, and model/
-field validators all preserved; arbitrary METHODS on a constraint class are not — rare).
-The recipe path is REQUIRED because no Constraint class cross-process dill-pickles (dynamic
-factory/composite classes recurse; structural pydantic classes pickle by-reference and
-would otherwise sink the whole snapshot). Verified end-to-end
+**Constraint OBJECTS now SURVIVE crash-restart** (was a gap): a `Constraint.field(...)` and a
+structural `class X(Constraint)` stored in a variable are snapshotted as a picklable RECIPE and
+rebuilt on rehydrate (`constraint/snapshot.py` — `to_recipe`/`from_recipe`/`is_constraint_class`),
+mirroring how a class POLICY survives by its `_p_source`. A field replays its construction;
+structural classes reconstruct from `model_fields` + the validator decorators (fields, defaults,
+Field bounds, and model/field validators all preserved; arbitrary METHODS on a constraint class are
+not — rare). The recipe path is REQUIRED because no Constraint class cross-process dill-pickles (a
+dynamic factory class recurses; structural pydantic classes pickle by-reference and would otherwise
+sink the whole snapshot). Verified end-to-end
 (`test_int_crash_restart_constraints_survive`).
 
 **Remaining (still deferred — rare):**
-  - constraint `kind=`s registered AT RUNTIME into the shared `REGISTRY` (a cell doing
-    `REGISTRY["x"] = pred`, NOT the built-in kinds) — the REGISTRY is rebuilt fresh on
-    respawn, so a runtime-added kind is lost. A field recipe that *uses* such a kind then
-    fails to replay (surfaced via `rehydrate_error`). (WF Corr#18)
   - live INSTANCES of a callable `@policy class` — the class SOURCE is replayed, but an
     instance a cell built and holds is gone (its depth-cap `__call__` wrap closes over a
     ContextVar, so dill can't pickle the instance). (WF Corr#17)
 
-**Status:** acceptable for research. Contract for the two remaining cases: after a respawn
-(detectable via `kernel_epoch`), re-register any runtime constraint kinds and rebuild any
-held callable-class instances.
+**Status:** acceptable for research. Contract for the remaining case: after a respawn
+(detectable via `kernel_epoch`), rebuild any held callable-class instances.
 
-**If picked up:** snapshot a replay recipe for runtime `REGISTRY` kinds (the registration
-args) + re-apply on rehydrate; for callable class instances, snapshot a construction
-recipe (class + init args) rather than the unpicklable instance.
+**If picked up:** for callable class instances, snapshot a construction recipe (class +
+init args) rather than the unpicklable instance.
 
 ## S-F9 / S-F13 — kernel↔parent IPC robustness (work today; low)
 
@@ -262,3 +228,49 @@ the real behavior.
 
 **If picked up:** boot-capture the kernel-internal module methods (dill/pickle/struct/io/linecache)
 as `_repl_`-prefixed bound references and use them throughout the snapshot + frame-I/O helpers.
+
+## NEST-IDENTITY — a nested struct is rebuilt as a DISTINCT class across crash-restart (instance-value validate path only)
+
+**What:** when a struct `Outer` references another top-level struct `Inner` (field `inner: Inner`) and
+BOTH are separate snapshot variables, crash-restart rebuilds each from its OWN recipe — so the rehydrated
+`Outer` references an `Inner` class that is a DIFFERENT object than the rehydrated top-level `Inner`. The
+dominant idiom (validating a dict/JSON — `Outer.validate({"inner": {...}})`) works: pydantic builds the
+inner from the dict. Only passing a PRE-BUILT instance of the separately-rehydrated `Inner`
+(`Outer.validate({"inner": Inner(...)})`) is rejected ("not strictly an instance of Inner").
+
+**Why deferred (rare + case-specific):** needs inner + outer BOTH as top-level vars, a crash-restart
+between define and use, AND a call passing a CONSTRUCTED instance (not a dict). A held struct INSTANCE
+var doesn't survive restart anyway, so the trigger only arises if the model freshly builds an instance
+post-crash and nests it. Same non-dedup root as C25; `describe()`/`json_schema()` (schema-based) are unaffected.
+
+**If picked up:** dedup nested recipes across the snapshot so a shared `Inner` rebuilds to ONE class (a
+recipe-id registry rehydrated once), mirroring how policies dedup by name.
+
+## OVERSIZE-VAR — an oversized snapshot var is dropped with NO rehydrate note
+
+**What:** in `_repl_collect_vars` (`repl/prefix.py`) a var whose dill-serialized form exceeds
+`_REPL_VAR_SIZE_MAX` (default 10 MiB) is `continue`d WITHOUT appending to `_var_dropped` — unlike the
+adjacent unpicklable branch — so it vanishes across respawn silently and a later cell hits a surprise
+`NameError`.
+
+**Why deferred (case-specific + documented best-effort):** normal PLM meta-reasoning never binds a single
+>10 MiB picklable module-scope global (that needs a deliberately materialized large structure); the size
+cap is intentional (`session.py:191`), and before `_var_dropped` existed ALL drops were silent.
+
+**If picked up:** append the name to `_var_dropped` in the oversized branch too (ideally noting "too
+large"), so the rehydrate note names it like the unpicklable case.
+
+## D5-MUTUAL — mutually-recursive structural constraints drop cleanly on crash-restart (self-recursion SURVIVES)
+
+**What:** a SELF-recursive `class Node(Constraint)` now survives crash-restart (the `_SELF_REF` recipe
+marker + `model_rebuild()`), and a MUTUAL cycle (`A` ↔ `B`) no longer POISONS the snapshot (its recipe
+is clean — no live class embedded), but it may not fully REBUILD (the partner class isn't defined yet
+when the first is rebuilt). In that case the per-recipe replay guard drops just that constraint with a
+`[rehydrate]` note — the rest of the session restores intact.
+
+**Why deferred (rare + accepted):** mutual structural recursion across two Constraint classes is an
+uncommon authoring shape, and the general per-object-resilient rehydrate makes it safe (drop + note,
+never catastrophic). Self-recursion — the common case — survives fully.
+
+**If picked up:** capture the whole mutual-recursion GROUP in `to_recipe` and co-rebuild both classes
+with forward refs + a single `model_rebuild()` pass over the group.

@@ -3,7 +3,7 @@
 A constraint is a **machine-checkable contract** PLM hands a sub-LLM: a value-rule or
 an object-shape that the sub-LLM's output must satisfy. It exposes three things to the
 model — `validate()` (the gate), `describe()` (the natural-language contract), and
-`json_schema()` (the formal contract) — and a small algebra (`& | ^ ~`) to compose them.
+`json_schema()` (the formal contract).
 
 > The full kwarg catalog lives in the `base.py` module docstring. This file documents
 > the **authoring surface**, the **`describe()` rendering** (and its edges), and the
@@ -29,15 +29,16 @@ generic (`list[int]`, `dict[str,int]`, `tuple[..]`, `set[int]`, `frozenset[int]`
 schema's `"type"`. Everything else (`int_range`, `str_pattern`, `is_instance_of`, …) is a
 **predicate** — a pure check that never sets a type (some enrich the schema with non-`"type"`
 keywords like `minimum`/`pattern`). A field with no `type=` is an error; the type is never
-nullable and never a `Union`/`X | Y` (use the `|` algebra across whole constraints instead).
+nullable and never a `Union`/`X | Y` (model alternatives with a `@model_validator` instead).
 
 `Constraint.field(...)` is the **single public authoring entry**. It embeds *flat* as a
 struct field (the field is the bare value, not a `{value: ..}` wrapper) and works
 standalone too. `Constraint.of(...)` is the internal engine `.field` rides on — **not**
-used outside this module. Author everything through `.field` + structural subclassing +
-the algebra; do **not** reach for plain pydantic `Field(...)`, bare `x: Annotation`
-defaults, or raw `Enum` types — the constraint mechanism covers those (`type=Literal[...]`,
-`multiple_of`, etc.) and only the constraint mechanism is rendered by `describe()`.
+used outside this module. EVERY structural field is authored through `.field` — a bare
+annotation (`x: int`, `x: Foo`, a bare nested `leg: Leg`), a raw pydantic `Field(...)`, an
+`Optional[...]`, or a default value is **rejected at class definition**. The constraint
+mechanism covers those needs (`type=Literal[...]`, `multiple_of`, nested via `type=Leg`, …),
+only the constraint mechanism is rendered by `describe()`, and every field is required.
 
 ## The `.field(**kw)` surface (full catalog in base.py docstring)
 
@@ -56,13 +57,11 @@ coercer(s)/predicate(s)/description`.
 Custom checks that no kwarg expresses → `predicate=fn` (with `description=`). Transforms →
 `coercer=fn`. Execution order: **coercer(s) → type/Field → predicate(s)**.
 
-## The algebra `& | ^ ~`
+## Several rules at once — author one constraint
 
-```
-A & B   two shapes → MERGE into one tighter shape; shape & value-rule → run-both composite
-A | B   at least one holds        A ^ B   exactly one holds
-~A      negate a value-test  (a shape has no complement → use a @model_validator)
-```
+To require several shapes/rules together, write ONE `class X(Constraint)` with all the fields
+plus a `@model_validator(mode="after")` for any cross-field or either-of rule. The single
+constraint carries the whole contract.
 
 ## `describe()` — the natural-language contract
 
@@ -72,8 +71,8 @@ For a structural constraint, `describe()` renders three parts:
 2. **One line per field** — `name (type) — <constraints>`:
    - a `.field` member shows its **complete** rule: declarative phrases + tagged
      predicates + tagged coercers + `description=` (see *tagging* below).
-   - a **nested structural** field (`leg: Leg`, or `Optional[Leg]`) is **expanded
-     inline**, indented, with a cycle guard (a self-referential type renders as its
+   - a **nested structural** field (`leg: Constraint.field(type=Leg)`) renders its type and
+     the nested contract inline, with a cycle guard (a self-referential type renders as its
      name, not infinitely).
 3. **`Additionally:`** — cross-field rules: every validator **tagged** with
    `@constraint("...")` (works in any decoration order).
@@ -106,12 +105,12 @@ Constraint.field(type=str, predicate=is_prime, coercer=slugify)
 
 ### Known limitation — collections of nested Constraints are not deep-recursed
 
-`describe()` recurses into **direct** and **`Optional[...]`** nested structural fields,
-but **not** into nested Constraints inside a *container*:
+`describe()` expands a **nested structural** field (`Constraint.field(type=Leg)`) inline,
+but does **not** expand nested Constraints inside a *container*:
 
 ```python
 class B(Constraint):
-    items: list[Item]        # describe() shows:  - items (List)   ← Item's fields NOT expanded
+    items: Constraint.field(type=list[Item])   # describe() shows: items (List) — Item's NOT expanded
 ```
 
 The element's shape *is* present in `json_schema()` (via `$defs`), just not in the NL
@@ -124,10 +123,11 @@ on a `.field` shows `list of [Item]` — the element type name, also not deep-ex
 ```python
 c.validate(value, context={...})   # → validated value, or raises ConstraintViolation
 c.describe()                       # NL contract (the channel above)
-c.json_schema()                    # formal contract — nests via $defs, carries optionality/defaults/enums
+c.json_schema()                    # formal contract — nests via $defs, carries enums + predicate bounds (minimum/pattern/…)
 ```
 
 `describe()` is the *unlimited* NL channel (predicates, coercers, cross-field rules);
-`json_schema()` is the *formal, fixed-vocabulary* channel (it does carry optionality,
-defaults, enum values, and deep-nested/collection shapes that the NL describe summarizes).
+`json_schema()` is the *formal, fixed-vocabulary* channel (every field is required + non-null, so
+it carries no defaults/optionality — it does carry enum values, predicate-derived keywords
+(minimum/pattern/…), and the deep-nested/collection shapes that the NL describe summarizes).
 The two are complementary — PLM typically hands a sub-LLM both.

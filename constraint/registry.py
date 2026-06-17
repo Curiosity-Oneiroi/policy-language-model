@@ -1,17 +1,16 @@
-"""Built-in `kind=` constraint registry — common predicates PLM would
+"""Built-in `kind=` constraint registry — common string predicates PLM would
 otherwise re-invent every call.
 
 Each entry is a plain predicate callable: takes a value, returns nothing
 on success, raises ValueError with a reason on failure.
 
-PLM (or downstream code) can extend the registry at runtime:
-
-    from plm.constraint import Constraint
-    def _smiles_check(s):
-        if rdkit.Chem.MolFromSmiles(s) is None:
-            raise ValueError("not a valid SMILES string")
-    Constraint.registry["smiles"] = _smiles_check
-    Constraint.field(type=str, kind="smiles").validate("CCO")
+The table is a FIXED set of built-ins and is READ-ONLY (a `MappingProxyType`):
+it is never mutated at runtime, so there is no shared mutable global to guard in a
+parallel() branch and nothing to lose across a crash-restart. For a check no
+built-in kind expresses, author it inline —
+`Constraint.field(type=..., predicate=fn, description="...")` — the same act with
+no global name to manage, and it survives crash-restart (the function travels with
+the constraint).
 """
 
 from __future__ import annotations
@@ -22,11 +21,10 @@ import os
 import re as _re
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Dict
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 from uuid import UUID
-
-from plm._branch_state import _no_branch_mutation   # stdlib-only leaf; parallel-branch mutation gate
 
 
 def _semver(s: Any) -> None:
@@ -104,42 +102,10 @@ def _path_exists(s: Any) -> None:
         raise ValueError(f"path_exists: {s!r} does not exist")
 
 
-class _GatedRegistry(dict):
-    """The `kind=` predicate registry, aliased as `Constraint.registry`. Reads use the C dict fast
-    path (unchanged); every WRITE is refused inside a parallel() branch — registering a custom kind
-    mutates a shared, process-global table that no single branch owns, so it is parent-only. The
-    initial built-ins below load via `dict(...)` (C-level, bypasses these), not `__setitem__`."""
-
-    def __setitem__(self, key, value):
-        _no_branch_mutation("registering a Constraint kind (Constraint.registry write)")
-        super().__setitem__(key, value)
-
-    def __delitem__(self, key):
-        _no_branch_mutation("removing a Constraint kind (Constraint.registry write)")
-        super().__delitem__(key)
-
-    def update(self, *a, **k):
-        _no_branch_mutation("updating Constraint.registry")
-        super().update(*a, **k)
-
-    def setdefault(self, *a, **k):
-        _no_branch_mutation("Constraint.registry.setdefault")
-        return super().setdefault(*a, **k)
-
-    def pop(self, *a, **k):
-        _no_branch_mutation("Constraint.registry.pop")
-        return super().pop(*a, **k)
-
-    def popitem(self):
-        _no_branch_mutation("Constraint.registry.popitem")
-        return super().popitem()
-
-    def clear(self):
-        _no_branch_mutation("clearing Constraint.registry")
-        super().clear()
-
-
-REGISTRY: Dict[str, Callable[[Any], None]] = _GatedRegistry({
+# READ-ONLY: a MappingProxyType over the fixed built-ins. Reads use the dict fast path; there is no
+# write surface, so the shared table is never mutated at runtime — no parallel()-branch race to gate
+# and no runtime-registered kind to lose across a crash-restart. Custom checks go through predicate=fn.
+REGISTRY: Mapping[str, Callable[[Any], None]] = MappingProxyType({
     "semver": _semver,
     "url": _url,
     "json": _json_str,

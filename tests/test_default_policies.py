@@ -420,7 +420,7 @@ def test_8_natural_llm_constraint_passes(defaults_installed, stub_backend):
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 42}')]
     nl = _PLM_POLICIES["natural_llm"]
@@ -493,7 +493,7 @@ def test_9_natural_llm_retry_then_pass(defaults_installed, stub_backend):
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [
         make_text('"not-an-int"'),
@@ -516,7 +516,7 @@ def test_10_natural_llm_budget_exhausted(defaults_installed, stub_backend):
     from plm.constraint import Constraint, ConstraintViolation
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('"bad"') for _ in range(20)]
     nl = _PLM_POLICIES["natural_llm"]
@@ -560,7 +560,7 @@ def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backe
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 7}')]
     nl = _PLM_POLICIES["natural_llm"]
@@ -577,38 +577,22 @@ def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backe
     assert "properties" in rf["json_schema"]["schema"] or "value" in str(rf["json_schema"]["schema"])
 
 
-def test_10d_natural_llm_composite_constraint_works(defaults_installed, stub_backend):
-    """A composite constraint (`A & B`) is schema-expressible (allOf), so
-    natural_llm accepts it and sends the merged schema as response_format."""
+def test_natural_llm_kind_constraint_response_format(defaults_installed, stub_backend):
+    """(Gap 2b) natural_llm builds response_format from a kind= constraint's json_schema (the built-in
+    kind resolves through the read-only registry) and validates the result end-to-end — post the
+    registry-freeze. Confirms the kind= path works through the single-shot policy."""
     from plm.constraint import Constraint
 
-    class HasName(Constraint):
-        name: str
+    class Acct(Constraint):
+        email: Constraint.field(type=str, kind="email")
 
-    class HasAge(Constraint):
-        age: int
-
-    Both = HasName & HasAge
-    # Composite is NOT a factory.
-    assert getattr(Both, "_constraint_is_factory", False) is False
-
-    stub_backend.script = [make_text('{"name": "alice", "age": 30}')]
+    stub_backend.script = [make_text('{"email": "a@b.co"}')]
     nl = _PLM_POLICIES["natural_llm"]
-    # The composite's json_schema produces allOf — natural_llm sends it as response_format.
-    # Validate must succeed against the merged schema.
-    try:
-        nl("?", constraint=Both)
-    except Exception as e:
-        # If pydantic can't validate the composite due to ConstraintMeta complexities,
-        # at least confirm the schema WAS sent (the main assertion of this test).
-        pass
-    sent_kw = stub_backend.calls[0]["kw"]
-    rf = sent_kw.get("response_format")
-    assert rf is not None
-    assert rf["type"] == "json_schema"
-    # The merged schema has either allOf or properties from the composite.
-    schema_str = json.dumps(rf["json_schema"]["schema"]) if isinstance(rf["json_schema"]["schema"], dict) else str(rf["json_schema"]["schema"])
-    assert "allOf" in schema_str or "name" in schema_str
+    out = nl("?", constraint=Acct)
+    assert out.email == "a@b.co"                                  # the kind= constraint validated the output
+    rf = stub_backend.calls[0]["kw"].get("response_format")
+    assert rf is not None and rf["json_schema"]["name"] == "answer"
+    assert "email" in str(rf["json_schema"]["schema"])           # the kind= constraint's schema reached the backend
 
 
 def test_10e_natural_llm_retries_on_non_violation_error(defaults_installed, stub_backend):
@@ -619,7 +603,7 @@ def test_10e_natural_llm_retries_on_non_violation_error(defaults_installed, stub
     from plm.constraint import Constraint, constraint
 
     class C(Constraint):
-        v: int = 0
+        v: Constraint.field(type=int)
         @model_validator(mode="after")
         @constraint("v must be non-zero")            # described -> passes natural_llm's gate
         def _chk(self):
@@ -640,7 +624,7 @@ def test_10f_natural_llm_budget_none_uses_default(defaults_installed, stub_backe
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 7}')]
     nl = _PLM_POLICIES["natural_llm"]
@@ -653,7 +637,7 @@ def test_10g_natural_llm_strips_fenced_json(defaults_installed, stub_backend):
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('```json\n{"value": 7}\n```')]
     nl = _PLM_POLICIES["natural_llm"]
@@ -670,7 +654,7 @@ def test_10h_natural_llm_exhaustion_raises_constraint_violation(defaults_install
     from plm.constraint import Constraint, ConstraintViolation, constraint
 
     class C(Constraint):
-        v: int = 0
+        v: Constraint.field(type=int)
         @model_validator(mode="after")
         @constraint("v always rejected (test)")     # described -> passes natural_llm's gate
         def _chk(self):
@@ -733,7 +717,7 @@ def test_10j_natural_llm_rejects_reserved_generate_kwargs(defaults_installed, st
     nl = _PLM_POLICIES["natural_llm"]
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
     with pytest.raises(ValueError, match="response_format"):
         nl("?", constraint=IntC, generate_kwargs={"response_format": {"x": 1}})
     with pytest.raises(ValueError, match="messages"):
@@ -748,7 +732,7 @@ def test_10k_natural_llm_retries_weave_into_caller_list(defaults_installed, stub
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
     msgs = [{"role": "user", "content": "give an int"}]
     stub_backend.script = [make_text('"bad"'), make_text('{"value": 7}')]
     nl = _PLM_POLICIES["natural_llm"]
@@ -1221,7 +1205,7 @@ def test_14b_constraint_validates_inside_exec(defaults_installed, stub_backend):
     from plm.constraint import Constraint
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     validate_calls = []
     original_validate = IntC.validate
@@ -1253,7 +1237,7 @@ def test_14c_budget_exhausted_with_constraint(defaults_installed, stub_backend):
     from plm.constraint import Constraint, ConstraintViolation
 
     class IntC(Constraint):
-        value: int
+        value: Constraint.field(type=int)
 
     stub_backend.script = [
         make_python_call("RETURN('bad')") for _ in range(20)
@@ -2007,9 +1991,9 @@ def test_d1_sealed_namespace_blocks_kernel_reach_but_RETURN_identical():
 
 def test_exec_ns_traceback_rebind_proof_and_interrupts_propagate():
     """Batch 2: exec_ns captures the traceback even when the code rebinds `sys.stderr`
-    (K-F1 — written straight to the buffer), strips its own exec frame, and
-    RE-RAISES KeyboardInterrupt/SystemExit/GeneratorExit instead of swallowing them
-    (K-F9/R-F7)."""
+    (K-F1 — written straight to the buffer), strips its own exec frame, RE-RAISES ONLY the operator's
+    KeyboardInterrupt, and CAPTURES a sub-agent's SystemExit/GeneratorExit instead of letting it crash
+    the loop (K-F9/R-F7)."""
     from plm.repl.exec_ns import exec_ns
 
     # K-F1: a cell rebinding sys.stderr can't make the traceback vanish.
@@ -2017,11 +2001,16 @@ def test_exec_ns_traceback_rebind_proof_and_interrupts_propagate():
     assert "ZeroDivisionError" in out and term is None
     # K-F6: the exec_ns frame is stripped (model sees only its own <slot> source).
     assert "exec(compile(" not in out and ", in exec_ns" not in out
-    # K-F9/R-F7: control exceptions PROPAGATE (so a Ctrl-C / deliberate exit interrupts).
-    with pytest.raises(SystemExit):
-        exec_ns("raise SystemExit(3)", {})
+    # K-F9/R-F7: ONLY the operator's KeyboardInterrupt propagates (a genuine Ctrl-C must interrupt).
     with pytest.raises(KeyboardInterrupt):
         exec_ns("raise KeyboardInterrupt", {})
+    # SystemExit / GeneratorExit are NOT operator signals — a sub-agent's `raise SystemExit` / exit()
+    # is CAPTURED like any error (fed back so the model self-corrects), never sailing past the loop's
+    # `except Exception` to crash the run.
+    out_se, term_se, _ = exec_ns("raise SystemExit(3)", {})
+    assert "SystemExit" in out_se and term_se is None
+    out_ge, term_ge, _ = exec_ns("raise GeneratorExit", {})
+    assert "GeneratorExit" in out_ge and term_ge is None
 
 
 def test_sealed_sub_llm_cannot_escape_or_hang_via_interactive_builtins():
@@ -2473,26 +2462,6 @@ def test_validate_helper_surfaces_non_cv_error():
     assert ok is False and ("boom" in msg or "TypeError" in msg)
 
 
-def test_natural_llm_rejects_composite_hiding_factory(defaults_installed, stub_backend):
-    """natural_llm rejects a factory hidden inside a composite (finding #5), before
-    any generate — not just a directly-factory constraint."""
-    from plm.constraint import Constraint
-
-    class HasName(Constraint):
-        name: str
-    Pred = Constraint.field(type=object, predicate=lambda v: None)   # a factory (Python predicate)
-    nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(TypeError):
-        nl("make a person", constraint=(HasName & Pred))
-    assert stub_backend.calls == []                      # rejected before any generate
-    # a purely-structural composite is still accepted (reaches generate)
-    class HasAge(Constraint):
-        age: int
-    stub_backend.script = [make_text('{"name":"a","age":1}')]
-    nl("make a person", constraint=(HasName & HasAge))
-    assert len(stub_backend.calls) == 1
-
-
 def test_base_verifier_passes_trajectory_copy(defaults_installed, stub_backend):
     """U04: the verification circuit gets a COPY of the trajectory; mutating it
     cannot corrupt the agent's real messages."""
@@ -2598,3 +2567,42 @@ def test_react_llm_message_weaving_caller_sees_conversation(defaults_installed, 
     # a str input has no caller list to weave into (builds a fresh one) — nothing leaks back
     stub_backend.script = [make_python_call("RETURN('ok')")]
     assert rl("just a string") == "ok"
+
+
+def test_react_llm_expose_messages_read_only_live_view(defaults_installed, stub_backend):
+    """expose_messages=True binds a leak-proof read-only live view `react_messages` in the sub-LLM's
+    exec scope: the model reads its CURRENT trajectory (incl. its own latest turn), and ANY write —
+    append OR an in-place turn edit — is fully isolated, so the caller's real message list is never
+    corrupted. Off by default (nothing added to the exec scope)."""
+    rl = _PLM_POLICIES["react_llm"]
+    code = (
+        "react_messages.append({'role': 'STRAY', 'content': 'x'})\n"   # append -> must NOT leak
+        "react_messages[0]['content'] = 'HACKED'\n"                     # in-place edit -> must NOT leak
+        "RETURN([m['role'] for m in react_messages])")
+    stub_backend.script = [make_python_call(code)]
+    convo = [{"role": "user", "content": "do the task"}]
+    seen = rl(convo, expose_messages=True)
+    assert seen[0] == "user" and "assistant" in seen            # saw the current trajectory incl. its own turn
+    assert "STRAY" not in [m.get("role") for m in convo]        # append did NOT leak into the caller's list
+    assert convo[0]["content"] == "do the task"                 # in-place edit did NOT leak — still original
+
+    # off by default: react_messages is NOT bound in the exec scope
+    stub_backend.script = [make_python_call("RETURN('react_messages' in dir())")]
+    assert rl("hi") is False
+
+
+def test_react_verifier_llm_expose_messages_read_only_live_view(defaults_installed, stub_backend):
+    """react_verifier_llm exposes the SAME leak-proof read-only live view, bound as
+    `react_verifier_messages` (the binding is in the verifier-loop code path and independent of the
+    `verifier` hook — verifier=None here)."""
+    rl = _PLM_POLICIES["react_verifier_llm"]
+    code = (
+        "react_verifier_messages.append({'role': 'STRAY', 'content': 'x'})\n"
+        "react_verifier_messages[0]['content'] = 'HACKED'\n"
+        "RETURN([m['role'] for m in react_verifier_messages])")
+    stub_backend.script = [make_python_call(code)]
+    convo = [{"role": "user", "content": "do the task"}]
+    seen = rl(convo, expose_messages=True)
+    assert seen[0] == "user" and "assistant" in seen           # saw the current trajectory
+    assert "STRAY" not in [m.get("role") for m in convo]       # append did NOT leak
+    assert convo[0]["content"] == "do the task"                # in-place edit did NOT leak

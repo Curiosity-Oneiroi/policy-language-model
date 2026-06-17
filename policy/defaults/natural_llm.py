@@ -15,19 +15,17 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
 
         # Constraint-validated structured output (recommended pattern):
         class Sum(Constraint):
-            value: int
+            value: Constraint.field(type=int)
         result = natural_llm("Compute 2+2", constraint=Sum)
         # -> Sum(value=4)   (a validated Constraint instance)
         # access the structured value: result.value -> 4
 
-        # Composite constraints (& | ^ ~) work — schema is the merged
-        # allOf/anyOf/oneOf/not form:
-        class HasName(Constraint):
-            name: str
-        class HasAge(Constraint):
-            age: int
-        person = natural_llm("Make up a person", constraint=HasName & HasAge)
-        # -> a Constraint instance satisfying both schemas
+        # Several fields/rules at once -> author ONE constraint with all of them:
+        class Person(Constraint):
+            name: Constraint.field(type=str)
+            age:  Constraint.field(type=int)
+        person = natural_llm("Make up a person", constraint=Person)
+        # -> a Person instance satisfying the schema
 
         # Retry budget (defaults to 5):
         result = natural_llm(msgs, constraint=Sum, return_budget=3)
@@ -68,7 +66,7 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
         - With no constraint: the model's `content` as a str.
         - With a constraint: the validated Constraint instance. The
           structured value is on the instance — e.g. `result.value` for
-          `class Sum(Constraint): value: int`, or `result.name` /
+          `class Sum(Constraint): value: Constraint.field(type=int)`, or `result.name` /
           `result.age` for a multi-field structural class.
 
     Raises:
@@ -132,21 +130,21 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
             check_depth_or_raise()                         # policy owns the depth gate
             return _content(backend.generate(msgs, **generate_kwargs))
 
-        # Shape guard: `constraint` must actually be a Constraint (class or
-        # composite). Otherwise json_schema()/validate() below would raise a raw
+        # Shape guard: `constraint` must actually be a Constraint (a struct class or a
+        # Constraint.field(...)). Otherwise json_schema()/validate() below would raise a raw
         # AttributeError; fail fast with a clear message instead.
         if not callable(getattr(constraint, "json_schema", None)):
             raise TypeError(
-                "natural_llm: `constraint` must be a Constraint class or composite "
+                "natural_llm: `constraint` must be a Constraint class or Constraint.field(...) "
                 f"(it needs json_schema()/validate()); got {constraint!r}"
             )
 
         # COMMUNICABILITY GATE: natural_llm steers a single-shot model with the schema (the SHAPE)
         # + describe() (the rules, IN WORDS). A check it cannot state in words is invisible to the
         # model — it can only fail it. So reject up front iff ANY user predicate / coercer /
-        # @model_validator anywhere in the tree (composites + struct fields + generic elements) has
-        # NO description. Built-in refinements (int_range/str_pattern/...) and framework validators
-        # (exactly_one_of) auto-describe, so they pass. A DESCRIBED predicate/coercer/validator is
+        # @model_validator anywhere in it (struct fields + type= generic elements) has
+        # NO description. Built-in refinements (int_range/str_pattern/...) auto-describe, so they
+        # pass. A DESCRIBED predicate/coercer/validator is
         # fine — the model is told about it and can comply (and validate+retry gates it). This is a
         # natural_llm-only rule; the general constraint mechanism does NOT require descriptions.
         if not _all_checks_described(constraint):

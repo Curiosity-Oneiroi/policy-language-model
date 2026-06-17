@@ -16,10 +16,9 @@ It carries the two mechanisms that make a `parallel()` branch safe (see the desi
 
   * MUTATION GATES (closes the concurrent policy-world mutation hazards, "H2-H5"). A branch may
     edit a policy ONLY via an explicit, exclusive grant (`with_edit`), and only an IN-PLACE body
-    edit. Structural / by-name / authoring ops (rename, remove, duplicate, `@policy`, unseal,
-    `Constraint.registry` writes) are refused inside a branch — they change the shared registry
-    membership / global namespace, which no single branch owns. Capability-security: the edit
-    capability is HANDED IN, never ambient.
+    edit. Structural / by-name / authoring ops (rename, remove, duplicate, `@policy`, unseal) are
+    refused inside a branch — they change the shared registry membership / global namespace, which
+    no single branch owns. Capability-security: the edit capability is HANDED IN, never ambient.
 """
 
 from __future__ import annotations
@@ -96,7 +95,11 @@ def set_main_streams(out, err):
 # (B) Mutation-capability gates
 # --------------------------------------------------------------------------------------------
 _IN_PARALLEL_BRANCH: ContextVar = ContextVar("_plm_in_parallel_branch", default=False)
-# frozenset of id(policy) THIS branch may edit in place (granted via `with_edit`).
+# frozenset of policy NAMES this branch may edit (granted via `with_edit`). Keyed by NAME, NOT
+# id(policy): a STRUCTURAL class edit replaces the class OBJECT (a fresh id) under the SAME name, so an
+# id-keyed grant would self-invalidate after the swap — a granted branch could edit its policy only
+# until its first structural edit. The name is stable (renames are parent-only), so a name-keyed grant
+# survives the swap, letting a granted branch fully edit ITS policy (in-place AND structural).
 _BRANCH_EDIT_GRANTS: ContextVar = ContextVar("_plm_branch_edit_grants", default=frozenset())
 
 
@@ -105,9 +108,12 @@ def _policy_label(target):
 
 
 def _edit_guard(target):
-    """Gate an IN-PLACE policy edit (proxy `_rewrite` / `_rewrite_class_policy`). Outside a branch:
-    no-op. Inside a branch: allowed ONLY if `target` was granted to THIS branch via `with_edit`."""
-    if _IN_PARALLEL_BRANCH.get() and id(target) not in _BRANCH_EDIT_GRANTS.get():
+    """Gate an in-place OR structural policy edit (proxy `_rewrite` / `_rewrite_class_policy`). Outside
+    a branch: no-op. Inside a branch: allowed ONLY if `target`'s NAME was granted to THIS branch via
+    `with_edit`. A granted policy is that branch's ALONE, so it may edit it freely — including a
+    structural class replacement, whose registry write is per-context-authorized via `_store_writable`
+    (a ContextVar) and so cannot race a sibling branch."""
+    if _IN_PARALLEL_BRANCH.get() and _policy_label(target) not in _BRANCH_EDIT_GRANTS.get():
         name = _policy_label(target)
         raise ParallelMutationError(
             f"cannot edit policy {name!r} inside a parallel() branch: it was not granted to this "
@@ -130,8 +136,8 @@ def _rename_guard(target, new_name):
 
 def _no_branch_mutation(op, *, hint=""):
     """Gate a STRUCTURAL / by-name / authoring op (remove, `@policy`, duplicate, by-name edit,
-    unseal, `Constraint.registry` write). These change the policy SET or the global namespace, which
-    no single branch owns — always refused inside a branch."""
+    unseal). These change the policy SET or the global namespace, which no single branch owns —
+    always refused inside a branch."""
     if _IN_PARALLEL_BRANCH.get():
         msg = (f"{op} is not allowed inside a parallel() branch — it changes shared "
                f"registry/namespace state. Do it in the main loop.")

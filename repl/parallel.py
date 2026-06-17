@@ -17,6 +17,7 @@ from plm._branch_state import (
     _BRANCH_EDIT_GRANTS,
     _EditGrant,
     _IN_PARALLEL_BRANCH,
+    _policy_label,
     ParallelMutationError,
     with_edit,
 )
@@ -100,23 +101,23 @@ def parallel(*tasks, max_workers=None):
     # branch may edit a policy only if granted, and a given policy may be granted to AT MOST ONE
     # branch. A second grant of the same policy is a contract breach raised HERE, by parallel()
     # itself (not inside a branch), so PLM gets it directly rather than in a result slot.
-    _plan = []                                         # [(zero-arg callable, frozenset(id(policy))), ...]
-    _granted = {}                                      # id(policy) -> policy (for a clear dup message)
+    _plan = []                                         # [(zero-arg callable, frozenset(policy-name)), ...]
+    _granted = {}                                      # policy-name -> policy (for a clear dup message)
     for _t in tasks:
         if isinstance(_t, _EditGrant):
-            _ids = set()
+            _names = set()
             for _p in _t.policies:
-                _pid = id(_p)
-                if _pid in _ids:
+                _pname = _policy_label(_p)                # grants keyed by NAME (survives a structural
+                if _pname in _names:                      # recreate's id swap; see _branch_state._edit_guard)
                     continue                              # N1: same policy listed twice in ONE grant
                                                           # (with_edit(task, p, p)) -> harmless, dedup
-                if _pid in _granted:                      # already granted to ANOTHER branch -> the real breach
+                if _pname in _granted:                    # already granted to ANOTHER branch -> the real breach
                     raise ParallelMutationError(
-                        f"policy {getattr(_p, '_p_name', '?')!r} is granted to more than one "
+                        f"policy {_pname!r} is granted to more than one "
                         f"parallel() branch; at most ONE branch may edit a given policy.")
-                _granted[_pid] = _p
-                _ids.add(_pid)
-            _plan.append((_t.task, frozenset(_ids)))
+                _granted[_pname] = _p
+                _names.add(_pname)
+            _plan.append((_t.task, frozenset(_names)))
         elif callable(_t):
             _plan.append((_t, frozenset()))
         else:
@@ -178,6 +179,13 @@ def parallel(*tasks, max_workers=None):
                     for (_fn, _g) in _plan]
             return await asyncio.gather(*futs, return_exceptions=True)   # belt-and-suspenders
         finally:
-            pool.shutdown(wait=False)
+            # wait=True: BLOCK until in-flight branches settle before returning. A cell-timeout SIGINT
+            # raises KeyboardInterrupt in the MAIN thread (here, inside asyncio.run) — never in a worker,
+            # and a Python thread can't be force-cancelled — so wait=False would let branches keep running
+            # DETACHED: the post-cell snapshot would capture half-finished state, and a leaked branch
+            # (still carrying its edit-grant context) would mutate into the NEXT cell. Waiting guarantees
+            # no branch outlives parallel()'s return on ANY path. (Branches are the cell's OWN subtasks,
+            # so blocking for them is correct; a true force-kill is only the process-level respawn.)
+            pool.shutdown(wait=True)
 
     return asyncio.run(_all())

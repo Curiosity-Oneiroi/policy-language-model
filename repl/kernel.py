@@ -14,6 +14,7 @@ from __future__ import annotations
 
 KERNEL_BOOTSTRAP = r'''
 import builtins as _builtins
+import copy as _repl_copy
 import os as _repl_os, struct as _repl_struct, pickle as _repl_pickle, socket as _repl_socket
 
 # Parent-death detector (Linux): if the parent dies abruptly, deliver SIGTERM so this
@@ -163,16 +164,71 @@ while True:
         _repl_rehydrate_error = None
         try:
             _repl_blob = _repl_req.get("vars_blob") or b""
-            # Single-blob: dill memoization preserves identity across all refs.
-            # blob may be b"" (a collect that bailed) -> nothing to restore, and
-            # _dill.loads(b"") would raise.
-            _repl_restored = _dill.loads(_repl_blob) if _repl_blob else {}
+            # HYBRID restore. The snapshot is a wrapper: a COMBINED blob (fast path — dill memoization
+            # preserves cross-object identity, e.g. a var aliasing a policy restores to the SAME object)
+            # PLUS per-object blobs (recovery). The wrapper holds only bytes/str/list, so it always
+            # loads. Try the combined blob; if ONE un-loadable object would sink the WHOLE restore (a
+            # by-reference __main__ class, a foreign model, an un-rebuildable recipe), fall back to
+            # loading each object on its own — drop only the failures, keep the rest. `_repl_restored`
+            # ends up _snap-shaped either way, so the apply logic below is unchanged.
+            _repl_wrapper = _dill.loads(_repl_blob) if _repl_blob else {}
+            _repl_dropped_load = []
+            if _builtins.isinstance(_repl_wrapper, dict) and "_combined" in _repl_wrapper:
+                try:
+                    _repl_restored = _dill.loads(_repl_wrapper.get("_combined") or b"")
+                except BaseException as _repl_combined_exc:
+                    # Combined blob poisoned by some un-loadable object -> recover each object alone.
+                    _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                        "[rehydrate] combined snapshot could not load ("
+                        + _repl_clip(_builtins.repr(_repl_combined_exc))
+                        + "); recovering objects individually. ")
+                    _repl_restored = {}
+                    _repl_reg2 = {}
+                    _repl_rec2 = {}
+                    _repl_psrc2 = _repl_wrapper.get("policy_sources") or {}
+                    for _repl_vn, _repl_vb in (_repl_wrapper.get("vars") or {}).items():
+                        try:
+                            _repl_restored[_repl_vn] = _dill.loads(_repl_vb)
+                        except BaseException:
+                            _repl_dropped_load.append("var " + _repl_vn)
+                    for _repl_pn2, _repl_pb in (_repl_wrapper.get("policies") or {}).items():
+                        try:
+                            _repl_reg2[_repl_pn2] = _dill.loads(_repl_pb)
+                        except BaseException:
+                            if _repl_pn2 not in _repl_psrc2:           # a source fallback may still cover it
+                                _repl_dropped_load.append("policy " + _repl_pn2)
+                    for _repl_rn, _repl_rb in (_repl_wrapper.get("recipes") or {}).items():
+                        try:
+                            _repl_rec2[_repl_rn] = _dill.loads(_repl_rb)
+                        except BaseException:
+                            _repl_dropped_load.append("constraint " + _repl_rn)
+                    _repl_restored["_PLM_POLICIES"] = _repl_reg2
+                    _repl_restored["_PLM_POLICY_SOURCES"] = _repl_psrc2
+                    _repl_restored["_CONSTRAINT_RECIPES"] = _repl_rec2
+                    _repl_restored["_CONSTRAINT_DROPPED"] = _repl_wrapper.get("dropped") or []
+            else:
+                # Empty / legacy / foreign shape -> treat directly (back-compat: b"" -> {}).
+                _repl_restored = _repl_wrapper if _builtins.isinstance(_repl_wrapper, dict) else {}
+            if _repl_dropped_load:
+                _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                    "[rehydrate] " + _builtins.str(_builtins.len(_repl_dropped_load))
+                    + " object(s) failed to load and were DROPPED (everything else was restored): "
+                    + _repl_clip("; ".join(_builtins.sorted(_repl_dropped_load))) + ". ")
+            # Vars that couldn't be SNAPSHOTTED at all (unpicklable -> dropped at dump time) are named
+            # here too, so a vanished variable is never silent.
+            _repl_var_dropped = ((_repl_wrapper.get("var_dropped") or [])
+                                 if _builtins.isinstance(_repl_wrapper, dict) else [])
+            if _repl_var_dropped:
+                _repl_rehydrate_error = (_repl_rehydrate_error or "") + (
+                    "[rehydrate] " + _builtins.str(_builtins.len(_repl_var_dropped))
+                    + " variable(s) could not be snapshotted (unpicklable), so they did NOT survive "
+                    + "restart: " + _repl_clip(_builtins.sorted(_repl_var_dropped)) + ". ")
 
             # Pop the source-fallback registry (policies that couldn't snapshot by
             # value — e.g. class policies) BEFORE globals().update so it never leaks
             # into __main__; it's re-installed from source after the reconcile.
             _repl_pol_sources = _repl_restored.pop("_PLM_POLICY_SOURCES", None) or {}
-            # CALL-built constraints (Constraint.field / & | ^ ~) that couldn't dill-pickle
+            # CALL-built constraints (Constraint.field) that couldn't dill-pickle
             # were snapshotted as RECIPES — popped here so they don't reach globals().update;
             # replayed back into __main__ after the reconcile (mirrors the policy-source path).
             _repl_constraint_recipes = _repl_restored.pop("_CONSTRAINT_RECIPES", None) or {}
@@ -351,19 +407,24 @@ while True:
 
     # `plm_messages` (the root's own trajectory) arrives ADDITIVELY: the parent
     # appends only the messages new since the last cell. We extend a hidden
-    # accumulator and rebind the PUBLIC `plm_messages` to a fresh shallow copy of
-    # it, so a cell mutating `plm_messages` (append/clear/reassign) can't corrupt
-    # the accumulation. After a respawn the parent resends the full trajectory
-    # (the accumulator is empty here), so this stays correct across crash-restart.
+    # accumulator and rebind the PUBLIC `plm_messages` to a fresh DEEP copy of it,
+    # so a cell mutating `plm_messages` — append/clear/reassign OR editing a turn
+    # in place — can't corrupt the accumulation (LEAK-PROOF). After a respawn the
+    # parent resends the full trajectory (the accumulator is empty here), so this
+    # stays correct across crash-restart.
     _repl_pm_delta = _repl_req.get("plm_messages_delta")
     if _repl_pm_delta is not None:
         _repl_plm_messages.extend(_repl_pm_delta)
     # Reseed the PUBLIC list from the hidden accumulator EVERY cell. The accumulator is
     # the single source of truth — fed by the delta channel (additive) and by a
-    # `plm_messages` seed above (replace) — so a seeded/delta'd trajectory persists to
-    # later no-input cells, while a cell mutating the public list (append/clear/reassign)
-    # can't corrupt the accumulation OR persist a stray rebind into the next cell.
-    _repl_g["plm_messages"] = _builtins.list(_repl_plm_messages)
+    # `plm_messages` seed above (replace). A DEEP copy makes the public view leak-proof:
+    # no cell mutation (list-level OR an in-place turn edit) reaches the accumulator, and
+    # no stray rebind persists into the next cell. Robust: fall back to a shallow list if a
+    # woven turn can't deepcopy, so the reseed never crashes a cell.
+    try:
+        _repl_g["plm_messages"] = _repl_copy.deepcopy(_repl_plm_messages)
+    except _builtins.Exception:
+        _repl_g["plm_messages"] = _builtins.list(_repl_plm_messages)
 
     # Guard A: reject a static rebind of a registered policy name BEFORE exec.
     # Pass the immutable-names subset so the audit can produce immutable-specific
@@ -483,7 +544,8 @@ while True:
     if _repl_reverted:
         _repl_stderr_buf.write(
             "\n[repl guard] kernel-injected name(s) reverted: "
-            + ", ".join(sorted(_repl_reverted))
+            + ", ".join(_builtins.sorted(_repl_reverted))   # _builtins.: a cell var named `sorted` must
+                                                            # not break the loop (all-builtins-via-_builtins)
             + " — granted helpers; rebinding them is reverted each cell.\n"
         )
 

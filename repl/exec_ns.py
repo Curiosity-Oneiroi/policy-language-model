@@ -121,8 +121,9 @@ def exec_ns(
         a CALLER's surrounding try/except is for ITS OWN orchestration (fence-strip,
         depth descend, ...), NOT for the run's code errors — those already sit inside
         `output`. A `SyntaxError` from `compile` and any ordinary exception are
-        captured; `KeyboardInterrupt`/`SystemExit`/`GeneratorExit` are RE-RAISED so an
-        operator Ctrl-C (or a deliberate exit) can actually interrupt the loop. The
+        captured; only `KeyboardInterrupt` (the operator's Ctrl-C) is RE-RAISED so a genuine
+        interrupt can actually stop the loop — `SystemExit`/`GeneratorExit` (which only a cell's own
+        `raise`/`exit()` produces here) are CAPTURED like any error, never crashing the run. The
         `exec_ns` frame is stripped from captured tracebacks.
       * ``term`` / ``val`` — set only when `code` raises the REPL RETURN sentinel
         (``_REPLReturn``, matched BY NAME like the kernel loop, so no import coupling):
@@ -161,8 +162,9 @@ def exec_ns(
                     term, val = (
                         on_return(proposed) if on_return is not None else ("return", proposed)
                     )
-                elif isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-                    raise                               # operator/runtime control — NEVER swallow; a Ctrl-C must interrupt (K-F9/R-F7)
+                elif isinstance(e, KeyboardInterrupt):
+                    raise   # ONLY the operator's Ctrl-C (SIGINT) is re-raised —
+                            # a genuine interrupt MUST propagate.
                 else:
                     # Write the traceback STRAIGHT to buf_e: a cell rebinding `sys.stderr`
                     # defeats redirect_stderr, so `print_exc()` could vanish — formatting to

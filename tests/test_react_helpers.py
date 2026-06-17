@@ -199,7 +199,7 @@ def test_build_last_round_reminder_with_constraint_includes_describe():
     the reminder so the model sees the contract it must satisfy."""
 
     class Ans(Constraint):
-        x: int
+        x: Constraint.field(type=int)
 
     msg = _build_last_round_reminder(Ans)
     assert msg["role"] == "user"
@@ -231,7 +231,7 @@ def test_format_constraint_error_includes_violation_text_and_required():
     so the model can see what failed AND what to satisfy."""
 
     class Ans(Constraint):
-        x: int
+        x: Constraint.field(type=int)
 
     try:
         Ans.validate({"x": "not an int"})
