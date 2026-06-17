@@ -2,13 +2,14 @@
 
 PLM authors constraints two ways:
 
-  Pattern 1 — Structural (subclass): an object SHAPE with named fields.
+  Pattern 1 — Structural (subclass): an object SHAPE — EVERY field a Constraint.field(...).
       class HypothesisReduction(Constraint):
-          facts: list[str]
-          ambiguities: list[str]
-          hypotheses: dict[str, list[str]]
-      # per-field value rules → Constraint.field(...) (below); cross-field
-      # invariants → @model_validator(mode="after").
+          facts:       Constraint.field(type=list[str])
+          ambiguities: Constraint.field(type=list[str])
+          hypotheses:  Constraint.field(type=dict[str, list[str]])
+      # every field is a REQUIRED Constraint.field(...); cross-field invariants →
+      # @model_validator(mode="after"). Bare annotations / Optional / defaults are
+      # rejected at class definition.
 
   Pattern 2 — Value / field rule:  Constraint.field(**kw)
       The single public authoring entry for a value rule. It works BOTH standalone
@@ -99,7 +100,6 @@ Both patterns expose the same API on the class:
   .validate(value, *, context=None) -> value
   .describe() -> str
   .json_schema() -> dict
-  &, |, ~, ^                       (class-level via metaclass)
 
 Built on pydantic v2.
 """
@@ -141,7 +141,7 @@ class ConstraintViolation(ValueError):
 
 
 # ============================================================================
-# Metaclass — class-level operator composition
+# Metaclass — field-authoring guard (every field a required Constraint.field) + super() rejection
 # ============================================================================
 
 
@@ -225,14 +225,15 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
                 )
 
         # FIELD-AUTHORING GUARD: every field of a STRUCTURAL constraint must be authored through
-        # `Constraint.field(...)` — the single, elegant authoring path. A bare annotation (`x: int`,
-        # `x: Foo`, a bare nested `leg: Leg`), a raw pydantic `Field(...)`, an `Optional[...]`, or a
-        # default value is rejected at DEFINITION. A `.field`-built class carries `_constraint_is_factory`,
-        # so a field whose RESOLVED annotation has that marker is the only accepted shape — everything
-        # else is a bare annotation. Factory classes are exempt (their own `value` field is the engine's
-        # internal annotation, not user authoring). `model_fields[name].annotation` is the resolved
-        # object (works under `from __future__ import annotations`), and a forward-ref recursion field
-        # `Constraint.field(type=list["X"])` still presents as a factory field here, so recursion passes.
+        # `Constraint.field(...)` AND be REQUIRED — the single, elegant authoring path, enforced by TWO
+        # checks: (1) SHAPE — a bare annotation (`x: int`, `x: Foo`, a bare nested `leg: Leg`) or a raw
+        # pydantic `Field(...)` is rejected; only a `.field`-built annotation (carrying
+        # `_constraint_is_factory`) is accepted. (2) REQUIRED — a default / default_factory makes a
+        # `.field` omittable (`= 3` keeps the factory annotation but yields a non-required field), which
+        # the strict model forbids, so reject any non-required field too. Factory classes are exempt
+        # (their own `value` field is the engine's internal annotation). `model_fields[name].annotation`
+        # is the resolved object (works under `from __future__ import annotations`), and a forward-ref
+        # recursion field `Constraint.field(type=list["X"])` still presents as a required factory field.
         if not getattr(cls, "_constraint_is_factory", False):
             for _fname, _finfo in getattr(cls, "model_fields", {}).items():
                 if not getattr(_finfo.annotation, "_constraint_is_factory", False):
@@ -243,6 +244,12 @@ class _ConstraintMeta(_PydanticMeta):  # type: ignore[misc, valid-type]
                         f"Constraint, Optional, defaults, and raw pydantic Field(...) are not supported "
                         f"(every field is a required Constraint.field; nest via type=YourStruct, "
                         f"recurse via type=list[\"YourClass\"])."
+                    )
+                if not _finfo.is_required():
+                    raise TypeError(
+                        f"Constraint {cls.__name__!r}: field {_fname!r} has a default — every field is a "
+                        f"REQUIRED Constraint.field(...). A default value or default_factory makes a field "
+                        f"omittable, which the strict .field-only model does not support; drop the default."
                     )
 
 

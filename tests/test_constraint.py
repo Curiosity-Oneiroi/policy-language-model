@@ -1917,9 +1917,11 @@ def test_structural_json_schema_airtight_for_arbitrary_field():
 
 
 def test_structural_fields_must_be_dot_field_not_bare():
-    """(B) The .field-only authoring rule is ENFORCED at class definition: a bare primitive,
-    a bare arbitrary class, and a bare nested Constraint are each rejected with a clear TypeError
-    naming the field. An all-.field struct (incl. a nested struct via type=) builds + validates."""
+    """(B) The .field-only authoring rule is ENFORCED at class definition: a bare primitive, a bare
+    arbitrary class, a bare nested Constraint, AND a .field carrying a default (or default_factory)
+    are each rejected with a clear TypeError naming the field — every field is a REQUIRED
+    Constraint.field. An all-.field struct (incl. a nested struct via type=) builds + validates."""
+    from pydantic import Field as _PydField
     class Leg(Constraint):
         qty: Constraint.field(type=int)
     class Foo:
@@ -1934,8 +1936,14 @@ def test_structural_fields_must_be_dot_field_not_bare():
     with pytest.raises(TypeError, match="Constraint.field"):
         class _Nest(Constraint):
             leg: Leg                                   # bare nested Constraint -> must be type=Leg
+    with pytest.raises(TypeError, match="default"):
+        class _Def(Constraint):
+            v: Constraint.field(type=int) = 3          # .field WITH a default -> non-required -> rejected
+    with pytest.raises(TypeError, match="default"):
+        class _Fac(Constraint):
+            tags: Constraint.field(type=list[int]) = _PydField(default_factory=list)   # default_factory too
 
-    # the one elegant way: every field a .field (nested via type=), and it validates
+    # the one elegant way: every field a REQUIRED .field (nested via type=), and it validates
     class Order(Constraint):
         side: Constraint.field(type=str)
         leg:  Constraint.field(type=Leg)

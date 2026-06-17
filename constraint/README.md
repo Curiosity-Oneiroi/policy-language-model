@@ -55,7 +55,7 @@ kind="email|url|uuid|semver|iso_date|identifier|json|regex|path_exists" (needs t
 coercer(s)/predicate(s)/description`.
 
 Custom checks that no kwarg expresses → `predicate=fn` (with `description=`). Transforms →
-`coercer=fn`. Execution order: **coercer(s) → type/Field → predicate(s)**.
+`coercer=fn`. Execution order: **coercer(s) → type coercer → predicate(s)**.
 
 ## Several rules at once — author one constraint
 
