@@ -144,15 +144,15 @@ while True:
     except EOFError:
         break
     except KeyboardInterrupt:
-        # A late SIGINT can land HERE, on the idle top-level read: the parent
-        # sends SIGINT on a clean-boundary cell timeout, but if the cell's exec
-        # had ALREADY finished and written its result frame (which the parent's
-        # grace-read then consumed), the signal arrives while we're blocked
-        # waiting for the NEXT frame. Swallow it and re-enter the read — letting
-        # it propagate would hit the outer boot_error wrapper, poison the stream
-        # with a spurious boot_error, kill the kernel, and silently drop the next
-        # cell. The cell that the SIGINT was meant to interrupt already completed
-        # and reported, so there is nothing to abort.
+        # DEFENSIVE BACKSTOP — under the normal invariant this cannot fire. SIGINT is armed
+        # (-> KeyboardInterrupt) ONLY around the cell-body exec in KERNEL_LOOP and disarmed the
+        # instant it returns; everywhere else, including THIS idle top-level read, SIGINT is
+        # SIG_IGN'd kernel-wide (see KERNEL_BOOTSTRAP), so a stray/late timeout SIGINT here is
+        # simply ignored and never raises. This handler is kept only for the off-nominal case
+        # where an arm/disarm somehow left SIGINT armed across the idle read: swallow + re-enter
+        # rather than let it propagate to the outer boot_error wrapper (which would poison the
+        # stream, kill the kernel, and silently drop the next cell). The cell a stray SIGINT was
+        # meant for has already completed and reported, so there is nothing to abort.
         continue
 
     _repl_etype = _repl_req.get("type")

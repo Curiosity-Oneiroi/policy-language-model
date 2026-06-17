@@ -274,3 +274,110 @@ never catastrophic). Self-recursion — the common case — survives fully.
 
 **If picked up:** capture the whole mutual-recursion GROUP in `to_recipe` and co-rebuild both classes
 with forward refs + a single `model_rebuild()` pass over the group.
+
+## Deferred sweep findings (2026-06-17 reconciliation) — LOW / by-design / off-path
+
+A two-pass sweep (full enumeration in the workspace: `../plm_sweep_report.md`) was reconciled against
+this `main` after the type=/algebra-drop landing. The items below are confirmed-present but
+intentionally deferred (low impact, off the active path, by-design tightness, or a documented
+contract). Fixed in the same pass (not listed here): SD1 (a timeout is now labeled "timed out", no
+spurious RE-RUN), SD4 (a slow-dying kernel is reaped by a daemon — no zombie), R3 (`executed` is
+always on the cell envelope), SD7 (idle-read SIGINT comment corrected). CD3/CD5 are subsumed by
+**C23** (satisfiability) above.
+
+**constraint (`constraint/base.py`, `registry.py`)**
+- **C4** — `_interpret_kwargs` never asserts it consumed all kwargs at the end; it relies entirely on
+  the `_KNOWN_KWARGS` front gate. A user can't trigger it (the gate rejects typos), but a maintainer
+  who adds a name to `_KNOWN_KWARGS` and forgets its handler ships a SILENT no-op (the kwarg is
+  accepted and ignored, no error). Fix: `if kwargs: raise RuntimeError(f"unhandled kwargs {sorted(kwargs)}")`
+  at the end of `_interpret_kwargs`, so a half-added kwarg fails loudly in tests.
+- **CD4** — `sorted=`/`monotonic=` on a `set`/`frozenset` type validate the set's arbitrary hash
+  order (meaningless). Fix: reject these kwargs on unordered types.
+- **C5** — `list_contains` and `str_contains` render the identical describe phrase "contains X" for
+  element vs substring. Fix: distinguish the wording.
+- **C6** — `subset_of`/`superset_of` give a generic "could not evaluate" message on a non-iterable
+  and emit no schema hint.
+- **C7** — single `predicate=` describe wording ("1 predicate(s) checked") is a separate bucket from
+  the plural untagged count; cosmetic.
+- **C9** — a struct-typed field is built-from-dict (lenient pydantic), diverging from
+  `is_instance_of`'s strict isinstance. Arguably intended pydantic semantics.
+- **CD9** — `kind="semver"` regex accepts leading zeros (`01.2.3`) and rejects build metadata
+  (`1.2.3+build`). Fix: tighten the regex to the SemVer spec.
+
+**repl (`repl/session.py`, `prefix.py`, `kernel.py`)**
+- **R1** — `cached_vars_blob` is refreshed on EVERY completed cell incl. one that errored, so a
+  half-mutated-then-errored cell becomes the crash-restart baseline. Fix: only refresh on a clean
+  cell. (Note: SD1's fix now distinguishes a graceful timeout — state preserved live — from a
+  crash/respawn; DOC-NR3-1's "re-run on timeout" applies to the hard-timeout/crash path only.)
+- **R2** — the kernel keeps the trajectory in a HIDDEN accumulator `_repl_plm_messages` (source of
+  truth; the parent's deltas `.extend()` it) and reseeds the PUBLIC `plm_messages` each cell as a deep
+  copy of it. The public list is leak-proof, but the accumulator is NOT: it's `_repl_`-prefixed
+  (excluded from the snapshot AND the Guard C+ canon) and unsealed, and the kernel reads it as a bare
+  `__main__` global. A cell doing `_repl_plm_messages = []` / `.clear()` wipes the trajectory for the
+  rest of the session (every later cell deep-copies the corrupted accumulator). LOW (needs a write to
+  an obvious kernel-internal name; cell-trust==parent-trust). Fix: add `_repl_plm_messages` to the
+  Guard C+ canon, or move the accumulator into the `_kernel_state` side-module out of cell reach.
+- **SD3** — the rehydrate handshake reuses the 30s cold-boot deadline despite unbounded
+  re-exec/recipe work, so a large session can false-fail and lose ALL state. Fix: a separate,
+  work-scaled rehydrate budget.
+- **R4** — a mutable extra policy can pre-empt a sealed-extra of the same NAME (installed first),
+  leaving it mutable; reachable only via raw `_PLM_*_POLICIES` env vars (the `PLMMetaParameters` API
+  rejects cross-bucket names). Fix: install sealed extras first / refuse the collision loudly.
+- **R5** — a kernel boot hang is resolvable only by the 30s handshake timeout, never SIGINT
+  (kernel-wide SIG_IGN). Accepted consequence.
+- **R6** — `_REPL_INJECTED_CANON` only covers callables/modules, so a rebind of a non-callable
+  injected singleton (e.g. the constraint `REGISTRY`) isn't Guard-C+-reverted.
+- **SD5** — kernel pre-exec setup (buffer reset, seed bind, Guard A audit + imports) is billed
+  against `cell_timeout`, so a timeout during setup is reported as if the cell ran.
+- **SD6** — `_read_exact` can busy-spin on a large frame trickling in near the deadline (unbuffered
+  chunk reads under select). Latent (real frames are tiny); BufferedReader is the S-F13 direction.
+
+**policy (`policy/...`, `policy/defaults/...`)**
+- **P2** — `_PolicyStore.popitem`/`clear` silently skip default policies with no `[policy]` note
+  (unlike `pop`/`del`). Fix: emit the note.
+- **P5** — rename/`duplicate_policy` refuse a `new_name` colliding with ANY `__main__` var (incl. a
+  transient one), not just policies/kernel-internals. Over-broad.
+- **P7** — `_install_policy_source` re-execs `@policy class` bodies (bootstrap + duplicate) — third
+  surface of **Corr#4** (keep class bodies side-effect-free).
+- **P8** — `base_verifier` silently no-ops a broken proposer (swallowed). Fix: surface a
+  verifier-channel note.
+- **P9** — `natural_llm` gives the model BOTH the JSON schema and an NL contract from `describe()`;
+  if `describe()` is empty or raises, it proceeds with the schema ONLY and emits NO warning, so the
+  NL steering vanishes silently (worse outputs / more retries, no signal). Fix: log a one-liner when
+  the produced steering is empty. (Rare — a structural constraint's `describe()` isn't normally empty.)
+- **PD2** — a sealed policy's dunder metadata (`__name__`/`__doc__`/`update_wrapper`) is still
+  writable, so introspection can lie even though behavior is locked. Narrow the claim or freeze.
+- **PD3** — `_PolicyStore.setdefault` (a conditional WRITE — inserts `key` if absent) checks the
+  writable-context flag but bypasses the seal/default-protection (`_blocked`) that every other mutator
+  (`__setitem__`/`pop`/`popitem`/`clear`/`update`/`__ior__`) routes through. Benign today (used only in
+  sanctioned paths, only creates new keys) but the one write surface with a different gate. Fix: route
+  `setdefault` through `__setitem__` so there is a single guarded write path.
+- **PD4** — react bodies `raise ConstraintViolation` via a `__main__` global only present if the
+  constraint import succeeded; on a degraded kernel that path raises `NameError`. Fix: import it.
+- **PD5** — `_SyncBackend.generate` uses `asyncio.run` per call with no guard/doc against a granted
+  callable already inside an event loop.
+- **P4** — (borderline; user sees no real problem) `_compute_insert` reports empty content as
+  NO_MATCH "empty content", conflating no-op with bad-arg + a redundant double-validate. Likely a
+  non-issue; tracked for completeness.
+
+**model_backend (off the active OpenAI-Responses path)**
+- **M2** — Chat-Completions forces `temperature=1` for reasoning models (gpt-5 /chat 400). **M5** —
+  Anthropic `json.loads(args)` crashes on one bad prior tool_call. **M6** — Anthropic `tc["id"]`
+  KeyError on an id-less call. **M3/M4/M7/M8** — token-floor / reasoning-effort-echo /
+  usage-floor-order / join-vs-`output_text` inconsistencies. All latent: PLM runs reasoning models on
+  the Responses API and ~never uses Anthropic. Fix if/when those backends go active (M5/M6 are
+  one-line guards).
+
+**core (`plm.py`, `_react_helper.py`, `plm_tools.py`)**
+- **CO1** — `chat_template_kwargs={'enable_thinking':True}` is dropped by the OpenAI allowlists
+  (vLLM-only) → no-op on the primary path.
+- **CO2** — the last-round reminder fires `return_budget` rounds early ("final round" while several
+  remain).
+- **CO3** — `_tool_python` flat Responses tool shape (by-design on the active path; see **R6-4**).
+- **CO4** — the internal last-round reminder text leaks into the kernel `plm_messages` view (benign).
+- **CO5** — `_format_repl_output` would raise on a truthy non-string section (unreachable today).
+- **CO6** — `metrics.model_calls`/`tool_calls` are lists, but the docstring implies scalar counts.
+- **CO7** — `main_turns` is tracked in two places, reconciled only at return.
+- **CO8** — `return_budget` is not a reserved RETURN window — just extra rounds appended to the loop.
+- **CO9** — no-progress rounds (text-only / malformed args) silently burn budget with no early-abort
+  or distinct failure signal.

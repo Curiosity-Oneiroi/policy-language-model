@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import ast
 
-from .registry import _SEALED_POLICIES, _MISSING, _PLM_POLICIES, _store_writable
+from .registry import _is_default, _MISSING, _PLM_POLICIES, _store_writable
 
 
 def _names_in_target(target):
@@ -219,10 +219,13 @@ def _post_cell_guard(cell_globals, stderr_buf):
         if binding is canonical:
             continue                            # OK
         if binding is _MISSING:
-            if name in _SEALED_POLICIES:
-                # Immutable policy was dynamically del'd / popped from __main__.
-                # Restore the binding from the registry (which `_sync` never
-                # evicted for immutable names).
+            if _is_default(canonical):
+                # Immutable/default policy was dynamically del'd / popped from __main__.
+                # Restore the binding from the registry (which `_sync` never evicted for
+                # immutable names). Anchored on `_is_default(canonical)` — the SAME identity
+                # check the store mutators use (`_blocked`/`popitem`/`clear`), NOT a bare
+                # `name in _SEALED_POLICIES` — so the guard's restore-vs-cleanup decision can
+                # never disagree with whether the store will actually let the entry be popped.
                 cell_globals[name] = canonical
                 stderr_buf.write(
                     f"\n[policy guard] {name!r} is immutable; deletion reverted "
@@ -236,7 +239,7 @@ def _post_cell_guard(cell_globals, stderr_buf):
         cell_globals[name] = canonical          # rebound -> restore + note
         tail = (
             f"It is immutable; use `duplicate_policy({name!r}, '<new_name>')` to fork."
-            if name in _SEALED_POLICIES else
+            if _is_default(canonical) else
             f"Use {name}._rewrite(...) to edit or `del {name}`/{name}._remove() to remove."
         )
         stderr_buf.write(

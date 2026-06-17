@@ -304,7 +304,7 @@ class PythonReplSession:
         plm_messages_delta: list | None = None,
     ) -> dict[str, Any]:
         """Run one cell; return an envelope:
-            {type: 'result'|'return', return_obj, stdout, stderr}.
+            {type: 'result'|'return', return_obj, executed, stdout, stderr}.
 
         ``seed`` (optional): a ``{name: object}`` dict bound into the kernel's
         ``__main__`` before this cell runs — a general per-round injection
@@ -341,6 +341,11 @@ class PythonReplSession:
             _pre += f"[rehydrate after respawn: {self.last_rehydrate_error}]\n"
             self.last_rehydrate_error = None
 
+        # becomes True only when a clean-boundary timeout's graceful SIGINT succeeded and
+        # we read the kernel's interrupted-result frame cleanly (the kernel SURVIVED). Used at the
+        # return below to label the result a timeout — WITHOUT the crash-restart RE-RUN note.
+        _interrupted = False
+
         with self._io_lock:
             try:
                 self._write_frame({"type": "code", "code": code, "seed": seed,
@@ -366,6 +371,7 @@ class PythonReplSession:
                     if self._proc is not None:
                         self._proc.send_signal(signal.SIGINT)
                     envelope = self._read_frame_with_timeout(self._sigint_grace)
+                    _interrupted = True          # grace read OK: this cell was interrupted by the timeout
                 except (_CellTimeout, _FrameDecodeError, EOFError, BrokenPipeError, struct.error):
                     self._kill_and_respawn()
                     return self._respawn_result(
@@ -394,6 +400,17 @@ class PythonReplSession:
         # `_pre` carries any pending boot/rehydrate diagnostics captured at the
         # top (surfaced once, on whatever path we return through).
         stderr_text = _pre + (envelope.get("stderr") or "")
+        if _interrupted:
+            # a clean-boundary timeout whose graceful SIGINT succeeded — the kernel caught
+            # it and shipped a (result) frame we read cleanly. Label it a TIMEOUT, but do NOT add
+            # the crash-restart "RE-RUN" note: the kernel SURVIVED, so this cell's partial effects
+            # remain live in the kernel (state was NOT rolled back). `executed=False` below is the
+            # structured signal that it did not complete normally.
+            etype = "result"
+            stderr_text = (
+                f"[cell timed out after {self._cell_timeout}s and was interrupted — its partial "
+                f"effects remain in the live kernel (state was NOT rolled back)]\n" + stderr_text
+            )
         if etype == "return":
             blob = envelope.get("return_blob")
             if blob is None:
@@ -409,6 +426,10 @@ class PythonReplSession:
         return {
             "type": etype,
             "return_obj": return_obj,
+            # ALWAYS present now (was omitted on the success path). True = completed normally;
+            # False on a graceful timeout-interrupt (above). The respawn paths use _respawn_result,
+            # which already sets executed=False + a RE-RUN note.
+            "executed": not _interrupted,
             "stdout": envelope.get("stdout") or "",
             "stderr": stderr_text,
         }
@@ -609,11 +630,24 @@ class PythonReplSession:
                 os.killpg(self._proc.pid, signal.SIGKILL)
             with suppress(ProcessLookupError, OSError):
                 self._proc.kill()                          # fallback if it wasn't a group leader
-            with suppress(subprocess.TimeoutExpired):
+            try:
                 self._proc.wait(timeout=_REAP_WAIT)
-        # This proc is no longer our live child (killed/reaped, or already dead);
-        # clear the pid box so the finalizer can't SIGKILL a recycled PID. The
-        # next _spawn_kernel resets the box to the fresh child's pid.
+            except subprocess.TimeoutExpired:
+                # a SLOW death (e.g. uninterruptible D-state I/O). Nulling the pid box below
+                # and walking away would leak a PERMANENT zombie — the finalizer can't reap it
+                # (and mustn't target the pid once it's recycled). Don't block the caller either:
+                # hand the still-dying child to a detached daemon that BLOCKS on wait() until it
+                # finally dies and reaps it. A zombie's pid isn't recycled before it's reaped, so
+                # the pid stays uniquely ours until that wait() returns — no recycle race — which
+                # is what makes nulling the box below safe.
+                _dying = self._proc
+                def _reap_dying(_p=_dying):
+                    with suppress(Exception):
+                        _p.wait()
+                threading.Thread(target=_reap_dying, name="plm-kernel-reaper", daemon=True).start()
+        # This proc is no longer our live child (killed/reaped, or handed to the reaper daemon
+        # above); clear the pid box so the finalizer can't SIGKILL a recycled PID. The next
+        # _spawn_kernel resets the box to the fresh child's pid.
         self._child_pid_box[0] = None
         self._close_pipes()
 
