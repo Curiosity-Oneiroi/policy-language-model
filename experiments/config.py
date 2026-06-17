@@ -24,8 +24,10 @@ BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "SlateBackend": {
         "module": "plm.model_backend.slate_backend", "cls": "SlateBackend",
-        "env_key": "SLATE_API_KEY", "default_model": "anthropic/claude-haiku-4.5",
-        "base_url": True,
+        # default mode is "search" (only Slate mode that obeys a caller system prompt); it pairs
+        # with gpt-5.3-codex / claude-haiku-4.5, NOT opus. Endpoint fixed/`SLATE_URL`-env.
+        "env_key": "SLATE_API_KEY", "default_model": "openai/gpt-5.3-codex",
+        "base_url": False,
     },
     "VLLMBackend": {
         "module": "plm.model_backend.vllm_backend", "cls": "VLLMBackend",
