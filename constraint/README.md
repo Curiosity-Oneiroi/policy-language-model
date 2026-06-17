@@ -115,8 +115,7 @@ class B(Constraint):
 
 The element's shape *is* present in `json_schema()` (via `$defs`), just not in the NL
 `describe()`. If a collection element's contract must appear in the NL contract, describe
-the element type separately, or rely on `json_schema()` for that field. (`list_of=Item`
-on a `.field` shows `list of [Item]` — the element type name, also not deep-expanded.)
+the element type separately, or rely on `json_schema()` for that field.
 
 ## Operations
 
