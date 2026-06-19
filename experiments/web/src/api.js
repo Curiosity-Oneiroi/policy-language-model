@@ -31,6 +31,12 @@ export const api = {
   createRun: (spec) => req("/runs", { method: "POST", body: JSON.stringify(spec) }),
   stopRun: (id) => req("/runs/" + id + "/stop", { method: "POST" }),
   game: (id, simIdx, gameId) => req(`/runs/${id}/games/${simIdx}/${gameId}`),
+  recipes: () => req("/recipes"),
+  candidates: (runId) => req(`/runs/${runId}/candidates`),
+  candidate: (runId, cid) => req(`/runs/${runId}/candidates/${cid}`),
+  candidateGames: (runId, cid) => req(`/runs/${runId}/candidates/${cid}/games`),
+  candidateGame: (runId, cid, simIdx, gameId) =>
+    req(`/runs/${runId}/candidates/${cid}/games/${simIdx}/${gameId}`),
 };
 
 // Poll a fetcher every `ms` (and immediately). Returns {data, error, refresh}.

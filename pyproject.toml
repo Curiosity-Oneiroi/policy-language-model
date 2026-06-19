@@ -11,6 +11,9 @@ dependencies = [
     "anthropic",
     "requests",
     "typing-extensions",
+    "gepa==0.1.1",        # real GEPA engine the optimizer drives (pinned to the tested version)
+    "fastapi",            # experiments webapp backend
+    "uvicorn",            # experiments webapp server
 ]
 
 [build-system]
@@ -32,6 +35,8 @@ packages = [
     "plm.policy",
     "plm.policy.defaults",
     "plm.repl",
+    "plm.optimizer",      # the multi-recipe optimizer (drives real gepa)
+    "plm.experiments",    # the experiments webapp backend (single + optimization runs)
 ]
 
 [dependency-groups]

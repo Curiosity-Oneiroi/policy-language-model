@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { api, usePoll, fmt } from "./api.js";
-import { go, StatusTag } from "./ui.jsx";
+import { go, StatusTag, KindBadge } from "./ui.jsx";
 import Create from "./Create.jsx";
 import RunDetail from "./RunDetail.jsx";
+import OptimizationDetail from "./OptimizationDetail.jsx";
 import Compare from "./Compare.jsx";
 
 function useHashRoute() {
@@ -29,22 +30,37 @@ function ExperimentsList() {
       {error && <div className="tag error">{error}</div>}
       {runs && runs.length === 0 && <div className="muted">No runs yet — create one.</div>}
       <div className="grid">
-        {(runs || []).map((r) => (
-          <div key={r.run_id} className="card click" onClick={() => go("#/run/" + r.run_id)}>
-            <div className="spread">
-              <strong>{r.label || r.run_id}</strong>
-              <StatusTag status={r.live ? "running" : r.status} />
+        {(runs || []).map((r) => {
+          const opt = r.kind === "optimization";
+          const dest = opt ? "#/opt/" + r.run_id : "#/run/" + r.run_id;
+          return (
+            <div key={r.run_id} className="card click" onClick={() => go(dest)}>
+              <div className="spread">
+                <strong>{r.label || r.run_id}</strong>
+                <div className="row" style={{ gap: 6 }}>
+                  <KindBadge kind={r.kind} />
+                  <StatusTag status={r.live ? "running" : r.status} />
+                </div>
+              </div>
+              <div className="small muted mono" style={{ margin: "6px 0" }}>
+                {opt ? (r.recipe || "—") : r.metaparam} · {r.backend?.name} · {r.backend?.model || ""}
+              </div>
+              {opt ? (
+                <table className="kv"><tbody>
+                  <tr><td>candidates</td><td>{fmt(r.num_candidates)}</td></tr>
+                  <tr><td>best scalar</td><td>{fmt(r.best_scalar)}</td></tr>
+                  <tr><td>best Elo</td><td>{fmt(r.best_elo)}</td></tr>
+                </tbody></table>
+              ) : (
+                <table className="kv"><tbody>
+                  <tr><td>simulates</td><td>{r.num_simulates}</td></tr>
+                  <tr><td>latest score</td><td>{fmt(r.latest_score)}</td></tr>
+                  <tr><td>est. Elo</td><td>{fmt(r.latest_elo)}</td></tr>
+                </tbody></table>
+              )}
             </div>
-            <div className="small muted mono" style={{ margin: "6px 0" }}>
-              {r.metaparam} · {r.backend?.name} · {r.backend?.model || ""}
-            </div>
-            <table className="kv"><tbody>
-              <tr><td>simulates</td><td>{r.num_simulates}</td></tr>
-              <tr><td>latest score</td><td>{fmt(r.latest_score)}</td></tr>
-              <tr><td>est. Elo</td><td>{fmt(r.latest_elo)}</td></tr>
-            </tbody></table>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -100,6 +116,7 @@ export default function App() {
   const hash = useHashRoute();
   let view;
   if (hash.startsWith("#/new")) view = <Create />;
+  else if (hash.startsWith("#/opt/")) view = <OptimizationDetail id={decodeURIComponent(hash.slice(6))} />;
   else if (hash.startsWith("#/run/")) view = <RunDetail id={decodeURIComponent(hash.slice(6))} />;
   else if (hash.startsWith("#/settings")) view = <Settings />;
   else if (hash.startsWith("#/compare")) view = <Compare />;

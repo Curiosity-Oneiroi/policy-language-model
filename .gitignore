@@ -15,3 +15,6 @@ experiments/web/dist/
 # experiments runtime data (workspace venv pool + run artifacts), if pointed inside the repo
 experiments_data/
 node_modules/
+
+# scratch / throwaway test + dry-run artifacts (never commit)
+.sweep_scratch/

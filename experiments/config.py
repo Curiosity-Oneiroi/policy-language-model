@@ -24,9 +24,11 @@ BACKENDS: Dict[str, Dict[str, Any]] = {
     },
     "SlateBackend": {
         "module": "plm.model_backend.slate_backend", "cls": "SlateBackend",
-        # default mode is "search" (only Slate mode that obeys a caller system prompt); it pairs
-        # with gpt-5.3-codex / claude-haiku-4.5, NOT opus. Endpoint fixed/`SLATE_URL`-env.
-        "env_key": "SLATE_API_KEY", "default_model": "openai/gpt-5.3-codex",
+        # opus-4.8 is the meta-reasoner of choice; SlateBackend auto-selects behavior_mode
+        # "subagent" for opus (the agent modes are the only ones that serve it) and drives it
+        # via the environmental REPL framing so it adopts the PLM persona. gpt-5.3-codex /
+        # claude-haiku-4.5 fall back to "search". Endpoint fixed/`SLATE_URL`-env.
+        "env_key": "SLATE_API_KEY", "default_model": "anthropic/claude-opus-4.8",
         "base_url": False,
     },
     "VLLMBackend": {

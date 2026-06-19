@@ -68,6 +68,7 @@ class PLMMetaParameters:
     system_prompt: str
     extra_policies: dict[str, str] | None = None         # mutable + duplicable (normal)
     sealed_policies: dict[str, str] | None = None        # immutable + un-duplicable (sealed, NOT blessed)
+    verifier: str | None = None
 
     def __post_init__(self) -> None:
         if not (self.system_prompt or "").strip():       # NP3-8: empty/whitespace system prompt is
@@ -112,6 +113,57 @@ class PLMMetaParameters:
                     f"PLMMetaParameters: policy name(s) {_dup} appear in BOTH extra_policies "
                     f"(mutable) and sealed_policies (immutable) — put each in exactly one"
                 )
+        # Validate verifier source (if any): must parse and define EXACTLY ONE
+        # top-level `def verifier(messages)` (FunctionDef or AsyncFunctionDef).
+        # Other top-level statements (helper defs, imports, assignments) are
+        # ALLOWED so the verifier can ship helpers, and the function keeps any
+        # cross-round state via the kernel namespace (it runs kernel-resident
+        # with full ambient access). This is a STRUCTURAL gate only — we do
+        # NOT exec/compile here; the kernel boot install (prefix.py) compiles the
+        # source in the policy space (full ambient namespace) once per run.
+        # Failure to parse OR a missing/duplicated/renamed top-level `verifier`
+        # is a metaparam bug, not an evolved runtime bug, so this validation is
+        # FAIL-LOUD (unlike the runtime call, which is fail-soft). The verifier
+        # is SEALED + HIDDEN in the kernel (not in the policy registry), so it can
+        # mutate the trajectory and use the full ambient namespace (react_llm /
+        # natural_llm / parallel / policy edit APIs / policyzero) but can never
+        # abort the run or edit a sealed policy (the universal kernel rules).
+        if self.verifier is not None:
+            if not isinstance(self.verifier, str):
+                raise TypeError(
+                    f"PLMMetaParameters.verifier must be a str (Python source) or None, "
+                    f"got {type(self.verifier).__name__}"
+                )
+            import ast as _ast
+            try:
+                _vtree = _ast.parse(self.verifier)
+            except SyntaxError as _e:
+                raise ValueError(
+                    f"PLMMetaParameters.verifier: source is not valid Python ({_e})"
+                ) from _e
+            # STRICT: the verifier source is EXACTLY ONE top-level node — a sync
+            # `def verifier(messages)`. NO other top-level statements (helpers,
+            # imports, constants, classes, async). Any helper functions, imports,
+            # or constants the verifier needs live INSIDE the function body. This
+            # keeps the verifier a single self-contained unit (trivial to validate,
+            # mutate, and serialize) AND guarantees nothing leaks into the kernel
+            # namespace (nested helpers are locals — invisible to policies/snapshot).
+            _vbody = _vtree.body
+            if len(_vbody) != 1 or not (
+                isinstance(_vbody[0], _ast.FunctionDef) and _vbody[0].name == "verifier"
+            ):
+                _async_hint = ""
+                if any(isinstance(n, _ast.AsyncFunctionDef) and n.name == "verifier"
+                       for n in _vbody):
+                    _async_hint = (" (`async def verifier` is NOT allowed — the kernel "
+                                   "calls it synchronously)")
+                raise ValueError(
+                    "PLMMetaParameters.verifier: source must be EXACTLY ONE top-level "
+                    "`def verifier(messages)` function and NOTHING else"
+                    + _async_hint
+                    + ". Put any helper functions, imports, and constants INSIDE the "
+                    f"function body. (Got {len(_vbody)} top-level statement(s).)"
+                )
 
     @classmethod
     def from_dir(cls, path: Any) -> "PLMMetaParameters":
@@ -148,10 +200,19 @@ class PLMMetaParameters:
                         out[f.stem] = f.read_text(encoding="utf-8")
             return out
 
+        # Optional EVOLVED trajectory verifier lives at the metaparam TOP LEVEL
+        # (NOT under policies/) as a fixed filename. Absent => None (legacy
+        # metaparam dirs continue to load unchanged). The `_`-prefix skip rule
+        # used for policy helper files does not apply here — `verifier.py` is a
+        # fixed name, not a glob.
+        _vp = base / "verifier.py"
+        _verifier_src = _vp.read_text(encoding="utf-8") if _vp.is_file() else None
+
         return cls(
             system_prompt=sp.read_text(encoding="utf-8"),
             extra_policies=_load("mutable") or None,
             sealed_policies=_load("sealed") or None,
+            verifier=_verifier_src,
         )
 
 
@@ -235,6 +296,9 @@ class PLM:
         if getattr(self.metaparams, "sealed_policies", None):
             repl_env["_PLM_SEALED_EXTRA_POLICIES"] = json.dumps(self.metaparams.sealed_policies)
 
+        if getattr(self.metaparams, "verifier", None):
+            repl_env["_PLM_VERIFIER_SOURCE"] = self.metaparams.verifier
+
         # FIXED simulate eval conditions -> the sealed `simulate` default reads these from
         # the env; the model cannot choose its own opponents / relax the clock.
         if self.simulate_config:
@@ -284,7 +348,124 @@ class PLM:
             "tool_calls": [],
             "total_tokens": 0,
             "main_turns": 0,
+            # Verifier-hook counters: ALWAYS present (0 when no verifier is configured)
+            # so downstream consumers can rely on the keys existing regardless of
+            # whether the metaparam dir shipped a verifier.py.
+            "verifier_calls": 0,
+            "verifier_errors": 0,
         }
+
+        # The (optional) evolved trajectory verifier is NO LONGER compiled in the
+        # PARENT process. It is shipped to the kernel via `_PLM_VERIFIER_SOURCE`
+        # (see repl_env above) and compiled there at boot into a PRIVATE, HIDDEN,
+        # SEALED object (`_repl_verifier_obj`), with the FULL ambient namespace
+        # (react_llm / natural_llm / parallel / policy edit APIs / policyzero). The
+        # parent dispatches each round via `_repl_run_verifier(...)` IN THE KERNEL
+        # (see `_run_verifier_in_kernel` below). `verifier=None` => the env var is
+        # unset => the kernel installs nothing => dispatch is a no-op (legacy
+        # metaparams behave EXACTLY as before).
+        _verifier_enabled = bool(getattr(self.metaparams, "verifier", None))
+
+        # --- kernel dispatch round-trip ------------------------------------
+        # Sentinel-delimited stdout is the kernel->parent channel for the mutated
+        # trajectory (the only structured non-terminating channel `execute_cell`
+        # exposes — `return_blob` would TERMINATE the run via RETURN). We:
+        #   1. SEED the current full trajectory into the kernel's `plm_messages`
+        #      accumulator (the seed channel REPLACES it — see kernel.py), so the
+        #      verifier sees an up-to-date, writable list.
+        #   2. Run a tiny dispatch cell that calls `_repl_run_verifier(plm_messages)`
+        #      and prints `<<<PLM_VERIFIER>>>{json}<<<END>>>` carrying the (possibly
+        #      mutated) messages + an error flag.
+        #   3. Parse that line; on success REPLACE the parent `messages` in place.
+        # CRASH-SAFE: if the cell times out / the kernel dies, `execute_cell`
+        # SIGKILLs + respawns and returns an envelope with NO sentinel — we detect
+        # the missing sentinel, count it as a verifier error, and KEEP the parent's
+        # current `messages` untouched (the run proceeds). Because we always re-seed
+        # the full trajectory immediately BEFORE dispatch, a respawn's empty
+        # accumulator is irrelevant. After dispatch we RESET seeded_count/epoch so
+        # the next normal cell re-seeds the full (post-verifier) trajectory once.
+        _V_SENTINEL_OPEN = "<<<PLM_VERIFIER_RESULT>>>"
+        _V_SENTINEL_CLOSE = "<<<PLM_VERIFIER_END>>>"
+
+        async def _run_verifier_in_kernel() -> None:
+            """Dispatch the kernel-resident verifier on the current trajectory,
+            FAIL-SOFT. EVERY dispatch increments `verifier_calls`; any failure
+            (kernel error, respawn, missing/garbled sentinel, verifier exception
+            captured in-kernel) increments `verifier_errors` and is logged into
+            `metrics['verifier_error_log']` but NEVER aborts the run — the verifier
+            is evolved code under optimization, so a buggy generation must not kill
+            the parent run. On success, the parent `messages` list is replaced
+            in-place with the kernel-returned (possibly mutated) trajectory."""
+            nonlocal force_full_reseed
+            if not _verifier_enabled:
+                return
+            metrics["verifier_calls"] += 1
+
+            def _log_err(kind: str, detail: str) -> None:
+                metrics["verifier_errors"] += 1
+                metrics.setdefault("verifier_error_log", []).append({
+                    "round": _round, "error_type": kind, "error": detail[:500],
+                })
+
+            dispatch_code = (
+                "import json as _vj\n"
+                "_v_msgs, _v_err = _repl_run_verifier(plm_messages)\n"
+                # NO default=str: a verifier that weaves a NON-JSON-native value
+                # must RAISE here (in-kernel), which the kernel's per-cell
+                # try/except catches -> stdout carries NO sentinel -> the parent
+                # detects the missing sentinel, counts a verifier error, and KEEPS
+                # its clean `messages` (never adopts a lossily-coerced trajectory).
+                "print('" + _V_SENTINEL_OPEN + "' + _vj.dumps("
+                "{'messages': _v_msgs, 'error': _v_err}) + '"
+                + _V_SENTINEL_CLOSE + "')\n"
+            )
+            try:
+                # Seed the full current trajectory (REPLACES the accumulator) and
+                # run the dispatch cell. No delta — the seed is the source of truth.
+                exec_result = await asyncio.to_thread(
+                    repl.execute_cell, dispatch_code, {"plm_messages": list(messages)}, None
+                )
+            except BaseException as _e:                      # hard parent-side failure
+                _log_err(type(_e).__name__, str(_e))
+                return
+            finally:
+                # A verifier just ran: it mutated a COPY of the trajectory (and may
+                # have PRUNED or ADDED turns), so the kernel accumulator is now stale.
+                # Force the NEXT normal cell to REPLACE the accumulator with the full
+                # post-verifier trajectory (the seed channel). An append-delta cannot
+                # represent a prune and would DOUBLE the in-kernel `plm_messages` view.
+                force_full_reseed = True
+
+            stdout = (exec_result or {}).get("stdout") or ""
+            # OPEN: first match; CLOSE: LAST match (rfind). Echoed trajectory
+            # content could itself contain the sentinel strings; using rfind for
+            # the close marker means embedded content can't prematurely truncate
+            # the JSON payload.
+            i = stdout.find(_V_SENTINEL_OPEN)
+            j = stdout.rfind(_V_SENTINEL_CLOSE)
+            if i < 0 or j < 0 or j < i:
+                # No sentinel: crash/respawn/garbled. Keep parent messages as-is.
+                _log_err("VerifierNoResult",
+                         "verifier dispatch returned no result sentinel (kernel may have "
+                         "respawned); stderr=" + ((exec_result or {}).get("stderr") or "")[:300])
+                return
+            payload = stdout[i + len(_V_SENTINEL_OPEN):j]
+            try:
+                parsed = json.loads(payload)
+                new_msgs = parsed.get("messages")
+                v_err = parsed.get("error")
+            except Exception as _e:
+                _log_err("VerifierResultDecode", str(_e))
+                return
+            if v_err:                                        # verifier raised inside the kernel
+                _log_err("VerifierRaised", str(v_err))
+                # The kernel returns the messages unchanged on a verifier exception,
+                # so adopting them is a no-op; still adopt to stay consistent.
+            if isinstance(new_msgs, list):
+                messages[:] = new_msgs                       # adopt the (possibly mutated) trajectory
+            else:
+                _log_err("VerifierBadMessages",
+                         f"verifier result 'messages' was {type(new_msgs).__name__}, not a list")
 
         constraint_is_set = constraint is not None
         _DONE = object()
@@ -295,6 +476,10 @@ class PLM:
 
         seeded_count = 0
         seeded_epoch: Optional[int] = None
+        # After a verifier round, the next normal cell must REPLACE the kernel
+        # `plm_messages` accumulator with the full post-verifier trajectory (seed
+        # channel) rather than append a delta — see `_run_verifier_in_kernel`.
+        force_full_reseed = False
 
         # Optional observability hook: called with the running transcript each round (and once
         # at the end). A harness uses it to stream the live trajectory; failures never break the run.
@@ -308,6 +493,9 @@ class PLM:
         # ---- React loop ------------------------------------------------------
         try:
             for _round in range(total_rounds_budget):
+                
+                if _round > 0:
+                    await _run_verifier_in_kernel()
                 _emit(messages)                  # live trajectory: the running transcript so far
 
                 if _round == self.max_turns - 1:
@@ -466,13 +654,26 @@ class PLM:
                     continue
 
                 if repl.kernel_epoch != seeded_epoch:
+                    # Kernel (re)spawned: accumulator is empty → full reseed via delta.
                     seeded_count = 0
                     seeded_epoch = repl.kernel_epoch
-                delta = public_trajectory(messages[seeded_count:])
+                    force_full_reseed = False
+                if force_full_reseed:
+                    # A verifier ran last round; REPLACE the accumulator with the full
+                    # post-verifier trajectory (seed channel) so the in-kernel
+                    # `plm_messages` view EXACTLY matches the parent's authoritative
+                    # `messages` — no doubling, and prunes/edits are reflected.
+                    _seed = {"plm_messages": public_trajectory(messages)}
+                    _delta = None
+                    force_full_reseed = False
+                else:
+                    _seed = None
+                    _delta = public_trajectory(messages[seeded_count:])
                 seeded_count = len(messages)
-                
+                seeded_epoch = repl.kernel_epoch
+
                 exec_result = await asyncio.to_thread(
-                    repl.execute_cell, code, None, delta
+                    repl.execute_cell, code, _seed, _delta
                 )
                 etype = exec_result.get("type", "result")
 

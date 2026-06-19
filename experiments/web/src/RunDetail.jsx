@@ -4,7 +4,7 @@ import { go, StatusTag } from "./ui.jsx";
 import Chart from "./Chart.jsx";
 import Board from "./Board.jsx";
 
-function codeOf(msg) {
+export function codeOf(msg) {
   const tc = (msg.tool_calls || [])[0];
   if (!tc) return null;
   let args = tc.function?.arguments;
@@ -12,7 +12,7 @@ function codeOf(msg) {
   return args?.code ?? null;
 }
 
-function Trajectory({ messages }) {
+export function Trajectory({ messages }) {
   if (!messages?.length) return <div className="muted">No transcript yet.</div>;
   return (
     <div>

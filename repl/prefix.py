@@ -471,4 +471,69 @@ try:
         _repl_llm_infra._LLM_DEPTH.set(_repl_llm_infra._root_depth())
 except Exception:
     pass
+
+# ============================================================================
+# Evolved trajectory VERIFIER — kernel-resident, SEALED + HIDDEN.
+#
+# The verifier source (if any) arrives via `_PLM_VERIFIER_SOURCE`. We compile it
+# HERE — at the very end of boot, AFTER all policies are installed/sealed/blessed
+# and the constraint surface is warmed — so it runs with the FULL ambient kernel
+# namespace a normal policy/cell sees (react_llm / natural_llm / parallel /
+# exec_ns / the policy ops `read_policy`/`edit`/`duplicate_policy` /
+# `policyzero` / artefacts). We install it into the MAIN kernel globals so that
+# ambient namespace resolves, BUT we DO NOT register it in `_PLM_POLICIES` — so
+# `list_policies()` / `read_policy("verifier")` / edits can never see or touch it.
+# It is the optimizer's GENOME LEVER: it may mutate the trajectory ANY way and do
+# anything a cell can, but it CANNOT abort the run (its exceptions are caught) and
+# CANNOT edit a sealed policy (the universal kernel rule still applies — the
+# policy-op gates run regardless of caller).
+#
+# Storage: `_repl_verifier_obj` holds the compiled `def verifier` function. It
+# keeps any cross-round state via the kernel namespace (it runs kernel-resident
+# with full ambient access). `_repl_run_verifier(messages)` is the parent-invoked
+# dispatch entrypoint; it is `_repl_`-prefixed so it is snapshot-skipped and
+# never user-visible. Compile failure is contained (a broken verifier must not
+# brick boot); `_repl_run_verifier` then degrades to a no-op error each round.
+_repl_verifier_obj = None        # the compiled `def verifier` function
+_repl_verifier_boot_error = None
+_repl_verifier_src = _os.environ.get("_PLM_VERIFIER_SOURCE")
+if _repl_verifier_src:
+    try:
+        _repl_g = _builtins.globals()
+        # exec in the MAIN kernel globals so the verifier closes over the full
+        # ambient namespace (same dict every cell execs in).
+        _builtins.exec(_builtins.compile(_repl_verifier_src, "<plm-verifier>", "exec"),
+                       _repl_g, _repl_g)
+        _repl_v = _repl_g.get("verifier")
+        if _builtins.callable(_repl_v):
+            _repl_verifier_obj = _repl_v
+        else:
+            _repl_verifier_boot_error = ("_PLM_VERIFIER_SOURCE defined no callable "
+                                         "`verifier` function (AST gate should have caught this)")
+        # Keep the bare `verifier` NAME out of __main__: the live object is
+        # `_repl_verifier_obj` (hidden + snapshot-skipped). It is NOT registered in
+        # `_PLM_POLICIES`, so list_policies/read_policy/edit can never see it.
+        _repl_g.pop("verifier", None)
+    except BaseException as _repl_verr:
+        _repl_verifier_obj = None
+        _repl_verifier_boot_error = _builtins.repr(_repl_verr)
+        _repl_stderr_buf.write("[boot] verifier install failed: "
+                               + _repl_verifier_boot_error + "\n")
+
+
+def _repl_run_verifier(messages):
+    """Parent-invoked dispatch: run the kernel-resident verifier on `messages`
+    (a writable list), FAIL-SOFT. Returns `(messages, error_or_None)`:
+      * `_repl_verifier_obj(messages)`   (return value ignored)
+    The contract is to MUTATE `messages` IN PLACE (append/prune/edit a turn); we
+    hand BACK the same list object so the parent adopts whatever it became (a full
+    reassign inside the verifier is NOT observed — mutate in place). Any exception
+    is captured and returned as the error string; the run is NEVER aborted."""
+    if _repl_verifier_obj is None:
+        return messages, (_repl_verifier_boot_error or None)
+    try:
+        _repl_verifier_obj(messages)
+        return messages, None
+    except BaseException as _repl_e:
+        return messages, _builtins.repr(_repl_e)
 '''

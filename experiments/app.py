@@ -114,8 +114,9 @@ def get_backends() -> List[Dict[str, Any]]:
 
 # ---- experiments / runs ----------------------------------------------------- #
 class RunSpec(BaseModel):
-    metaparam: str                                               # set NAME under METAPARAMS_ROOT
-    backend: Dict[str, Any]                                      # {name, model, base_url}
+    kind: str = "single"                                         # "single" | "optimization"
+    metaparam: Optional[str] = None                             # set NAME under METAPARAMS_ROOT (single)
+    backend: Optional[Dict[str, Any]] = None                    # {name, model, base_url}
     simulate_config: Optional[Dict[str, Any]] = None
     seed: int = 0
     max_turns: int = 100
@@ -123,6 +124,32 @@ class RunSpec(BaseModel):
     task: Optional[str] = None
     tool_timeout: Optional[float] = None
     label: Optional[str] = None
+    # optimization-only payload: {recipe, backend{...}, reflection{...},
+    # simulate_config, max_turns, return_budget, generations, max_metric_calls,
+    # population_size}
+    optimization: Optional[Dict[str, Any]] = None
+
+
+# Short blurbs for the 10 recipes (see optimizer/README.md for full provenance).
+_RECIPE_BLURBS: Dict[str, Dict[str, str]] = {
+    "E1":  {"title": "GEPA-plain",                   "summary": "gepa's default reflective-mutation proposer; instance-Pareto frontier, two-parent merge on."},
+    "E2":  {"title": "MO-GA",                         "summary": "EvoPrompt GA mutation as proposer; objective (metric-Pareto) frontier, merge on."},
+    "E3":  {"title": "GEPA+PE2",                      "summary": "default proposer with the real PE2 meta-prompt in the template slot; instance frontier, merge on."},
+    "E4":  {"title": "GEPA+PE2+PromptBreeder",        "summary": "PromptBreeder mutation framed by the PE2 grammar; instance frontier, merge on."},
+    "E5":  {"title": "GEPA+PE2+PromptBreeder+xover",  "summary": "E4 plus crossover via gepa's real two-parent merge op; instance frontier."},
+    "E6":  {"title": "GEPA+TextGrad",                 "summary": "TextGrad textual-gradient (backward + step) proposer; instance frontier, merge on."},
+    "E7":  {"title": "GEPA+ContraPrompt",             "summary": "ContraPrompt contrastive-pair rule mining proposer; instance frontier, merge off."},
+    "E8":  {"title": "MO-GA+PromptBreeder+xover",     "summary": "PromptBreeder (PE2 grammar) proposer; objective frontier, merge on."},
+    "E9":  {"title": "Dual-everything",               "summary": "ContraPrompt proposer; hybrid (instance AND objective) frontier, merge on."},
+    "E10": {"title": "Island",                        "summary": "three real gepa islands (E4,E5,E7 configs) with elite migration between rounds."},
+}
+
+
+@app.get("/api/recipes")
+def get_recipes() -> List[Dict[str, str]]:
+    from plm.optimizer import RECIPES
+    return [{"id": rid, **_RECIPE_BLURBS.get(rid, {"title": rid, "summary": ""})}
+            for rid in sorted(RECIPES, key=lambda x: int(x[1:]))]
 
 
 @app.get("/api/runs")
@@ -132,6 +159,34 @@ def list_runs() -> List[Dict[str, Any]]:
 
 @app.post("/api/runs")
 def create_run(spec: RunSpec) -> Dict[str, Any]:
+    if spec.kind == "optimization":
+        from plm.optimizer import RECIPES
+        opt = spec.optimization or {}
+        recipe = (opt.get("recipe") or "").strip().upper()
+        if recipe not in RECIPES:
+            raise HTTPException(400, f"unknown recipe {recipe!r}; known: {sorted(RECIPES)}")
+        backend = opt.get("backend") or spec.backend
+        if not backend:
+            raise HTTPException(400, "optimization run requires a backend")
+        try:
+            return runs.create_run({
+                "kind": "optimization",
+                "recipe": recipe,
+                "backend": backend,
+                "reflection": opt.get("reflection"),
+                "simulate_config": opt.get("simulate_config", spec.simulate_config),
+                "max_turns": opt.get("max_turns", spec.max_turns),
+                "return_budget": opt.get("return_budget", spec.return_budget),
+                "generations": opt.get("generations", 2),
+                "max_metric_calls": opt.get("max_metric_calls", 10),
+                "population_size": opt.get("population_size", 4),
+                "label": spec.label,
+            })
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+
+    if not spec.metaparam:
+        raise HTTPException(400, "single run requires a metaparam set name")
     mp_dir = METAPARAMS_ROOT / spec.metaparam
     if not mp_dir.is_dir():
         raise HTTPException(400, f"unknown metaparam set {spec.metaparam!r}")
@@ -167,6 +222,39 @@ def stop_run(run_id: str) -> Dict[str, Any]:
 @app.get("/api/runs/{run_id}/games/{sim_idx}/{game_id}")
 def get_game(run_id: str, sim_idx: int, game_id: str) -> Dict[str, Any]:
     g = runs.get_game(run_id, sim_idx, game_id)
+    if g is None:
+        raise HTTPException(404, "no such game")
+    return g
+
+
+# ---- optimization: candidate endpoints ------------------------------------- #
+@app.get("/api/runs/{run_id}/candidates")
+def list_candidates(run_id: str) -> List[Dict[str, Any]]:
+    r = runs.get_run(run_id)
+    if r is None:
+        raise HTTPException(404, "no such run")
+    return r.get("candidates") or []
+
+
+@app.get("/api/runs/{run_id}/candidates/{candidate_id}")
+def get_candidate(run_id: str, candidate_id: str) -> Dict[str, Any]:
+    c = runs.get_candidate(run_id, candidate_id)
+    if c is None:
+        raise HTTPException(404, "no such candidate")
+    return c
+
+
+@app.get("/api/runs/{run_id}/candidates/{candidate_id}/games")
+def list_candidate_games(run_id: str, candidate_id: str) -> List[Dict[str, Any]]:
+    g = runs.list_candidate_games(run_id, candidate_id)
+    if g is None:
+        raise HTTPException(404, "no such candidate")
+    return g
+
+
+@app.get("/api/runs/{run_id}/candidates/{candidate_id}/games/{sim_idx}/{game_id}")
+def get_candidate_game(run_id: str, candidate_id: str, sim_idx: int, game_id: str) -> Dict[str, Any]:
+    g = runs.get_game(run_id, sim_idx, game_id, candidate_id=candidate_id)
     if g is None:
         raise HTTPException(404, "no such game")
     return g
