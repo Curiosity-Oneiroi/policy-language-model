@@ -7,6 +7,17 @@ import Board from "./Board.jsx";
 // ---------- small helpers ----------
 const AX = "#2b3440", MUTED = "#8b949e";
 const C_ACCEPT = "#3fb950", C_REJECT = "#f85149", C_FRONT = "#d29922", C_LINE = "#4493f8";
+const C_PENDING = "#8b949e";
+
+// Candidate lifecycle tag. While a run is live the poller writes PRELIMINARY rows
+// (accepted=false, method "seed"/"pending"); the post-hoc reconcile later flips kept
+// candidates to accepted=true and genuinely-discarded ones to method="rejected". So
+// only show "rejected" for that real verdict — otherwise the candidate is "pending".
+function candStatus(c) {
+  if (c && c.accepted) return { label: "accepted", color: C_ACCEPT };
+  if (c && c.method === "rejected") return { label: "rejected", color: C_REJECT };
+  return { label: "pending", color: C_PENDING };
+}
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 // blue (low) -> green (high) ramp for est_elo coloring
@@ -54,6 +65,78 @@ function Frame({ W, H, pad, ymin, ymax, xlabel, ylabel, fmtY = (v) => v.toFixed(
   );
 }
 
+// ---------- per-candidate evolution across its OWN simulate calls ----------
+const PALETTE = ["#3fb950", "#f85149", "#4493f8", "#d29922", "#a371f7", "#db61a2",
+                 "#39c5cf", "#e3b341", "#ff7b72", "#7ee787", "#bc8cff", "#56d364"];
+const candColor = (i) => PALETTE[((i % PALETTE.length) + PALETTE.length) % PALETTE.length];
+
+// One chart: x = simulate #, y = metric; one colored line per candidate over its peeks;
+// the dedicated post-RETURN eval (final_eval) is a diamond = the OFFICIAL score.
+function EvolutionChart({ series, order, metric }) {
+  const W = 520, H = 250, pad = 48;
+  const cids = order.filter((c) => (series[c] || []).some((p) => p[metric] != null));
+  if (!cids.length) return <Empty msg="no simulate data yet" />;
+  const xs = [], ys = [];
+  cids.forEach((c) => (series[c] || []).forEach((p) => {
+    if (p[metric] != null) { xs.push(p.idx ?? 0); ys.push(p[metric]); }
+  }));
+  const xmax = Math.max(1, ...xs);
+  const [ymin, ymax] = metric === "win_rate" ? [0, 1] : extent(ys);
+  const sx = (x) => pad + (W - 2 * pad) * x / (xmax || 1);
+  const sy = (y) => H - pad - (H - 2 * pad) * (y - ymin) / ((ymax - ymin) || 1);
+  const fmtY = metric === "win_rate" ? (v) => v.toFixed(2) : (v) => v.toFixed(0);
+  return (
+    <svg width={W} height={H} style={{ maxWidth: "100%" }}>
+      <Frame W={W} H={H} pad={pad} ymin={ymin} ymax={ymax} xlabel="simulate #"
+             ylabel={metric === "win_rate" ? "win rate" : "est. Elo"} fmtY={fmtY} />
+      {cids.map((c) => {
+        const col = candColor(order.indexOf(c));
+        const pts = (series[c] || []).filter((p) => p[metric] != null)
+                      .slice().sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0));
+        const peeks = pts.filter((p) => !p.final_eval);
+        const fin = pts.find((p) => p.final_eval);
+        const path = peeks.map((p, j) =>
+          (j ? "L" : "M") + sx(p.idx ?? 0).toFixed(1) + " " + sy(p[metric]).toFixed(1)).join(" ");
+        return (
+          <g key={c}>
+            {path && <path d={path} fill="none" stroke={col} strokeWidth="1.8" opacity="0.85" />}
+            {peeks.map((p, j) => <circle key={j} cx={sx(p.idx ?? 0)} cy={sy(p[metric])} r="2.6" fill={col} />)}
+            {fin && (
+              <rect x={sx(fin.idx ?? 0) - 4.5} y={sy(fin[metric]) - 4.5} width="9" height="9"
+                    transform={`rotate(45 ${sx(fin.idx ?? 0)} ${sy(fin[metric])})`}
+                    fill={col} stroke="#fff" strokeWidth="1.4">
+                <title>{`${c} — FINAL ${metric === "win_rate" ? "win rate" : "Elo"} ${fin[metric]} (${fin.num_games} games)`}</title>
+              </rect>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function EvolutionCharts({ series, order }) {
+  const cids = (order || []).filter((c) => (series[c] || []).length);
+  if (!cids.length) return null;
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="small muted" style={{ marginBottom: 6 }}>
+        Per-candidate evolution — each line is one trajectory across ITS own simulate calls;
+        ◆ = the dedicated post-RETURN eval of the delivered policy (the OFFICIAL score).
+      </div>
+      <div className="row" style={{ flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+        {cids.map((c) => (
+          <span key={c} className="small mono" style={{ color: candColor(order.indexOf(c)) }}>● {c}</span>
+        ))}
+      </div>
+      <div className="row" style={{ alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
+        <EvolutionChart series={series} order={order} metric="est_elo" />
+        <EvolutionChart series={series} order={order} metric="win_rate" />
+      </div>
+    </div>
+  );
+}
+
 // ---------- 1. Elo vs step scatter + best-so-far ----------
 function EloScatter({ pop, lo, hi, onPick }) {
   const W = 560, H = 260, pad = 46;
@@ -74,14 +157,14 @@ function EloScatter({ pop, lo, hi, onPick }) {
       <path d={path} fill="none" stroke={C_LINE} strokeWidth="2" strokeDasharray="4 3" />
       {sorted.map((p, i) => {
         const cx = sx(p.step ?? 0), cy = sy(p.est_elo);
-        const front = p.on_pareto_front, acc = p.accepted;
+        const front = p.on_pareto_front, acc = p.accepted, st = candStatus(p);
         return (
           <g key={p.candidate_id || i} style={{ cursor: "pointer" }} onClick={() => onPick && onPick(p.candidate_id)}>
             {front && <circle cx={cx} cy={cy} r="7" fill="none" stroke={C_FRONT} strokeWidth="2" />}
             <circle cx={cx} cy={cy} r="4.5"
               fill={acc ? eloColor(p.est_elo, lo, hi) : "none"}
-              stroke={acc ? eloColor(p.est_elo, lo, hi) : C_REJECT} strokeWidth="1.5">
-              <title>{`${p.candidate_id} · gen ${p.gen} · elo ${fmt(p.est_elo)} · ${acc ? "accepted" : "rejected"}${front ? " · frontier" : ""}`}</title>
+              stroke={acc ? eloColor(p.est_elo, lo, hi) : st.color} strokeWidth="1.5">
+              <title>{`${p.candidate_id} · gen ${fmt(p.gen)} · elo ${fmt(p.est_elo)} · ${st.label}${front ? " · frontier" : ""}`}</title>
             </circle>
           </g>
         );
@@ -96,7 +179,8 @@ function byGen(pop, key) {
   for (const p of pop) {
     const v = p[key];
     if (v === null || v === undefined || Number.isNaN(v)) continue;
-    (m[p.gen] = m[p.gen] || []).push(v);
+    const g = p.gen ?? 0;                 // seed/pre-gen candidates -> gen 0 (a real number,
+    (m[g] = m[g] || []).push(v);          // not the string "null" that map(Number) turns to NaN)
   }
   return m;
 }
@@ -359,7 +443,9 @@ function CandidateList({ rows, selected, onPick }) {
   if (!rows.length) return <Empty msg="no candidates yet" />;
   return (
     <div style={{ minWidth: 240 }}>
-      {rows.map((c) => (
+      {rows.map((c) => {
+        const s = candStatus(c);
+        return (
         <div key={c.candidate_id} className="card click"
           style={{ marginBottom: 8, borderColor: c.candidate_id === selected ? "var(--accent)" : undefined }}
           onClick={() => onPick(c.candidate_id)}>
@@ -367,16 +453,15 @@ function CandidateList({ rows, selected, onPick }) {
             <strong className="mono small">{c.candidate_id}</strong>
             <div className="row" style={{ gap: 4 }}>
               {c.on_pareto_front && <span className="tag" style={{ color: C_FRONT, borderColor: C_FRONT }}>frontier</span>}
-              <span className="tag" style={c.accepted ? { color: C_ACCEPT, borderColor: C_ACCEPT } : { color: C_REJECT, borderColor: C_REJECT }}>
-                {c.accepted ? "accepted" : "rejected"}
-              </span>
+              <span className="tag" style={{ color: s.color, borderColor: s.color }}>{s.label}</span>
             </div>
           </div>
           <div className="small muted mono" style={{ marginTop: 4 }}>
             gen {fmt(c.gen)} · {c.method || "?"} · elo {fmt(c.est_elo)} · scalar {fmt(c.scalar)}
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -554,8 +639,9 @@ export default function OptimizationDetail({ id }) {
       {tab === "progress" && (
         <>
           {pop.length === 0 && <Empty msg="no population yet — charts will populate as candidates are evaluated" />}
+          <EvolutionCharts series={data.simulate_series || {}} order={rows.map((r) => r.candidate_id)} />
           <div className="row" style={{ alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
-            <ChartCard title="Elo vs step (population)" hint="filled=accepted · hollow=rejected · gold ring=frontier · click → trajectory">
+            <ChartCard title="Elo vs step (population)" hint="filled=accepted · hollow=pending/rejected · gold ring=frontier · click → trajectory">
               <EloScatter pop={pop} lo={eloLo} hi={eloHi} onPick={pickInTrajectory} />
             </ChartCard>
             <ChartCard title="Per-generation convergence" hint="best (solid) & mean (dashed) est. Elo">

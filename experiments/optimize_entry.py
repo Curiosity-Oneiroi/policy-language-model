@@ -27,7 +27,7 @@ Experiment-dir layout (everything UNDER runs_dir/<run_id>/):
                              — raw optimizer output (output_dir=exp_dir)
 
 Sourcing of the normalized fields (see also scorer.py / gepa core/result.py):
-  * scalar / vector (7 shaped metrics)  : score_run(candidate run_dir)
+  * scalar / vector (6 shaped metrics)  : score_run(candidate run_dir)
   * per_instance {opponent: winrate}    : score_run -> raw["per_instance"]
                                           (fallback: GEPAResult.val_subscores[i])
   * est_elo                             : score_run -> raw["proxy_elo"]["best_est_elo"]
@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import sys
 import threading
 import time
@@ -400,9 +401,21 @@ def _main(cfg: dict) -> None:
                       json.dumps({"run_id": cfg["run_id"], "kind": "optimization",
                                   "status": status, "config": cfg, **extra}, default=repr))
 
+    # SIGTERM (what RunManager.stop_run / the UI "Stop" sends) -> SystemExit, so the
+    # try/finally below runs and RETURNS the borrowed pool slot instead of leaking it.
+    # (subprocess.run's own cleanup also kills the in-flight run_entry child on this.)
+    def _raise_sysexit(*_a):
+        raise SystemExit(143)
+    try:
+        signal.signal(signal.SIGTERM, _raise_sysexit)
+    except (ValueError, OSError):
+        pass                                            # not main thread / platform lacks it
+
     started = time.time()
     write_status("starting", started=started)
     poller: Optional[_PopulationPoller] = None
+    _pool = None
+    _borrowed: set = set()
     try:
         from plm.optimizer import RECIPES, run_experiment, EvalConfig
         from plm.optimizer.gepa_engine import BackendReflectLM, candidate_hash
@@ -417,6 +430,27 @@ def _main(cfg: dict) -> None:
         reflection = cfg.get("reflection") or backend
         stage = "alpha"                                    # EvalConfig default
 
+        # Borrow kernel venvs from the SHARED workspace pool (the same one single runs use)
+        # when the web backend wired its location into the config — so each candidate reuses
+        # a pre-built venv instead of creating one, and pool size caps candidate concurrency.
+        # Falls back to per-candidate workspaces under workspace_root when no pool is set.
+        acquire_ws = release_ws = None
+        pool_root = cfg.get("pool_root")
+        if pool_root:
+            from .workspaces import WorkspacePool
+            _pool = WorkspacePool(pool_root, cfg.get("pool_game_path") or pool_root)
+            _pool_wait = float(cfg.get("pool_wait_s", 1800.0))
+
+            def acquire_ws(rid, _p=_pool, _w=_pool_wait):
+                a = _p.allocate_blocking(rid, timeout=_w)
+                if a:
+                    _borrowed.add(a["number"])           # track for stop/crash cleanup below
+                return a
+
+            def release_ws(num, _p=_pool):
+                _borrowed.discard(num)
+                _p.free(num)
+
         eval_cfg = EvalConfig(
             metaparams_root=metaparams_root,
             runs_root=runs_root,
@@ -428,7 +462,21 @@ def _main(cfg: dict) -> None:
             max_turns=cfg.get("max_turns", 5),
             return_budget=cfg.get("return_budget", 2),
             dotenv_path=cfg.get("dotenv_path"),
+            # Per-CELL timeout: NONE (no cap). evaluate()'s 60s default kills react_llm /
+            # natural_llm sub-agent dispatches on the slow 122B (~30 tok/s), forcing the PLM
+            # off its delegate-don't-grind strategy. Unbounded cells let dispatches finish;
+            # the per-candidate subprocess_timeout below is the only safety ceiling now.
+            tool_timeout=cfg.get("tool_timeout_s"),     # None unless overridden -> no cell cap
+            # Per-candidate hard ceiling (the run_entry subprocess). Generous, because cells
+            # are now unbounded and a real delegate-heavy candidate on the slow model + full
+            # maia games runs long; this only stops a wedged candidate holding a pool slot.
+            subprocess_timeout=float(cfg.get("eval_timeout_s") or 7200.0),
+            # Official Elo: a fixed 150-game eval of the delivered policy after RETURN
+            # (tagged final_eval) — the scorer reads that, not the model's own peeks.
+            final_eval_games=int(cfg.get("final_eval_games") or 150),
             stage=stage,
+            acquire_workspace=acquire_ws,
+            release_workspace=release_ws,
         )
         rlm = BackendReflectLM(build_backend(
             reflection["name"], model=reflection.get("model"),
@@ -486,6 +534,16 @@ def _main(cfg: dict) -> None:
         write_status("error", started=started, ended=time.time(),
                      error=f"{type(e).__name__}: {e}")
         raise
+    finally:
+        # Backstop: return any pool slots still borrowed by in-flight candidates so a Stop
+        # (SIGTERM->SystemExit) or crash mid-candidate never leaks them. evaluate() already
+        # releases on its own normal/exception path; freeing twice is harmless (idempotent).
+        if _pool is not None and _borrowed:
+            for _num in list(_borrowed):
+                try:
+                    _pool.free(_num)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

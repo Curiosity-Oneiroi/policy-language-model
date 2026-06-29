@@ -39,9 +39,10 @@ class RunManager:
           "optimization" — drives the GEPA recipe loop via `optimize_entry`: recipe,
                            backend, reflection, simulate_config, max_turns,
                            return_budget, generations, max_metric_calls,
-                           population_size, label.  The optimizer makes per-candidate
-                           workspaces under a workspace ROOT inside the experiment dir,
-                           so NO pool slot is consumed."""
+                           population_size, label.  The optimizer BORROWS kernel venvs
+                           from the shared pool (reusing pre-built venvs), falling back to
+                           per-candidate workspaces under the experiment dir if the pool
+                           is empty.  No dedicated pool slot is held for the run itself."""
         if spec.get("kind") == "optimization":
             return self._create_optimization_run(spec)
         run_id = spec.get("run_id") or ("run-" + uuid.uuid4().hex[:12])
@@ -81,8 +82,8 @@ class RunManager:
         run_id = spec.get("run_id") or ("opt-" + uuid.uuid4().hex[:12])
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Clean a workspace ROOT for the optimizer (it makes per-candidate workspaces
-        # under it). No pool slot is allocated for optimization runs.
+        # A workspace ROOT for the optimizer's FALLBACK per-candidate workspaces (used only
+        # when the shared pool is empty); normally candidates borrow from the pool instead.
         ws_root = run_dir / "workspaces"
         if ws_root.exists():
             shutil.rmtree(ws_root, ignore_errors=True)
@@ -104,6 +105,10 @@ class RunManager:
             "dotenv_path": self.dotenv_path,
             "label": spec.get("label"),
             "created": time.time(),
+            # Share the pre-provisioned pool with the optimizer's candidate evals, so each
+            # candidate reuses a ready venv instead of building its own (see optimize_entry).
+            "pool_root": str(self.pool.root),
+            "pool_game_path": self.pool.game_path,
         }
         (run_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
         proc = subprocess.Popen(
@@ -250,6 +255,7 @@ class RunManager:
                 "pareto_front": self._jsonl(d / "pareto_front.jsonl"),
                 "optimization_result": self._read_json(d / "optimization_result.json"),
                 "candidates": self._candidates_view(pop),
+                "simulate_series": self._simulate_series(d, pop),
                 "live": run_id in self._procs,
             }
         return {
@@ -273,6 +279,33 @@ class RunManager:
                 except Exception:
                     pass
         return rows
+
+    def _simulate_series(self, run_dir: Path, pop: List[Dict[str, Any]]
+                         ) -> Dict[str, List[Dict[str, Any]]]:
+        """Per-candidate LIGHT simulate series for the evolution charts:
+        candidate_id -> [{idx, est_elo, win_rate, num_games, final_eval}] over its own
+        simulate calls (the `final_eval` point is the dedicated post-RETURN evaluation)."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in pop:
+            cid, rd = r.get("candidate_id"), r.get("run_dir")
+            if not cid or not rd or cid in out:
+                continue
+            sf = Path(rd) / "simulates.jsonl"
+            if not sf.is_file():
+                continue
+            pts = []
+            for row in self._jsonl(sf):
+                s = row.get("summary") or {}
+                pts.append({
+                    "idx": row.get("idx"),
+                    "est_elo": s.get("est_elo"),
+                    "win_rate": s.get("win_rate"),
+                    "num_games": row.get("num_games"),
+                    "final_eval": bool(row.get("final_eval")),
+                })
+            if pts:
+                out[cid] = pts
+        return out
 
     # ---- optimization: per-candidate access ------------------------------- #
     def _candidate_row(self, run_id: str, candidate_id: str) -> Optional[Dict[str, Any]]:

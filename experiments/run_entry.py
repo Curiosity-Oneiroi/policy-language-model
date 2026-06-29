@@ -66,6 +66,21 @@ async def _main(cfg: dict) -> None:
             dotenv_path=cfg.get("dotenv_path"),
         )
         metaparams = PLMMetaParameters.from_dir(cfg["metaparam_dir"])
+        # Optional dedicated post-RETURN evaluation of the delivered `policyzero` (the
+        # OFFICIAL Elo): one fixed-N, fixed-seed `simulate` after RETURN, tagged via
+        # _PLM_FINAL_EVAL so the scorer reads IT, not the model's self-chosen peeks. Chess-
+        # specific (assumes `policyzero` + `simulate`); a no-op if absent (best-effort).
+        final_probe = None
+        _nfe = cfg.get("final_eval_games")
+        if _nfe:
+            final_probe = (
+                'import os as _os\n'
+                '_os.environ["_PLM_FINAL_EVAL"] = "1"\n'
+                'try:\n'
+                f'    simulate(get_policy("policyzero"), {int(_nfe)}, seed=987654321)\n'
+                'finally:\n'
+                '    _os.environ.pop("_PLM_FINAL_EVAL", None)\n'
+            )
         plm = PLM(
             model_backend=backend,
             metaparams=metaparams,
@@ -74,6 +89,7 @@ async def _main(cfg: dict) -> None:
             max_turns=cfg.get("max_turns", 100),
             return_budget=cfg.get("return_budget", 5),
             tool_timeout=cfg.get("tool_timeout"),
+            final_probe=final_probe,
         )
 
         def on_round(msgs):

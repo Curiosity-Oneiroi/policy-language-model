@@ -145,6 +145,9 @@ def simulate(policy, num_games, *, seed=0, return_summary=True):
                 "game_clock_s": cfg["game_clock_s"], "max_moves": cfg["max_moves"],
                 "summary": result.get("summary"),
                 "sampled_games": [g["game_id"] for g in picked],
+                # Harness-set (NOT model-set): the dedicated post-RETURN evaluation of the
+                # delivered policy. The scorer uses this row's est_elo as the OFFICIAL Elo.
+                "final_eval": bool(os.environ.get("_PLM_FINAL_EVAL")),
             }
             with logf.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record) + "\n")

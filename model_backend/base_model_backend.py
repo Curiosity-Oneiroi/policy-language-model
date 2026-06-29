@@ -220,6 +220,35 @@ class BaseModelBackend(ModelBackend):
         )
         return sanitized_tools, tool_name_mapping
 
+    def _as_chat_completions_tools(
+        self, tools: Optional[List[Dict]]
+    ) -> Optional[List[Dict]]:
+        """Normalize a (possibly FLAT / Responses-API-shaped) tool list into the nested
+        Chat-Completions shape `{"type":"function","function":{name,description,parameters}}`.
+
+        The sanitizer deliberately PRESERVES whatever shape the caller sent (the Responses
+        API consumes the flat `{"type":"function","name":...,"parameters":...}` form), but
+        `chat.completions` REQUIRES the nested `function` object — vLLM/OpenAI otherwise
+        reject the request with `tools.0.function: Field required`. Already-nested function
+        tools and any non-function tools pass through untouched, so this is safe (idempotent)
+        to apply right before a `chat.completions.create` call."""
+        if not tools:
+            return tools
+        out: List[Dict] = []
+        for t in tools:
+            if t.get("type") == "function" and not isinstance(t.get("function"), dict):
+                out.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("parameters", {}),
+                    },
+                })
+            else:
+                out.append(t)
+        return out
+
     def _sanitize_message_history(
         self, messages: List[Dict], tool_name_mapping: Dict[str, str]
     ) -> List[Dict]:

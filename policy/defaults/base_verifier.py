@@ -275,16 +275,21 @@ def base_verifier(messages):
     #   _verify                 — the simplest: a NOTE steer + verifier-channel marker.
     #   _verify_propose_approve — a self-checked trajectory EDIT (propose -> approve -> apply).
     _checks = (_verify, _verify_propose_approve)
+    _ran_clean = False
     for _check in _checks:
         try:
             _check(messages)
+            _ran_clean = True
         except Exception:
             # A verifier is an AUXILIARY control circuit — a check that fails (budget
             # exhausted, a backend error, a bug in a custom check) must NOT abort the
             # OUTER agent. Swallow and move on; the trajectory is just left un-edited.
             pass
-    # Record a `verifier`-channel marker UNCONDITIONALLY (the gate keys off it), so a
-    # round where no check produced an edit/note still can't re-fire on the SAME stale
-    # error next round. Skip if a check already left one as the latest message.
-    if messages and messages[-1].get("role") != "verifier":
+    # Record a `verifier`-channel marker (the gate keys off it) so a round where a check ran
+    # cleanly but produced no edit/note can't re-fire on the SAME stale error next round —
+    # but ONLY when at least one check ran WITHOUT raising. If EVERY check throws (depth
+    # exhausted every call, a buggy custom check), stamping "verified" here would be a LIE: the
+    # gate would skip the error forever and the verifier would be silently inert while looking
+    # healthy. On an all-throw round leave it un-marked so the error legitimately re-fires.
+    if _ran_clean and messages and messages[-1].get("role") != "verifier":
         messages.append({"role": "verifier", "content": "verified (no change)"})

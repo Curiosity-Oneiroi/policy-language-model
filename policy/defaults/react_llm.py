@@ -405,7 +405,7 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
     # `max_turns`/`return_budget` are model-controlled; coerce None/non-int/
     # negative -> a sane non-negative int (no raw TypeError / no surprise
     # negative range — see #18/#22). They sum into one flat per-round budget.
-    from plm._react_helper import _coerce_budget
+    from plm._react_helper import _coerce_budget, _build_last_round_reminder
     max_turns = _coerce_budget(max_turns, 8)
     return_budget = _coerce_budget(return_budget, 5)
     
@@ -414,6 +414,9 @@ def react_llm(messages, *, args=(), kwargs=None, objects=None,
         backend = _make_backend()
         for _round in range(max_turns + return_budget):
             check_depth_or_raise()                      # policy owns the depth gate
+            if _round == max_turns - 1:                 # mirror the root loop: planned work-rounds are spent —
+                msgs.append(_build_last_round_reminder(constraint))   # nudge the sub-agent to RETURN, else the
+                                                        # return_budget slack rounds pass silently and it never finalizes
             resp = backend.generate(msgs, tools=tools, **generate_kwargs)
             if not isinstance(resp, dict):                  # malformed backend response -> empty turn
                 resp = {}

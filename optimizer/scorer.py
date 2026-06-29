@@ -4,10 +4,9 @@ The scalar uses the EXACT weights the user committed to:
 
     score = 0.30*proxy_elo
           + 0.20*benchmark_score
-          + 0.15*artifact_throughput
-          + 0.10*workflow_invention_quality
-          + 0.10*budget_efficiency
-          + 0.10*stability_and_correctness
+          + 0.35*meta_reasoning_quality      # creative sub-LLM circuits that WORK and are USED — the headline nudge
+          + 0.05*budget_efficiency
+          + 0.05*stability_and_correctness
           + 0.05*anti_gaming_score
 
 The VECTOR is preserved for Pareto selection in `loop.py`; the SCALAR is only
@@ -23,17 +22,18 @@ mistake heuristic noise for signal):
                                  verifier_errors, model_calls anomalies
 
   HEURISTIC / STUB (transparent proxies until we emit per-round signals):
-    - artifact_throughput  : distinct policies created via `policy(...)` /
-                             `duplicate_policy(...)` mentions in tool outputs
-                             (proxy for "accepted artifacts" until the run
-                             emits a real artifact-accept event)
-    - workflow_invention_quality : 1 iff (a verifier is configured AND
-                             verifier_calls>0 AND simulates.jsonl is non-empty)
-                             — i.e. the run had a verifier that did fire AND
-                             measurement signal was produced. Until we emit
-                             per-workflow accept rows, this is the cheapest
-                             non-trivial proxy that satisfies the user's
-                             "explicit verifier AND contributed signal" rule.
+    - meta_reasoning_quality : QUALITY of sub-LLM-circuit use (subsumes the old
+                             artifact_throughput + workflow_invention_quality with a
+                             far richer signal). Three sub-scores from the trajectory:
+                             circuit_design (creative/diverse/composed circuits —
+                             named researcher-policies, fleets, verifiers,
+                             constraint-gated dispatches), circuit_success (dispatches
+                             RETURN instead of erroring), output_benefit (a successful
+                             dispatch's output is USED downstream — applied to
+                             policyzero / read to prune/decide). design GATES;
+                             success+benefit dominate. ORTHOGONAL to Elo: hand-grinding
+                             a strong engine scores LOW, delegating+composing well
+                             scores HIGH — the behaviour we want gepa to evolve.
     - budget_efficiency    : 1 − (fraction of rounds with no tool_call OR a
                              FAILED tool call). Until the run emits per-round
                              accept/decision events, "made a tool call that
@@ -55,10 +55,9 @@ from typing import Any, Dict, List, Optional, Tuple
 SCORE_WEIGHTS: Dict[str, float] = {
     "proxy_elo":                  0.30,
     "benchmark_score":            0.20,
-    "artifact_throughput":        0.15,
-    "workflow_invention_quality": 0.10,
-    "budget_efficiency":          0.10,
-    "stability_and_correctness":  0.10,
+    "meta_reasoning_quality":     0.35,   # creative sub-LLM circuits that WORK and are USED — the headline nudge
+    "budget_efficiency":          0.05,
+    "stability_and_correctness":  0.05,
     "anti_gaming_score":          0.05,
 }
 assert abs(sum(SCORE_WEIGHTS.values()) - 1.0) < 1e-9, "SCORE_WEIGHTS must sum to 1.0"
@@ -76,6 +75,16 @@ _ELO_CEIL = 2000.0
 # them out for a real artifact-event reader later is a one-call replacement.
 _RE_POLICY_CREATED = re.compile(r"\b(?:duplicate_policy|@policy|policy\s*\()\s*\(?['\"]([A-Za-z_]\w*)['\"]?")
 _RE_SIMULATE_CALL = re.compile(r"\bsimulate\s*\(")
+
+# meta_reasoning_quality: the sub-LLM-circuit surface + dispatch-failure signatures.
+_RE_MR_DISPATCH = re.compile(r"\b(react_llm|natural_llm|react_verifier_llm|parallel)\s*\(")
+_RE_MR_ASSIGN = re.compile(r"(\w+)\s*=\s*(?:react_llm|natural_llm|react_verifier_llm|parallel)\s*\(")
+_RE_MR_NAMED = re.compile(
+    r"@policy\s*\n\s*(?:async\s+)?def\s+(\w+)"
+    r"|duplicate_policy\s*\([^,]+,\s*['\"](\w+)['\"]"
+    r"|(?<![.\w])policy\s*\(\s*['\"](\w+)['\"]")
+_RE_MR_CONSTRAINT = re.compile(r"\bconstraint\s*=")
+_RE_MR_FAIL = re.compile(r"budget exhausted|ConstraintViolation|LLMDepthExceeded")
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -109,24 +118,41 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 # ---------- per-component scorers (each returns float in [0,1]) -------------
 
 def _proxy_elo_term(simulates: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
-    """REAL component. Best `est_elo` across all simulate rows -> normalized.
+    """REAL component. The OFFICIAL `est_elo` -> normalized.
 
-    Returns (score, raw_dict). `raw_dict['no_rated_games']=True` when est_elo is
-    missing on every row (recall: simulate sets est_elo=None unless RATED
-    opponents were played). In that case we return 0 — NOT a small constant —
-    because the optimizer must NOT credit candidates that never produced rated
-    play.
+    Prefers the dedicated post-RETURN evaluation row — the one tagged `final_eval`,
+    which the harness runs on the DELIVERED `policyzero` under a fixed N-game / fixed-seed
+    sample. That is the comparable, un-gameable score (every candidate measured the same
+    way on its final deliverable). Only when no final-eval row exists (single runs, older
+    runs) does it fall back to the best `est_elo` across the model's self-chosen peeks.
+
+    Returns (score, raw_dict). `raw_dict['no_rated_games']=True` when est_elo is missing
+    everywhere (simulate sets est_elo=None unless RATED opponents were played); then we
+    return 0 — NOT a small constant — so the optimizer never credits a candidate that
+    produced no rated play.
     """
-    best: Optional[float] = None
+    final_elo: Optional[float] = None              # the official post-RETURN evaluation
+    best_peek: Optional[float] = None              # fallback: best of the model's own peeks
     for row in simulates:
         summary = row.get("summary") or row
         e = summary.get("est_elo")
-        if isinstance(e, (int, float)):
-            best = e if best is None else max(best, float(e))
-    if best is None:
-        return 0.0, {"best_est_elo": None, "no_rated_games": True}
-    norm = max(0.0, min(1.0, (best - _ELO_FLOOR) / (_ELO_CEIL - _ELO_FLOOR)))
-    return norm, {"best_est_elo": best, "no_rated_games": False}
+        if not isinstance(e, (int, float)):
+            continue
+        if row.get("final_eval"):
+            final_elo = float(e)                   # keep the LAST tagged row (probe runs last)
+        best_peek = float(e) if best_peek is None else max(best_peek, float(e))
+
+    chosen = final_elo if final_elo is not None else best_peek
+    if chosen is None:
+        return 0.0, {"best_est_elo": None, "no_rated_games": True, "final_eval": False}
+    norm = max(0.0, min(1.0, (chosen - _ELO_FLOOR) / (_ELO_CEIL - _ELO_FLOOR)))
+    return norm, {
+        "best_est_elo": chosen,                    # OFFICIAL elo (final-eval if present)
+        "final_eval": final_elo is not None,
+        "final_eval_elo": final_elo,
+        "best_peek_elo": best_peek,
+        "no_rated_games": False,
+    }
 
 
 def _benchmark_score_term(simulates: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
@@ -147,50 +173,173 @@ def _benchmark_score_term(simulates: List[Dict[str, Any]]) -> Tuple[float, Dict[
     return max(0.0, min(1.0, float(best))), {"best_score": best}
 
 
-def _artifact_throughput_term(
+def _has_circuit_policy(code: str) -> bool:
+    """True if the trajectory defines a policy / function whose BODY itself dispatches
+    a sub-LLM (react_llm / natural_llm / parallel) — i.e. a policy that IS an agentic
+    circuit (multiple reactors / rounds doing a job), not a one-shot call. Detected by
+    indentation: a `def` / `async def` header followed by an indented block that
+    contains a dispatch. The strongest 'agentic, not just dispatching' signal."""
+    lines = code.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        stripped = lines[i].lstrip()
+        if stripped.startswith(("def ", "async def ")):
+            header_indent = len(lines[i]) - len(stripped)
+            body: List[str] = []
+            j = i + 1
+            while j < n:
+                if not lines[j].strip():
+                    j += 1
+                    continue
+                if (len(lines[j]) - len(lines[j].lstrip())) <= header_indent:
+                    break
+                body.append(lines[j])
+                j += 1
+            if _RE_MR_DISPATCH.search("\n".join(body)):
+                return True
+            i = j
+        else:
+            i += 1
+    return False
+
+
+def _meta_reasoning_quality_term(
     messages: List[Dict[str, Any]],
-    tool_calls_meta: List[Dict[str, Any]],
 ) -> Tuple[float, Dict[str, Any]]:
-    """HEURISTIC / STUB. Until runs emit a real per-artifact accept event, we
-    proxy "accepted artifacts" with the count of distinct policy names that
-    appear in tool RESULTS (so the kernel actually executed the def — failed
-    cells don't count toward this), capped at a `policies_for_full_credit`
-    saturation point (default 5: more than that and the optimizer should be
-    rewarding QUALITY not COUNT — the anti-gaming term picks that up)."""
-    saturate_at = 5
-    distinct: set[str] = set()
-    for tc in tool_calls_meta:
-        if tc.get("tool_status") not in ("completed", "return_valid"):
-            continue
-        result = tc.get("tool_result") or ""
-        if not isinstance(result, str):
-            continue
-        for m in _RE_POLICY_CREATED.finditer(result):
-            distinct.add(m.group(1))
-    raw = len(distinct)
-    score = min(1.0, raw / saturate_at)
-    return score, {"distinct_policies_created": raw, "names": sorted(distinct),
-                   "stub": True, "saturate_at": saturate_at}
+    """NEW (heuristic, from the trajectory). Rewards HIGH-QUALITY use of sub-LLM
+    circuits — the meta-reasoning that is the whole point of PLM — along three axes:
 
+      (1) circuit_design  — did it build AGENTIC SYSTEMS, not just fire dispatches?
+                            Rewards composition: named researcher-policies, parallel
+                            fleets, verifier circuits, multiple construct types, and
+                            especially a policy whose BODY itself dispatches (a multi-
+                            reactor circuit — what's needed to delegate a COMPLEX
+                            problem). Plain react_llm calls cap LOW; the top half
+                            REQUIRES real agentic structure.
+      (2) circuit_success — do those circuits actually WORK, i.e. RETURN instead of
+                            erroring ('budget exhausted' / ConstraintViolation /
+                            depth)? Fraction of dispatches that returned cleanly.
+      (3) output_benefit  — did a SUCCESSFUL circuit's output get USED downstream:
+                            applied to policyzero, read to decide/prune, OR fed into
+                            another circuit? A HELPER circuit (diagnostician/critic)
+                            that writes no code but whose output STEERS the next build
+                            counts — indirect benefit is benefit; chaining circuits
+                            into a pipeline earns extra. Unreferenced output = 0.
 
-def _workflow_invention_quality_term(
-    metrics: Dict[str, Any],
-    simulates: List[Dict[str, Any]],
-    verifier_configured: bool,
-) -> Tuple[float, Dict[str, Any]]:
-    """HEURISTIC / STUB. Spec: rewards a workflow ONLY if it has an explicit
-    verifier AND contributed signal. Until we emit per-workflow accept rows,
-    "had an explicit verifier" === `verifier_configured`, "verifier did fire"
-    === `verifier_calls > 0`, and "contributed signal" === non-empty
-    simulates.jsonl. All three required for credit. Treated as binary 0/1
-    because partial credit on a stub would just be noise."""
-    fired = (metrics.get("verifier_calls") or 0) > 0
-    has_signal = len(simulates) > 0
-    granted = bool(verifier_configured and fired and has_signal)
-    return (1.0 if granted else 0.0), {
-        "verifier_configured": verifier_configured,
-        "verifier_fired": fired,
-        "had_simulate_signal": has_signal,
+    Combined so design GATES (no circuits -> ~0) and success+benefit DOMINATE
+    (circuits that error or go unused earn almost nothing). Deliberately ORTHOGONAL
+    to Elo: a candidate that hand-grinds a strong engine scores LOW here; one that
+    delegates + composes well scores HIGH — exactly the behaviour we want gepa to
+    evolve toward. Subsumes the old artifact_throughput (named policies -> design)
+    and workflow_invention_quality (a working, contributing circuit -> success +
+    benefit) with a far richer signal. Heuristic until the kernel emits per-dispatch
+    events; the regexes are a single block so the swap to real events is one edit.
+    """
+    # ordered stream of (kind, text): assistant CODE cells + their tool RESULTS
+    stream: List[Tuple[str, str]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            code = ""
+            for tc in (msg.get("tool_calls") or []):
+                if isinstance(tc, dict):
+                    a = (tc.get("function") or {}).get("arguments")
+                    if isinstance(a, str):
+                        try:
+                            code += (json.loads(a).get("code", "") or "") + "\n"
+                        except Exception:
+                            code += a + "\n"
+            stream.append(("code", code))
+        elif role == "tool":
+            c = msg.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(str(x.get("text", "") if isinstance(x, dict) else x) for x in c)
+            stream.append(("result", str(c)))
+    allcode = "\n".join(t for k, t in stream if k == "code")
+    if not allcode.strip():
+        return 0.0, {"no_code": True, "stub": True}
+
+    # (1) circuit_design: reward AGENTIC COMPOSITION, not raw dispatching. Plain
+    # react_llm calls (even successful, even many) CAP LOW here — to delegate a genuinely
+    # complex problem you must build a SYSTEM: named researcher-policies, parallel fleets,
+    # verifier circuits, and especially a policy whose BODY itself dispatches (a multi-
+    # reactor circuit). Composition DOMINATES; raw volume is only a minor floor, so "just
+    # dispatching" can never reach the top half. This is the "it needs to do agentic" bar.
+    types_used = {n for n in ("react_llm", "natural_llm", "react_verifier_llm", "parallel")
+                  if re.search(r"\b" + n + r"\s*\(", allcode)}
+    named: set[str] = set()
+    for mm in _RE_MR_NAMED.finditer(allcode):
+        named.add(next(g for g in mm.groups() if g))
+    n_constraint = len(_RE_MR_CONSTRAINT.findall(allcode))
+    n_dispatch = len(_RE_MR_DISPATCH.findall(allcode))
+    has_fleet = "parallel(" in allcode
+    has_verifier = "react_verifier_llm(" in allcode
+    circuit_policy = _has_circuit_policy(allcode)        # a policy that INTERNALLY dispatches
+    # agentic points: named policies + fleet + verifier + a policy-that-dispatches +
+    # multi-type. ~5 points (e.g. a circuit-policy + a fleet + two named) -> full.
+    agentic = (min(3, len(named)) * 0.8
+               + (1.5 if has_fleet else 0.0)
+               + (1.5 if has_verifier else 0.0)
+               + (2.0 if circuit_policy else 0.0)
+               + (1.0 if len(types_used) >= 2 else 0.0))
+    diversity = min(1.0, len(types_used) / 3.0)
+    volume = min(1.0, n_dispatch / 4.0)
+    compose = min(1.0, agentic / 5.0)
+    circuit_design = 0.20 * diversity + 0.55 * compose + 0.25 * volume
+
+    # (2) circuit_success: fraction of dispatches whose cell did NOT error out
+    n_succ = n_fail = 0
+    for i, (k, t) in enumerate(stream):
+        if k != "code" or not _RE_MR_DISPATCH.search(t):
+            continue
+        d = len(_RE_MR_DISPATCH.findall(t))
+        result = stream[i + 1][1] if i + 1 < len(stream) and stream[i + 1][0] == "result" else ""
+        if _RE_MR_FAIL.search(result):
+            n_fail += d
+        else:
+            n_succ += d
+    total = n_succ + n_fail
+    circuit_success = (n_succ / total) if total else 0.0
+
+    # (3) output_benefit: a SUCCESSFUL dispatch's output is USED downstream — applied to policyzero,
+    # OR read to decide/prune, OR FED INTO ANOTHER circuit. The last case is the key one: a HELPER
+    # circuit (e.g. a diagnostician that names weaknesses, or a critic that picks a direction) rarely
+    # writes code itself, but the lead USES its output to steer the next build — that INDIRECT benefit
+    # IS benefit and is credited here (a referenced result counts; a result feeding another dispatch
+    # counts EXTRA, since chaining circuits into a pipeline is the behavior we most want). An output
+    # never referenced again earned nothing.
+    n_used = n_chained = 0
+    for i, (k, t) in enumerate(stream):
+        if k != "code":
+            continue
+        for am in _RE_MR_ASSIGN.finditer(t):
+            var = am.group(1)
+            result = stream[i + 1][1] if i + 1 < len(stream) and stream[i + 1][0] == "result" else ""
+            if _RE_MR_FAIL.search(result):
+                continue
+            later_cells = [t2 for k2, t2 in stream[i + 1:] if k2 == "code"]
+            pat = r"\b" + re.escape(var) + r"\b"
+            if any(re.search(pat, c) for c in later_cells):
+                n_used += 1
+                if any(re.search(pat, c) and _RE_MR_DISPATCH.search(c) for c in later_cells):
+                    n_chained += 1                     # output steers a later circuit (a pipeline)
+    # chained outputs earn a small bonus (capped) — composing circuits into pipelines is desirable.
+    output_benefit = min(1.0, (n_used + 0.25 * n_chained) / n_succ) if n_succ else 0.0
+
+    quality = 0.4 * circuit_success + 0.6 * output_benefit
+    score = circuit_design * (0.15 + 0.85 * quality)
+    return round(score, 6), {
+        "circuit_design": round(circuit_design, 3),
+        "circuit_success": round(circuit_success, 3),
+        "output_benefit": round(output_benefit, 3),
+        "n_dispatch": n_dispatch, "n_success": n_succ, "n_fail": n_fail,
+        "n_used_downstream": n_used, "n_chained_to_circuit": n_chained,
+        "circuit_types": sorted(types_used),
+        "named_policies": sorted(named), "n_constraint": n_constraint,
+        "has_fleet": has_fleet, "has_verifier": has_verifier,
+        "circuit_policy": circuit_policy, "agentic_points": round(agentic, 2),
         "stub": True,
     }
 
@@ -388,8 +537,7 @@ def score_run(run_dir: Path, *, verifier_configured: Optional[bool] = None) -> D
     # Per-component scoring (each returns (score, raw_diag)).
     pe, pe_raw = _proxy_elo_term(simulates)
     bs, bs_raw = _benchmark_score_term(simulates)
-    at, at_raw = _artifact_throughput_term(messages, tool_calls_meta)
-    wq, wq_raw = _workflow_invention_quality_term(metrics, simulates, verifier_configured)
+    mrq, mrq_raw = _meta_reasoning_quality_term(messages)
     be, be_raw = _budget_efficiency_term(metrics, messages)
     sc, sc_raw = _stability_and_correctness_term(run_status, answer, metrics, simulates)
     ag, ag_raw = _anti_gaming_term(messages, tool_calls_meta)
@@ -398,8 +546,7 @@ def score_run(run_dir: Path, *, verifier_configured: Optional[bool] = None) -> D
     vector = {
         "proxy_elo": pe,
         "benchmark_score": bs,
-        "artifact_throughput": at,
-        "workflow_invention_quality": wq,
+        "meta_reasoning_quality": mrq,
         "budget_efficiency": be,
         "stability_and_correctness": sc,
         "anti_gaming_score": ag,
@@ -419,8 +566,7 @@ def score_run(run_dir: Path, *, verifier_configured: Optional[bool] = None) -> D
             "num_simulates": len(simulates),
             "proxy_elo": pe_raw,
             "benchmark_score": bs_raw,
-            "artifact_throughput": at_raw,
-            "workflow_invention_quality": wq_raw,
+            "meta_reasoning_quality": mrq_raw,
             "budget_efficiency": be_raw,
             "stability_and_correctness": sc_raw,
             "anti_gaming_score": ag_raw,

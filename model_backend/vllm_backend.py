@@ -320,7 +320,7 @@ class VLLMBackend(BaseModelBackend):
         }
 
         if sanitized_tools:
-            completion_kwargs["tools"] = sanitized_tools
+            completion_kwargs["tools"] = self._as_chat_completions_tools(sanitized_tools)
             completion_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
 
         call_start = time.time()
@@ -464,7 +464,7 @@ class VLLMBackend(BaseModelBackend):
         }
 
         if sanitized_tools:
-            completion_kwargs["tools"] = sanitized_tools
+            completion_kwargs["tools"] = self._as_chat_completions_tools(sanitized_tools)
             completion_kwargs["tool_choice"] = tool_choice or "auto"
 
         call_start = time.time()

@@ -170,6 +170,7 @@ _MOD = {
     "OpenAIBackend":    "openai_backend",
     "VLLMBackend":      "vllm_backend",
     "AnthropicBackend": "anthropic_backend",
+    "FireworksBackend": "fireworks_backend",
 }
 
 

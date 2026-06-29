@@ -203,6 +203,18 @@ def natural_llm(messages, *, constraint=None, depth=None, return_budget=5, gener
                 # KeyError/TypeError that pydantic does NOT wrap). Treat ANY
                 # validation failure as a retry — surface the last one if the
                 # budget is exhausted — instead of letting it abort the call.
+                # STRUCTURELESS rescue: for a describe-only constraint (no response_format) the
+                # model emits a BARE value, and json.loads above can coerce a CORRECT answer away
+                # from a string ("1221" -> int 1221, "true" -> True, "null" -> None) so it fails
+                # here though the raw text validates. Before counting a failure, retry the raw
+                # string whenever json.loads changed it — else a model that answers correctly
+                # every round burns the entire budget on a parsing artifact and PLM mis-reads it
+                # as "the sub-LLM couldn't satisfy the constraint".
+                if value != content:
+                    try:
+                        return constraint.validate(content)
+                    except Exception:
+                        pass
                 last_err = e
                 # M6: append IN PLACE (extend, not `msgs = msgs + [...]`) so the failed answer +
                 # violation weave back into the caller's trajectory by reference, matching react_llm.

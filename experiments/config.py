@@ -36,6 +36,14 @@ BACKENDS: Dict[str, Dict[str, Any]] = {
         "env_key": None, "default_model": "Qwen/Qwen3-30B-A3B-Thinking-2507",
         "base_url": True,
     },
+    "FireworksBackend": {
+        # Fireworks AI, OpenAI-compatible. Qwen 3.7 Plus: reasoning (reasoning_content,
+        # default effort "medium") + tool calling, ~290 tok/s. Key from $FIREWORKS_API_KEY.
+        "module": "plm.model_backend.fireworks_backend", "cls": "FireworksBackend",
+        "env_key": "FIREWORKS_API_KEY",
+        "default_model": "accounts/fireworks/models/qwen3p7-plus",
+        "base_url": True,
+    },
 }
 
 

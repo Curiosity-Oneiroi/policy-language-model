@@ -231,6 +231,7 @@ class PLM:
         tool_timeout: Optional[float] = None,
         session_workspace: Optional[str] = None,
         simulate_config: Optional[Dict[str, Any]] = None,
+        final_probe: Optional[str] = None,
     ):
         self.model_backend = model_backend
         self.metaparams = metaparams
@@ -239,6 +240,11 @@ class PLM:
         self.pip_install_packages = pip_install_packages
         self.tool_timeout = tool_timeout
         self.session_workspace = session_workspace
+        # OPTIONAL harness code run as ONE kernel cell AFTER a successful RETURN and
+        # BEFORE the kernel is torn down — used by the optimizer to evaluate the delivered
+        # policy under a fixed, larger sample (the "official" Elo). Best-effort; a probe
+        # failure never affects the run's answer. None -> no probe (single runs etc.).
+        self.final_probe = final_probe
         # FIXED evaluation conditions for the `simulate` default (opponents, clock /
         # per_move_s / game_clock_s, max_moves, evaluate / eval_depth / reference_engine,
         # on_illegal / max_illegal_retries, max_workers). Passed to the kernel as
@@ -734,6 +740,17 @@ class PLM:
                     + (" (an output constraint was configured)" if constraint_is_set else "")
                     + "."
                 )
+
+            # RETURN succeeded (the loop broke, not the max-turns `else`). Run the optional
+            # final-eval probe as ONE last kernel cell — a fixed, larger evaluation of the
+            # delivered policy whose logged row the scorer reads as the OFFICIAL Elo — while
+            # the policy is still live, BEFORE the kernel is torn down below. Strictly
+            # best-effort: a probe error must never change the answer already returned.
+            if self.final_probe:
+                try:
+                    await asyncio.to_thread(repl.execute_cell, self.final_probe, None, None)
+                except Exception:
+                    pass
         finally:
             try:
                 repl.close()

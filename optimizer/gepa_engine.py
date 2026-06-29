@@ -34,6 +34,39 @@ from .scorer import SCORE_WEIGHTS
 COMPONENT_SYSTEM_PROMPT = "system_prompt"
 COMPONENT_VERIFIER = "verifier"
 
+
+def _verifier_weighted_selector(ratio: int = 3):
+    """A gepa ReflectionComponentSelector that favors the VERIFIER ~(ratio-1):1 over the system
+    prompt — the verifier is the live behavioral enforcer and the higher-leverage component to
+    evolve (a standing prompt alone does not reliably change behavior). Deterministic (a per-
+    candidate counter mod `ratio`): the first ratio-1 picks go to the verifier, then one to the
+    other component, repeat. Returns None (caller falls back to 'round_robin') if the gepa base
+    class can't be imported, so a gepa version change never breaks the run."""
+    try:
+        from gepa.proposer.reflective_mutation.base import ReflectionComponentSelector
+    except Exception:
+        return None
+
+    class _VerifierWeighted(ReflectionComponentSelector):
+        def __init__(self):
+            self._n = {}
+
+        def __call__(self, state, trajectories, subsample_scores, candidate_idx, candidate):
+            names = list(getattr(state, "list_of_named_predictors", []) or list(candidate.keys()))
+            if COMPONENT_VERIFIER not in names or len(names) < 2:
+                pid = state.named_predictor_id_to_update_next_for_program_candidate[candidate_idx]
+                state.named_predictor_id_to_update_next_for_program_candidate[candidate_idx] = \
+                    (pid + 1) % len(names)
+                return [names[pid]]
+            c = self._n.get(candidate_idx, 0)
+            self._n[candidate_idx] = c + 1
+            if c % ratio != (ratio - 1):
+                return [COMPONENT_VERIFIER]
+            others = [n for n in names if n != COMPONENT_VERIFIER]
+            return [others[(c // ratio) % len(others)]]
+
+    return _VerifierWeighted()
+
 # The rated opponent rungs. Each is its OWN gepa instance (instance-Pareto axis).
 OPPONENT_RUNGS: List[str] = [
     "maia-1100",
@@ -121,6 +154,7 @@ class PLMChessAdapter(GEPAAdapter):
                     "opponent": opp,
                     "opponent_score": s,
                     "metric_vector": metric_vector,
+                    "mrq": raw.get("meta_reasoning_quality") or {},
                     "subprocess_tail": (result.get("subprocess") or {}).get("tail", "")[-600:],
                 })
 
@@ -191,16 +225,41 @@ class PLMChessAdapter(GEPAAdapter):
             base = "Lost more than won against this rung."
         else:
             base = "Held or beat this rung; reinforce what worked."
+        mrq = traj.get("mrq") or {}
+        mrq_score = float(mv.get("meta_reasoning_quality", 0.0))
+        mr_signal = (
+            f"This run's meta-reasoning quality was {mrq_score:.2f} "
+            f"(circuit_success={mrq.get('circuit_success')}, output_benefit={mrq.get('output_benefit')}, "
+            f"{mrq.get('n_dispatch')} dispatches / {mrq.get('n_fail')} failed, "
+            f"built_a_circuit_policy={mrq.get('circuit_policy')}). "
+        )
         if component == COMPONENT_VERIFIER:
-            base += (" The verifier runs IN THE POLICY-SPACE KERNEL each round with the "
-                     "full ambient namespace (react_llm / natural_llm / parallel / policy "
-                     "edit APIs / policyzero): it may inject USER or SYSTEM turns, edit/prune "
-                     "the trajectory, call sub-policies, or fork/edit a MUTABLE policy — but "
-                     "must not error, abort the run, or edit a sealed policy. Weakest shaped "
-                     "metrics: " + weak_str + ".")
+            base += (
+                " >>> THE VERIFIER IS THE LIVE GUARD OF META-REASONING — and it matters MORE than the "
+                "system prompt, because a standing prompt does not reliably change behavior, but the "
+                "verifier acts MID-TRAJECTORY in the kernel each round with the full namespace "
+                "(react_llm / natural_llm / parallel / policy-edit APIs / policyzero) and a WRITABLE "
+                "trajectory. Its JOB is to GUARD the lab-lead against bad behavior — solving the "
+                "problem BY HAND inline, figuring/trying things out inline, NOT designing sub-LLM "
+                "circuits, or hand-grinding after a dispatch failed — and steer it to DESIGN AGENTIC "
+                "META-REASONING CIRCUITS (policies composing several reactors), spending MOST rounds "
+                "designing meta-reasoning and only HIGH-LEVEL thought on the goal, never inline "
+                "implementation/experimentation. It may inject turns, call sub-policies, or "
+                "edit/prune the inline turn. " + mr_signal +
+                "If that is LOW, THIS verifier FAILED to guard — evolve it into a sharper, more ACTIVE "
+                "guard: detect the specific failure (too much inline code this round, inline "
+                "experimentation, no/failed delegation, never composing a circuit, hand-grinding after "
+                "a failure) and intervene HARDER so the lead spends rounds DESIGNING CIRCUITS, not "
+                "solving by hand. Weakest shaped metrics: " + weak_str + "."
+            )
         else:
-            base += (" The system prompt should push budget-aware delegation and "
-                     "measurement; weakest shaped metrics: " + weak_str + ".")
+            base += (
+                " The system prompt sets the FRAMING — nudge the lab-lead to spend MOST rounds "
+                "DESIGNING meta-reasoning circuits (sub-LLM reactors composed into agentic systems), "
+                "to reason about the goal only at a HIGH level, and to NEVER figure things out / try "
+                "things out INLINE (the verifier is the live enforcer of that; the prompt is the "
+                "standing instruction). " + mr_signal + "Weakest shaped metrics: " + weak_str + "."
+            )
         return base
 
     @staticmethod
@@ -287,7 +346,7 @@ def run_gepa(
     max_metric_calls: int = 8,
     run_dir: Optional[str] = None,
     candidate_selection_strategy: str = "pareto",
-    module_selector: str = "round_robin",
+    module_selector: str = "verifier_weighted",
     reflection_minibatch_size: int = 1,
     seed: int = 0,
     label: Optional[str] = None,
@@ -321,6 +380,12 @@ def run_gepa(
     if run_dir is not None:
         gepa_run_dir = str(Path(run_dir) / "gepa_state")
         Path(gepa_run_dir).mkdir(parents=True, exist_ok=True)
+
+    # Bias component evolution toward the VERIFIER (the live behavioral enforcer) ~2:1 over the
+    # system prompt. gepa.optimize only accepts the strings 'round_robin'/'all' or a selector
+    # INSTANCE, so resolve our sentinel here; fall back to round-robin if the gepa base is absent.
+    if isinstance(module_selector, str) and module_selector == "verifier_weighted":
+        module_selector = _verifier_weighted_selector() or "round_robin"
 
     result = gepa.optimize(
         seed_candidate=seed_candidate,

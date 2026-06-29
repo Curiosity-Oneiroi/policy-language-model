@@ -464,7 +464,7 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
     # `max_turns`/`return_budget` are model-controlled; coerce None/non-int/
     # negative -> a sane non-negative int (no raw TypeError / no surprise
     # negative range — see #18/#22). They sum into one flat per-round budget.
-    from plm._react_helper import _coerce_budget
+    from plm._react_helper import _coerce_budget, _build_last_round_reminder
     max_turns = _coerce_budget(max_turns, 8)
     return_budget = _coerce_budget(return_budget, 5)
     
@@ -474,6 +474,12 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
         backend = _make_backend()
         for _round in range(max_turns + return_budget):
             check_depth_or_raise()                      # policy owns the depth gate
+            if verifier is not None and _round > 0:     # VERIFIER AT TOP (mirror root plm.py:503-504): run on the
+                with descend():                         # prior round's complete trajectory so the generate BELOW
+                    verifier(msgs)                      # always consumes its edits — never a wasted terminal pass.
+            if _round >= max_turns - 1:                 # final-round RETURN nudge (mirror root). RE-ASSERT each slack
+                msgs[:] = [m for m in msgs if m.get("_plm_meta") != "final_round_return_reminder"]  # round AFTER the
+                msgs.append(_build_last_round_reminder(constraint))   # verifier, so a prune/rewrite verifier can't strip it
             resp = backend.generate(msgs, tools=tools, **generate_kwargs)
             if not isinstance(resp, dict):                  # malformed backend response -> empty turn
                 resp = {}
@@ -567,18 +573,14 @@ def react_verifier_llm(messages, *, args=(), kwargs=None, objects=None,
             # model sees its own text-turn next round. Either way this round did NOT
             # terminate, so the verifier runs below.
 
-            # --- per-round VERIFIER hook (the trajectory control axis) ---
-            # Runs after EVERY non-terminal round (text-only or tool), once this
-            # round's messages are complete, BEFORE the next generate. A successful
-            # RETURN above already returned, so the verifier never runs on the
-            # terminal round. Wrapped in `descend()` so the depth guard accounts the
-            # verifier ONE level below react_verifier_llm — any react_llm/natural_llm
-            # circuit it builds is then capped at depth-1 (root=2) and respects the
-            # global budget. The verifier mutates `msgs` in place; its return value
-            # is ignored. Exceptions propagate (fail-loud; the verifier is trusted).
-            if verifier is not None:
-                with descend():
-                    verifier(msgs)
+            # --- per-round VERIFIER hook now runs at the TOP of the next round ---
+            # (moved up to mirror root plm.py:503-504). At the BOTTOM it also fired on the
+            # FINAL budget round, where its edits were discarded (no generate consumed them)
+            # and a depth-1 LLM verifier burned the last slot for nothing; worse, a prune
+            # verifier here could strip the just-appended final-round RETURN reminder. Running
+            # it at the top (for _round > 0) means every verifier pass is followed by a generate,
+            # and the reminder is re-asserted AFTER it so the RETURN nudge can't be stripped.
+            # (descend() still accounts it depth-1; the verifier mutates msgs in place.)
 
         # --- budget exhausted: model never produced an accepted RETURN(value) ---
         if constraint is None:

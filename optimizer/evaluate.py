@@ -55,6 +55,11 @@ class EvalConfig:
     # Subprocess timeout (seconds). Hard kill if PLM hangs.
     subprocess_timeout: float = 300.0
 
+    # Dedicated post-RETURN evaluation of the delivered policy → the OFFICIAL Elo: one
+    # `simulate(policyzero, N, fixed-seed)` after RETURN, tagged final_eval so the scorer
+    # reads it instead of the model's self-chosen peeks. None -> off (no final eval).
+    final_eval_games: Optional[int] = None
+
     # Misc. dotenv_path forwarded so the run subprocess loads creds.
     dotenv_path: Optional[str] = None
 
@@ -63,6 +68,18 @@ class EvalConfig:
 
     # Extra args merged into the JSON config (escape hatch for future fields).
     extra_config: Dict[str, Any] = field(default_factory=dict)
+
+    # Optional shared-pool hooks, injected by the experiments layer (dependency injection —
+    # keeps the optimizer decoupled from `plm.experiments`). When `acquire_workspace` is set,
+    # `evaluate()` BORROWS a ready pool workspace (reusing its pre-built game+deps venv) for
+    # the run instead of creating `workspace_root/<cid>` from scratch, then hands it back via
+    # `release_workspace(number)`. This makes optimizer candidates reuse the SAME pool the
+    # single runs use, so the venv cost is paid once (not per candidate).
+    #   acquire_workspace(run_id: str) -> {"number": int, "path": str} | None
+    #     (None -> fall back to a self-made workspace, e.g. pool empty or none freed in time)
+    #   release_workspace(number: int) -> None
+    acquire_workspace: Optional[Any] = None
+    release_workspace: Optional[Any] = None
 
 
 def _python_executable() -> str:
@@ -93,77 +110,100 @@ def evaluate(candidate: Candidate, eval_cfg: EvalConfig) -> Dict[str, Any]:
     metaparam_dir = Path(eval_cfg.metaparams_root) / candidate.id
     run_id = f"{eval_cfg.stage}_{candidate.id}"
     run_dir = Path(eval_cfg.runs_root) / run_id
-    workspace = Path(eval_cfg.workspace_root) / candidate.id
 
     # 1. Materialize the candidate metaparam dir (frozen `policies/` + prompt + verifier).
     candidate.materialize(metaparam_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    workspace.mkdir(parents=True, exist_ok=True)
 
-    # 2. Compose the run-entry config (mirrors `run_entry._main`'s expected schema).
-    cfg: Dict[str, Any] = {
-        "run_id": run_id,
-        "runs_dir": str(Path(eval_cfg.runs_root).resolve()),
-        "workspace": str(workspace.resolve()),
-        "backend": {
-            "name": eval_cfg.backend_name,
-            "model": eval_cfg.backend_model,
-            "base_url": eval_cfg.backend_base_url,
-        },
-        "metaparam_dir": str(metaparam_dir.resolve()),
-        "task": eval_cfg.task,
-        "max_turns": eval_cfg.max_turns,
-        "return_budget": eval_cfg.return_budget,
-        "tool_timeout": eval_cfg.tool_timeout,
-    }
-    if eval_cfg.simulate_config is not None:
-        cfg["simulate_config"] = eval_cfg.simulate_config
-    if eval_cfg.dotenv_path:
-        cfg["dotenv_path"] = eval_cfg.dotenv_path
-    cfg.update(eval_cfg.extra_config)
+    # 1b. Pick the workspace (the kernel venv). Prefer a BORROWED pool workspace: its
+    #     game+deps venv is pre-built and reused, so we don't pay venv creation per
+    #     candidate (and hit fewer provisioning errors) — it's the same pool single runs
+    #     use. Fall back to a self-made per-candidate dir when no pool is wired in
+    #     (acquire_workspace is None) or none freed in time (acquire returned None).
+    pool_number: Optional[int] = None
+    workspace: Optional[Path] = None
+    if eval_cfg.acquire_workspace is not None:
+        alloc = eval_cfg.acquire_workspace(run_id)
+        if alloc:
+            pool_number, workspace = alloc["number"], Path(alloc["path"])
+    if workspace is None:
+        workspace = Path(eval_cfg.workspace_root) / candidate.id
+        workspace.mkdir(parents=True, exist_ok=True)
 
-    cfg_path = run_dir / "_optimizer_config.json"
-    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-
-    # 3. Launch the run subprocess.
-    cmd = [_python_executable(), "-m", "plm.experiments.run_entry", str(cfg_path)]
-    started = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=eval_cfg.subprocess_timeout,
-            env={**os.environ},          # inherit (so PYTHONPATH / SLATE_API_KEY / etc. propagate)
-            check=False,
-        )
-        elapsed = time.time() - started
-        rc = proc.returncode
-        # Keep only the last few KB of stderr/stdout for the ledger — full logs
-        # live in run_dir/error.txt and the run subprocess's own files.
-        tail_blob = (proc.stdout[-2000:] if proc.stdout else "") \
-                  + (("\n[stderr]\n" + proc.stderr[-2000:]) if proc.stderr else "")
-    except subprocess.TimeoutExpired as e:
-        elapsed = time.time() - started
-        rc = -1
-        tail_blob = f"[evaluate] subprocess TimeoutExpired after {eval_cfg.subprocess_timeout}s: {e}"
+        # 2. Compose the run-entry config (mirrors `run_entry._main`'s expected schema).
+        cfg: Dict[str, Any] = {
+            "run_id": run_id,
+            "runs_dir": str(Path(eval_cfg.runs_root).resolve()),
+            "workspace": str(workspace.resolve()),
+            "backend": {
+                "name": eval_cfg.backend_name,
+                "model": eval_cfg.backend_model,
+                "base_url": eval_cfg.backend_base_url,
+            },
+            "metaparam_dir": str(metaparam_dir.resolve()),
+            "task": eval_cfg.task,
+            "max_turns": eval_cfg.max_turns,
+            "return_budget": eval_cfg.return_budget,
+            "tool_timeout": eval_cfg.tool_timeout,
+            "final_eval_games": eval_cfg.final_eval_games,
+        }
+        if eval_cfg.simulate_config is not None:
+            cfg["simulate_config"] = eval_cfg.simulate_config
+        if eval_cfg.dotenv_path:
+            cfg["dotenv_path"] = eval_cfg.dotenv_path
+        cfg.update(eval_cfg.extra_config)
 
-    # 4. Score the resulting run_dir. `verifier_configured` is exact, not
-    #    inferred — we know whether THIS candidate shipped a non-no-op verifier
-    #    because we authored it. We treat "any non-empty verifier source" as
-    #    configured (the no-op verifier IS configured; it just doesn't act).
-    verifier_configured = bool((candidate.verifier or "").strip())
-    score = score_run(run_dir, verifier_configured=verifier_configured)
+        cfg_path = run_dir / "_optimizer_config.json"
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
-    return {
-        "candidate_id": candidate.id,
-        "stage": eval_cfg.stage,
-        "run_dir": str(run_dir),
-        "metaparam_dir": str(metaparam_dir),
-        "score": score,
-        "subprocess": {
-            "returncode": rc,
-            "elapsed_s": round(elapsed, 3),
-            "tail": tail_blob,
-        },
-    }
+        # 3. Launch the run subprocess.
+        cmd = [_python_executable(), "-m", "plm.experiments.run_entry", str(cfg_path)]
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=eval_cfg.subprocess_timeout,
+                env={**os.environ},          # inherit (so PYTHONPATH / SLATE_API_KEY / etc. propagate)
+                check=False,
+            )
+            elapsed = time.time() - started
+            rc = proc.returncode
+            # Keep only the last few KB of stderr/stdout for the ledger — full logs
+            # live in run_dir/error.txt and the run subprocess's own files.
+            tail_blob = (proc.stdout[-2000:] if proc.stdout else "") \
+                      + (("\n[stderr]\n" + proc.stderr[-2000:]) if proc.stderr else "")
+        except subprocess.TimeoutExpired as e:
+            elapsed = time.time() - started
+            rc = -1
+            tail_blob = f"[evaluate] subprocess TimeoutExpired after {eval_cfg.subprocess_timeout}s: {e}"
+
+        # 4. Score the resulting run_dir. `verifier_configured` is exact, not
+        #    inferred — we know whether THIS candidate shipped a non-no-op verifier
+        #    because we authored it. We treat "any non-empty verifier source" as
+        #    configured (the no-op verifier IS configured; it just doesn't act).
+        verifier_configured = bool((candidate.verifier or "").strip())
+        score = score_run(run_dir, verifier_configured=verifier_configured)
+
+        return {
+            "candidate_id": candidate.id,
+            "stage": eval_cfg.stage,
+            "run_dir": str(run_dir),
+            "metaparam_dir": str(metaparam_dir),
+            "score": score,
+            "subprocess": {
+                "returncode": rc,
+                "elapsed_s": round(elapsed, 3),
+                "tail": tail_blob,
+            },
+        }
+    finally:
+        # Return the borrowed pool workspace so the next candidate (or a single run) reuses
+        # it. Best-effort — a failed release must never mask the eval result.
+        if pool_number is not None and eval_cfg.release_workspace is not None:
+            try:
+                eval_cfg.release_workspace(pool_number)
+            except Exception:
+                pass

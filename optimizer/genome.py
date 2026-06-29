@@ -103,37 +103,38 @@ def verifier(messages):
 # mid-stream — a user-role nudge is the reliable channel for caller corrections.
 _VERIFIER_DELEGATE_NUDGE = '''\
 def verifier(messages):
-    """Delegate-or-measure nudge verifier (kernel-resident, SINGLE self-contained def).
+    """Meta-reasoning GUARD (kernel-resident, SINGLE self-contained def).
 
-    Runs in the policy space each non-terminal round with the full ambient
-    namespace (react_llm / natural_llm / parallel / policy edit APIs / policyzero).
-    `messages` is the live, writable trajectory — this seed only APPENDS a user
-    turn, but a more powerful evolved verifier could call sub-policies, fork/edit a
-    mutable policy, or prune/edit turns. It may NOT abort the run or edit a sealed
-    policy. CONTRACT: the verifier is ONE top-level `def verifier(messages)` and
-    nothing else — every helper, import, and constant lives INSIDE this body (so
-    nothing leaks into the kernel namespace). Cross-round state, if needed, lives
-    in the kernel namespace, e.g. `globals().setdefault("_v_state", {})`.
+    The verifier is the LIVE guard of meta-reasoning — and the lever that matters most, because
+    a standing system prompt does not reliably change behavior, but THIS runs in the policy space
+    each non-terminal round with the full ambient namespace (react_llm / natural_llm / parallel /
+    policy-edit APIs / policyzero) and a WRITABLE trajectory. Its job: catch the lab-lead falling
+    into bad behavior — solving the problem BY HAND inline instead of DESIGNING sub-LLM circuits,
+    or hand-grinding after a dispatch failed — and steer it back toward DESIGNING AGENTIC META-
+    REASONING CIRCUITS (policies that compose several reactors across rounds). It may inject turns,
+    call sub-policies, or edit/prune the trajectory; it may NOT abort the run or edit a sealed
+    policy. CONTRACT: ONE top-level `def verifier(messages)`; every helper/import/constant lives
+    INSIDE this body; cross-round state in globals()['_v_state'].
 
-    Heuristic: if the latest assistant turn carried a LONG python tool_call whose
-    code does NOT obviously delegate (react_llm / natural_llm) or measure
-    (simulate / measure), inject a USER-role reminder to delegate or measure.
-    USER role (not SYSTEM) is required because real subagent backends (Slate opus
-    on behavior_mode=subagent) drop NEW system messages mid-conversation; user
-    turns are the reliable mid-stream injection channel.
+    Seed heuristic (the optimizer SHOULD evolve this into a far stronger guard): track, across
+    rounds, how much the lead hand-grinds vs designs circuits. If the latest round is a LONG inline
+    code block that does NOT delegate (react_llm / natural_llm / parallel) or measure (simulate),
+    it is solving-by-hand — steer toward designing a circuit, escalating if it keeps happening; and
+    if a recent dispatch FAILED and the lead responded by hand-writing, call that out specifically
+    (redesign the circuit with more rounds / a pipeline — don't grind). USER role for injections:
+    subagent backends drop NEW system turns mid-stream; user turns are the reliable channel.
     """
     import json
 
-    LONG_CODE_THRESHOLD = 800
-    DELEGATION_TOKENS = ("react_llm", "react_verifier_llm", "simulate(", "measure(", "natural_llm")
-    NUDGE = (
-        "[meta-coach] You just wrote a long inline code block. Before another, "
-        "ask: can a sub-policy (react_llm / react_verifier_llm) do this work, "
-        "or has any of it been MEASURED (simulate / a benchmark) on the current "
-        "policy? Spend the next turn DELEGATING or MEASURING, not coding inline."
-    )
+    st = globals().setdefault("_v_state", {})
+    st["inline_rounds"] = st.get("inline_rounds", 0)
+    st["circuit_rounds"] = st.get("circuit_rounds", 0)
 
-    def last_assistant_python_code(msgs):
+    LONG = 800
+    DELEGATE = ("react_llm", "react_verifier_llm", "natural_llm", "parallel(")
+    MEASURE = ("simulate(", "measure(")
+
+    def last_assistant_code(msgs):
         for m in reversed(msgs):
             if m.get("role") != "assistant":
                 continue
@@ -151,16 +152,62 @@ def verifier(messages):
                     return None
             if not isinstance(args, dict):
                 return None
-            code = args.get("code")
-            return code if isinstance(code, str) else None
+            c = args.get("code")
+            return c if isinstance(c, str) else None
         return None
 
-    code = last_assistant_python_code(messages)
-    if not code or len(code) < LONG_CODE_THRESHOLD:
+    def recent_dispatch_failed(msgs):
+        seen = 0
+        for m in reversed(msgs):
+            if m.get("role") != "tool":
+                continue
+            seen += 1
+            r = m.get("content")
+            if isinstance(r, list):
+                r = " ".join(str(x) for x in r)
+            r = str(r or "")
+            if ("budget exhausted" in r) or ("ConstraintViolation" in r) or ("LLMDepthExceeded" in r):
+                return True
+            if seen >= 2:
+                break
+        return False
+
+    code = last_assistant_code(messages)
+    if not code:
         return
-    if any(tok in code for tok in DELEGATION_TOKENS):
+    if any(t in code for t in DELEGATE):
+        st["circuit_rounds"] = st["circuit_rounds"] + 1
         return
-    messages.append({"role": "user", "content": NUDGE})
+    if len(code) < LONG:
+        return
+    if any(t in code for t in MEASURE):
+        return
+
+    st["inline_rounds"] = st["inline_rounds"] + 1
+    n = st["inline_rounds"]
+    if recent_dispatch_failed(messages):
+        steer = (
+            "[meta-coach] A sub-LLM circuit just FAILED and you are now hand-writing the engine "
+            "yourself — that surrenders the leverage. A failure means the circuit was under-built "
+            "or under-resourced: REDESIGN it (more rounds/budget, split into a pipeline "
+            "proposer->critic->reviser, or a policy that composes several reactors) and re-dispatch "
+            "the improved circuit. Do not solve it by hand."
+        )
+    elif n >= 2:
+        steer = (
+            "[meta-coach] Round " + str(n) + " of solving by hand inline. You are the lab LEAD, not "
+            "the engineer — stop typing the chess machinery yourself. DESIGN an agentic circuit: a "
+            "policy that composes react_llm / natural_llm reactors (and a parallel fleet or verifier "
+            "where useful) to build and test it for you. Spend this round DESIGNING that circuit."
+        )
+    else:
+        steer = (
+            "[meta-coach] You just wrote a long inline code block instead of delegating. Before more "
+            "inline work, DESIGN a sub-LLM circuit to do it — a react_llm/natural_llm reactor, a "
+            "parallel fleet, or a policy that composes several reactors — and let IT build/test the "
+            "machinery; then MEASURE the result. Don't hand-grind."
+        )
+    messages.append({"role": "user", "content": steer})
 '''
 
 
@@ -180,8 +227,8 @@ def seed_candidates(seed_dir: Optional[Path] = None) -> List[Candidate]:
     sp = (seed / "system_prompt.md").read_text(encoding="utf-8")
 
     sp_budget_aware = (
-        "## Budget Pressure (50-round lead budget)\n"
-        "You have a SCARCE 50-round lead budget. DO NOT spend rounds on inline\n"
+        "## Budget Pressure (15-round lead budget)\n"
+        "You have a SCARCE 15-round lead budget. DO NOT spend rounds on inline\n"
         "object-level chess work; spend them DESIGNING workflows, EVALUATORS, and\n"
         "DELEGATING to sub-policies. If a turn produced no experiment, no accepted\n"
         "artifact, and no decision, you wasted it.\n\n"

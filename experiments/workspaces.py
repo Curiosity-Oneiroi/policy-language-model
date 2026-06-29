@@ -16,9 +16,11 @@ Status is tracked with marker files so it survives a backend restart:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -127,13 +129,46 @@ class WorkspacePool:
 
     # ---- allocation ------------------------------------------------------- #
     def allocate(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Reserve the lowest-numbered ready+free workspace for `run_id`; None if none free."""
+        """Reserve the lowest-numbered ready+free workspace for `run_id`; None if none free.
+
+        The `.allocated` marker is created with O_CREAT|O_EXCL, so allocation is atomic
+        ACROSS PROCESSES — the optimizer subprocess shares this pool with the web backend,
+        and two processes racing for the last slot must not both win.
+        """
         with self._lock:
             for n in self._numbers():
                 if self._ready(n) and not self._allocated(n):
-                    self._alloc_file(n).write_text(str(run_id), encoding="utf-8")
+                    try:
+                        fd = os.open(str(self._alloc_file(n)),
+                                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                    except FileExistsError:
+                        continue                       # another process grabbed it first
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(str(run_id))
                     return {"number": n, "path": str(self._dir(n))}
         return None
+
+    def allocate_blocking(self, run_id: str, *, timeout: float = 1800.0,
+                          poll_s: float = 1.0) -> Optional[Dict[str, Any]]:
+        """Like `allocate`, but WAIT for a slot when the pool is full or still provisioning.
+
+        Returns None IMMEDIATELY when the pool is empty (size 0) so the caller can fall
+        back to its own workspace. Otherwise polls until a ready workspace frees (or
+        `timeout` elapses) — so the pool size becomes the optimizer's concurrency cap, and
+        slots that are mid-provisioning are awaited rather than skipped. Safe to call from a
+        separate process (allocation is atomic; see `allocate`)."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                empty = not self._numbers()
+            if empty:
+                return None                            # no pool configured — caller falls back
+            got = self.allocate(run_id)
+            if got is not None:
+                return got
+            if time.monotonic() >= deadline:
+                return None                            # waited too long — caller falls back
+            time.sleep(poll_s)
 
     def free(self, number: int) -> None:
         """Release a workspace. If it's now above the target (a shrink happened while it was

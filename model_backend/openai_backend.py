@@ -541,7 +541,7 @@ class OpenAIBackend(BaseModelBackend):
                 completion_kwargs[k] = kwargs[k]
 
         if tools:
-            completion_kwargs["tools"] = tools
+            completion_kwargs["tools"] = self._as_chat_completions_tools(tools)
             completion_kwargs.setdefault("tool_choice", kwargs.get("tool_choice", "auto"))
         
         call_start = time.time()
@@ -706,7 +706,7 @@ class OpenAIBackend(BaseModelBackend):
             if k in kwargs:
                 completion_kwargs[k] = kwargs[k]
         if tools:
-            completion_kwargs["tools"] = tools
+            completion_kwargs["tools"] = self._as_chat_completions_tools(tools)
             completion_kwargs.setdefault("tool_choice", tool_choice or "auto")
         
         response = await self.client.chat.completions.create(**completion_kwargs)

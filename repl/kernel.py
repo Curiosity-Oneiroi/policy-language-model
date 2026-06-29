@@ -550,13 +550,28 @@ while True:
         )
 
     if _repl_terminal_etype == "return":
+        # A policy OBJECT can't be pickled (its depth-wrap closes over a ContextVar) and is almost
+        # never what you mean to deliver anyway — the SOURCE is. Auto-substitute a policy's source
+        # string so RETURN(some_policy) JUST WORKS instead of silently failing the whole run.
+        if _builtins.hasattr(_repl_return_value, "_p_source"):
+            try:
+                _repl_return_value = _repl_return_value._p_source
+            except Exception:
+                pass
         try:
             _repl_return_blob = _dill.dumps(_repl_return_value)
         except Exception as _repl_pickle_err:
+            # LOUD + actionable: the old message was a bare repr and the model would retry the same
+            # un-picklable RETURN until the budget died. Name the type and say exactly what to do.
             _repl_return_blob = None
             _repl_stderr_buf.write(
-                "RETURN: could not serialize return value: "
-                + _builtins.repr(_repl_pickle_err) + "\n"
+                "RETURN FAILED — the value (type "
+                + _builtins.type(_repl_return_value).__name__
+                + ") is not serializable, so THE TASK DID NOT FINISH: "
+                + _builtins.repr(_repl_pickle_err)
+                + ". RETURN a PICKLABLE representation instead — a SOURCE STRING / dict / number, "
+                + "NOT a live object that closes over kernel state. Call RETURN(...) again with a "
+                + "serializable value.\n"
             )
         _repl_write_frame({
             "type":        "return",

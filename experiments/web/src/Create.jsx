@@ -7,7 +7,7 @@ const HR = <hr style={{ border: "none", borderTop: "1px solid var(--border)", ma
 // Pick a sensible default backend (prefer an available one, prefer vLLM).
 function defaultBackend(backends) {
   return (
-    backends.find((b) => b.available && /vllm/i.test(b.name)) ||
+    backends.find((b) => b.available && /fireworks/i.test(b.name)) ||
     backends.find((b) => b.available) ||
     backends[0] ||
     null
@@ -148,8 +148,8 @@ function BackendBlock({ title, backends, value, onChange }) {
 }
 
 const OPT_DEFAULTS = {
-  model: "Qwen/Qwen3-30B-A3B-Thinking-2507",
-  base_url: "http://0.0.0.0:8005/v1",
+  model: "accounts/fireworks/models/qwen3p7-plus",
+  base_url: "https://api.fireworks.ai/inference/v1",
 };
 
 function OptForm({ backends }) {
@@ -160,9 +160,9 @@ function OptForm({ backends }) {
     label: "", recipe: "E4",
     backend: { name: "", model: OPT_DEFAULTS.model, base_url: OPT_DEFAULTS.base_url },
     reflection: { name: "", model: OPT_DEFAULTS.model, base_url: OPT_DEFAULTS.base_url },
-    opponents: ["maia-1500", "stockfish-1320"], clock: "per_move", per_move_s: 3,
-    game_clock_s: 60, max_moves: 300, evaluate: false, games_per_opponent: 4,
-    generations: 3, max_metric_calls: 12, population_size: 3, max_turns: 30, return_budget: 5,
+    opponents: ["maia-1500", "stockfish-1320", "maia-1100"], clock: "per_move", per_move_s: 2,
+    game_clock_s: 100, max_moves: 120, evaluate: true, games_per_opponent: 3,
+    generations: 5, max_metric_calls: 30, population_size: 10, max_turns: 15, return_budget: 5,
   });
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -175,7 +175,7 @@ function OptForm({ backends }) {
       const a = defaultBackend(backends);
       if (!a) return;
       const sb = !!a.supports_base_url;
-      const blk = { name: a.name, model: a.default_model || OPT_DEFAULTS.model, base_url: sb ? OPT_DEFAULTS.base_url : "" };
+      const blk = { name: a.name, model: OPT_DEFAULTS.model || a.default_model, base_url: sb ? OPT_DEFAULTS.base_url : "" };
       setForm((f) => ({ ...f, backend: { ...blk }, reflection: { ...blk } }));
     }
   }, [backends]); // eslint-disable-line
