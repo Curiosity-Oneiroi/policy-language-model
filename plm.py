@@ -21,7 +21,7 @@ from plm.metaparams import get_system_prompt
 from plm.plm_tools import _tool_python
 from plm.repl import PythonReplSession, PREFIX, DEFAULT_PREINSTALL
 
-_PLM_ROOT_DEPTH: int = 2
+_PLM_ROOT_DEPTH: int = 1   # depth-1 experiment: sub-agents get NO LLM primitives
 
 
 _INTERNAL_KWARGS: frozenset[str] = frozenset({
@@ -35,6 +35,7 @@ _BACKEND_DEPS: dict[str, tuple[str, ...]] = {
     "OpenAIBackend":    ("openai",),
     "AnthropicBackend": ("anthropic",),
     "VLLMBackend":      ("openai",),
+    "GeminiBackend":    ("openai",),
 }
 
 
@@ -244,7 +245,7 @@ class PLM:
 
         tools = [_tool_python()]
 
-        # Reserved-kwarg guard (mirrors react_llm / react_verifier_llm / natural_llm): the per-round
+        # Reserved-kwarg guard (mirrors react_auto / react_verifier_llm / llm): the per-round
         # call passes `messages` and `tools` explicitly, then splats **clean_generate_kwargs — so a
         # caller-supplied `tools=`/`messages=` in generate_kwargs would collide into a cryptic
         # `TypeError: got multiple values for keyword argument`. Reject it up front with a clear message.
@@ -305,7 +306,7 @@ class PLM:
                     response = {}                          # degrade to an empty turn, never a raw crash.
                 # ONE normalization at the top of the turn makes EVERYTHING below — _track_model_call,
                 # .get("content"/"reasoning"/"tool_calls") — safe by construction, so a malformed
-                # backend response can't escape PLM.__call__ as an AttributeError. Mirrors react_llm.
+                # backend response can't escape PLM.__call__ as an AttributeError. Mirrors react_auto.
 
                 _track_model_call(response, call_start, metrics, token_state)
 
@@ -324,7 +325,7 @@ class PLM:
                     "content": content,
                     "reasoning": reasoning,
                     # Store ONLY the executed+answered call, and ONLY if it's a dict — a non-dict
-                    # entry would corrupt the next round's history sanitizer. Mirrors react_llm.
+                    # entry would corrupt the next round's history sanitizer. Mirrors react_auto.
                     "tool_calls": ([tool_calls[0]] if tool_calls and isinstance(tool_calls[0], dict) else None),
                     "_timestamp": time.time(),
                 })
@@ -338,7 +339,7 @@ class PLM:
                 tool_call = tool_calls[0]
                 # PLM emitted parallel tool_calls; the root loop runs ONLY the first. Surface the
                 # nudge in PLM's OWN tool result (its message stream) so PLM self-corrects to one
-                # python call per turn — mirrors react_llm's note to its sub-LLM: each model's
+                # python call per turn — mirrors react_auto's note to its sub-LLM: each model's
                 # coaching stays in its own stream, never leaks across levels.
                 _parallel_note = (
                     "[plm] you emitted " + str(len(tool_calls)) + " tool_calls; only the FIRST ran "
@@ -347,7 +348,7 @@ class PLM:
                 if not isinstance(tool_call, dict):
                     # Malformed first tool_call from a non-conformant backend: the assistant turn
                     # stored tool_calls=None for it, so reply as a USER turn (NOT an orphan `tool`).
-                    # Mirrors react_llm's hardening; the root loop's outer try has no except,
+                    # Mirrors react_auto's hardening; the root loop's outer try has no except,
                     # so without this a bare-subscript below would crash PLM.__call__ raw.
                     messages.append({"role": "user",
                                      "content": _parallel_note + f"[error] malformed tool_call "

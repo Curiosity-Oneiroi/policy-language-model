@@ -6,7 +6,7 @@ Layout (per the plan):
     the LLM-policy bodies; owns `_make_backend()`, the depth ContextVar +
     `llm_call`/`descend`/`check_depth_or_raise`/`LLMDepthExceeded`, and the
     blessed-caller gate (`_BLESSED_CALLERS` / `_check_blessed_caller`).
-  * `natural_llm.py`, `react_llm.py`, `react_verifier_llm.py` — the immutable
+  * `llm.py`, `react_auto.py`, `react_verifier_llm.py` — the immutable
     LLM-loop policy source files, and `base_verifier.py` — a MUTABLE +
     DUPLICABLE reference verifier. All are read as TEXT by
     `iter_default_policies` and replayed as synthetic cells via the bootstrap
@@ -15,7 +15,7 @@ Layout (per the plan):
     Sealing/blessing is decided per-name by `_LLM_DEFAULT_POLICIES` (below), NOT
     by being a default file: `base_verifier` is a default file that is deliberately
     NOT in that set, so it stays mutable + duplicable + unblessed (it reaches the
-    model only via `natural_llm` / `react_llm`).
+    model only via `llm` / `react_auto`).
 
 Two DISTINCT concepts (kept separate):
   * `_LLM_DEFAULT_POLICIES` (here) — the LLM-loop default NAMES. The bootstrap
@@ -66,7 +66,10 @@ def iter_default_policies():
 # which also contains a metaparam's sealed extras — those are sealed but NOT blessed.
 # NOTE: `base_verifier` ships as a default file too but is intentionally ABSENT here —
 # that keeps it mutable + duplicable + unblessed (a PLM-forkable reference verifier).
-_LLM_DEFAULT_POLICIES = frozenset({"natural_llm", "react_llm", "react_verifier_llm"})
+# `react` is the de-bundled capability (R13): present in FULL only; in harnesses
+# without it the name simply resolves to None below and is skipped.
+_LLM_DEFAULT_POLICIES = frozenset({"llm", "react", "react_auto",
+                                   "react_verifier_llm"})
 
 
 def _bless_llm_callers() -> None:
@@ -89,7 +92,7 @@ def _bless_llm_callers() -> None:
     codes = []
     # Bless ONLY the LLM-loop defaults (the BLESS set) — NOT the runtime SEAL set
     # (`_SEALED_POLICIES`). Those were once identical, but a metaparam's SEALED extra is in
-    # the SEAL set while deliberately NOT blessed (it reaches the model via natural_llm/react_llm
+    # the SEAL set while deliberately NOT blessed (it reaches the model via llm/react_auto
     # like any policy); blessing the whole sealed set would wrongly grant it raw access.
     for pn in _LLM_DEFAULT_POLICIES:
         p = _PLM_POLICIES.get(pn)
@@ -100,8 +103,13 @@ def _bless_llm_callers() -> None:
             if hasattr(inner, "__code__"):         # bless it; if it somehow lacks __code__, SKIP —
                 codes.append(inner.__code__)       # do NOT fall through to the class-policy path and
             continue                               # bless an unrelated object's __call__
-        cm = getattr(p, "__call__", None)          # class policy: bless original
-        orig = getattr(cm, "__wrapped__", cm)      # __wrapped__ skips _policy_call wrap
-        if hasattr(orig, "__code__"):
-            codes.append(orig.__code__)
+        # class policy: bless EVERY plain function defined on the class, not just
+        # __call__ — a session-style capability (react, R13) makes its LLM calls
+        # from methods (step/run/_round), and those bodies are the sealed default
+        # code exactly as a function policy's _inner is.
+        import inspect as _inspect
+        for _name, _fn in vars(p).items():
+            _fn = getattr(_fn, "__wrapped__", _fn)     # skip _policy_call wraps
+            if _inspect.isfunction(_fn) and hasattr(_fn, "__code__"):
+                codes.append(_fn.__code__)
     _llm_infra._BLESSED_CALLERS = frozenset(codes)

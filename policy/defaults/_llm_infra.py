@@ -62,7 +62,7 @@ def _check_blessed_caller(name: str) -> None:
     if caller_code not in _BLESSED_CALLERS:
         raise RuntimeError(
             f"_llm_infra.{name}: callable ONLY from inside the sanctioned LLM "
-            f"policies (natural_llm / react_llm / react_verifier_llm). To call "
+            f"policies (llm / react_auto / react_verifier_llm). To call "
             f"the model, use those policies; do not author your own LLM primitive."
         )
 
@@ -107,10 +107,10 @@ def check_depth_or_raise() -> None:
 
 def descend():
     """Decrement the LLM-depth budget for the dynamic extent of the agent's
-    act phase. Used by react_llm and react_verifier_llm around their act-phase
+    act phase. Used by react_auto and react_verifier_llm around their act-phase
     code execution — and, in react_verifier_llm, around the per-round verifier
-    hook, so a verifier's react_llm/natural_llm circuits are accounted depth-1.
-    natural_llm is single-shot (no act phase) and does
+    hook, so a verifier's react_auto/llm circuits are accounted depth-1.
+    llm is single-shot (no act phase) and does
     NOT descend — it only checks before its generate calls.
 
     The blessed-caller check fires HERE (function-call time, frame 2 = the
@@ -167,6 +167,7 @@ def llm_call(depth=None):
 # Local model-backend class-name → module suffix (plm.model_backend.*).
 _MOD = {
     "SlateBackend":     "slate_backend",
+    "GeminiBackend":    "gemini_backend",
     "OpenAIBackend":    "openai_backend",
     "VLLMBackend":      "vllm_backend",
     "AnthropicBackend": "anthropic_backend",
@@ -204,7 +205,24 @@ async def _aclose_backend(be):
         pass                                            # transport teardown is best-effort
 
 
-def _make_backend():
+# --- token accounting ------------------------------------------------------
+# Reset by the runner before each instance and read after it, so spend is
+# attributable per policy per instance. A plain dict so it survives the
+# `_check_blessed_caller` gate without needing a new blessed entry point.
+USAGE = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+         "llm_wait_s": 0.0}
+
+
+def reset_usage():
+    for k in USAGE:
+        USAGE[k] = 0
+
+
+def read_usage():
+    return dict(USAGE)
+
+
+def _make_backend(model=None):
     """Reconstruct the parent PLM's model backend in this kernel from
     `_PLM_BACKEND_SPEC` env. Returns a SYNC handle that is a THIN transport
     wrapper — no depth logic inside `.generate()`. The depth check lives in
@@ -226,6 +244,11 @@ def _make_backend():
             "(PLM sets it from its model_backend)."
         )
     spec = json.loads(raw)
+    if model is not None:
+        # Per-call generator override (G4 axis): same backend class and auth,
+        # different model for THIS call's generations. The caller-facing
+        # primitives expose it as `model=`; None means the spec's default.
+        spec = {**spec, "model": str(model)}
     cls_name = spec["model_backend_class_name"]
     if cls_name not in _MOD:
         raise RuntimeError(
@@ -237,6 +260,30 @@ def _make_backend():
 
     class _SyncBackend:
         def generate(self, messages, tools=None, **kw):
+            # --- token accounting (instrument hygiene; identical in every harness) ---
+            # Cost is a reported axis, never part of any criterion (A4b), but it has to
+            # be MEASURED somewhere and `.generate()` is the only place every sub-call
+            # passes through. Accumulates into a module-level counter the runner reads
+            # between instances. Never raises: accounting must not break a run.
+            import time as _t
+            _t0 = _t.monotonic()
+            _res = self._generate_inner(messages, tools=tools, **kw)
+            _elapsed = _t.monotonic() - _t0
+            try:
+                u = (_res or {}).get("usage") or {}
+                USAGE["calls"] += 1
+                USAGE["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
+                USAGE["completion_tokens"] += int(u.get("completion_tokens") or 0)
+                USAGE["total_tokens"] += int(u.get("total_tokens") or 0)
+                # code/wait split (A5f-b): wait is provider latency, metered at the
+                # same choke point as tokens; the runner subtracts it from cell time
+                # to get CODE-time, whose breaches are POLICY failures.
+                USAGE["llm_wait_s"] = USAGE.get("llm_wait_s", 0.0) + _elapsed
+            except Exception:
+                pass
+            return _res
+
+        def _generate_inner(self, messages, tools=None, **kw):
             # NO depth logic here — this is a thin transport. The policy body
             # calls `check_depth_or_raise()` BEFORE each .generate(), so the
             # backend only handles the API round-trip. The local backends carry

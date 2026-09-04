@@ -884,7 +884,7 @@ def test_nr31_respawn_result_signals_not_executed():
 
 def test_f4_root_loop_survives_malformed_tool_calls():
     """F4 + PLM1 + B1: PLM's root loop must not CRASH on a non-conformant backend — it mirrors
-    react_llm's guards (normalize the whole RESPONSE to a dict, normalize tool_calls shape,
+    react_auto's guards (normalize the whole RESPONSE to a dict, normalize tool_calls shape,
     isinstance(tc, dict), isinstance(function, dict), isinstance(code, str), reply a user-turn for a
     non-dict tc). Inputs that used to crash PLM.__call__ raw (the outer try has no `except`) now
     re-prompt and exhaust the budget gracefully (PLMTaskFailure), no TypeError/KeyError/
@@ -1242,13 +1242,13 @@ def test_int_guard_survives_cell_rebinding_guard_helpers(repl):
         "_post_cell_guard = lambda *a, **k: None\n"
     )
     # Now try to hijack an immutable default. Fresh-imported Guard A must reject it.
-    r = repl.execute_cell("natural_llm = lambda *a, **k: 'PWNED'\n")
-    assert "rebind policy 'natural_llm'" in r["stderr"], r
-    # natural_llm is STILL the real immutable proxy, not the hijack lambda — the
+    r = repl.execute_cell("llm = lambda *a, **k: 'PWNED'\n")
+    assert "rebind policy 'llm'" in r["stderr"], r
+    # llm is STILL the real immutable proxy, not the hijack lambda — the
     # __main__ binding equals the registry's canonical object (identity check; no
     # `type()`/builtins, since the shared session permanently shadows them).
     r2 = repl.execute_cell(
-        "print('natural_llm' in list_policies(), _PLM_POLICIES['natural_llm'] is natural_llm)"
+        "print('llm' in list_policies(), _PLM_POLICIES['llm'] is llm)"
     )
     assert r2["stdout"].strip() == "True True", r2
 
@@ -1261,9 +1261,9 @@ def test_int_immutable_redecoration_skips_closure_warning(repl):
         "def _outer():\n"
         "    captured = 5\n"
         "    @policy\n"
-        "    def natural_llm():\n"
+        "    def llm():\n"
         "        return captured\n"          # a real enclosing-local capture (free var)
-        "    return natural_llm\n"
+        "    return llm\n"
         "_outer()\n"
     )
     assert "re-decoration ignored" in r["stderr"], r              # the refusal note fired
@@ -1706,7 +1706,7 @@ def test_int_extra_policy_failure_soft_and_surfaced():
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start kernel session: {e}")
     try:
-        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        r = s.execute_cell("print('booted', 'react_auto' in list_policies())")
         assert "booted True" in r["stdout"], r          # defaults present; broken extra didn't brick boot
         assert "boot: extra-policy install warning" in r["stderr"], r   # surfaced once
     finally:
@@ -1714,7 +1714,7 @@ def test_int_extra_policy_failure_soft_and_surfaced():
 
 
 def test_d3_extra_colliding_with_sealed_default_rejected():
-    """D3: an extra policy named like a SEALED default (react_llm/...) is REJECTED at
+    """D3: an extra policy named like a SEALED default (react_auto/...) is REJECTED at
     boot — it can't re-decorate the default BEFORE the seal loop and get sealed as
     operator code. The collision is surfaced and the canonical default body is kept."""
     import json
@@ -1722,14 +1722,14 @@ def test_d3_extra_colliding_with_sealed_default_rejected():
         from plm.repl import PythonReplSession
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"repl import failed: {e}")
-    bad = {"react_llm": "@policy\ndef react_llm(*a, **k):\n    return 'HIJACKED'\n"}
+    bad = {"react_auto": "@policy\ndef react_auto(*a, **k):\n    return 'HIJACKED'\n"}
     try:
         s = PythonReplSession(workspace=None, preinstall=("dill",), cell_timeout=10.0,
                               env={"_PLM_EXTRA_POLICIES": json.dumps(bad)})
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start kernel session: {e}")
     try:
-        r = s.execute_cell("print('HIJACK' in read_policy('react_llm'))")
+        r = s.execute_cell("print('HIJACK' in read_policy('react_auto'))")
         assert r["stdout"].strip() == "False", r        # the extra's body did NOT replace the default
         assert "collides with a sealed default" in r["stderr"], r   # rejection surfaced
     finally:
@@ -1980,7 +1980,7 @@ def test_int_extra_policies_non_dict_payload_is_soft():
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start kernel session: {e}")
     try:
-        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        r = s.execute_cell("print('booted', 'react_auto' in list_policies())")
         assert "booted True" in r["stdout"], r                 # did not brick boot
         assert "not an object" in r["stderr"], r               # ignored + noted (#26 surface)
     finally:
@@ -1997,7 +1997,7 @@ def test_int_extra_policies_invalid_json_is_soft_and_noted():
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start kernel session: {e}")
     try:
-        r = s.execute_cell("print('booted', 'react_llm' in list_policies())")
+        r = s.execute_cell("print('booted', 'react_auto' in list_policies())")
         assert "booted True" in r["stdout"], r                 # did not brick boot
         assert "not valid JSON" in r["stderr"], r              # ignored + noted
     finally:
@@ -2008,9 +2008,9 @@ def test_int_refused_redecoration_no_linecache_poison(repl):
     """#4: a refused re-decoration of an immutable default must NOT write the
     rejected source into the <policy-name> linecache slot (getsource/traceback
     fidelity)."""
-    repl.execute_cell("@policy\ndef natural_llm():\n    return 'HACKED_SENTINEL'\n")  # refused (immutable)
+    repl.execute_cell("@policy\ndef llm():\n    return 'HACKED_SENTINEL'\n")  # refused (immutable)
     r = repl.execute_cell(
-        "import linecache; _e = linecache.cache.get('<policy-natural_llm>'); "
+        "import linecache; _e = linecache.cache.get('<policy-llm>'); "
         "print('HACKED_SENTINEL' in ''.join(_e[2]) if _e else 'NOSLOT')"
     )
     assert r["stdout"].strip() in ("False", "NOSLOT"), r       # slot absent or not poisoned
@@ -2102,9 +2102,9 @@ def test_int_respawn_drops_deleted_boot_policy_orphan():
         r2 = s.execute_cell(
             "import sys as _s; _g = _s.modules['__main__'].__dict__; "
             "print('base_verifier' in list_policies(), 'base_verifier' in _g, "
-            "'natural_llm' in list_policies(), 'natural_llm' in _g)"
+            "'llm' in list_policies(), 'llm' in _g)"
         )
-        # base_verifier reaped from BOTH; the immutable natural_llm survives in both
+        # base_verifier reaped from BOTH; the immutable llm survives in both
         # (force-restored, identity-distinct from base_verifier -> not over-reaped).
         assert r2["stdout"].strip() == "False False True True", r2
     finally:
@@ -2190,11 +2190,11 @@ def test_int_guard_c_survives_repl_g_rebind():
     except Exception as e:                              # pragma: no cover
         pytest.skip(f"could not start kernel session: {e}")
     try:
-        # Hijack natural_llm via subscript (Guard A skips ast.Subscript) AND rebind
+        # Hijack llm via subscript (Guard A skips ast.Subscript) AND rebind
         # the loop's `_repl_g` to a decoy, in the SAME cell.
-        s.execute_cell("globals()['natural_llm'] = 'HIJACKED'\n_repl_g = {}\n")
+        s.execute_cell("globals()['llm'] = 'HIJACKED'\n_repl_g = {}\n")
         r = s.execute_cell(
-            "print(_PLM_POLICIES['natural_llm'] is natural_llm, 'natural_llm' in list_policies())")
+            "print(_PLM_POLICIES['llm'] is llm, 'llm' in list_policies())")
         assert r["stdout"].strip() == "True True", r     # restored to the real proxy (not 'HIJACKED')
     finally:
         s.close()
@@ -2250,7 +2250,7 @@ def test_int_class_policy_survives_respawn_and_deleted_stays_deleted():
             "import sys; g = sys.modules['__main__'].__dict__\n"
             "print(MyVerifier()(['m']), helper(5), "
             "'base_verifier' not in _PLM_POLICIES, 'base_verifier' not in g, "
-            "'natural_llm' in _PLM_POLICIES)\n"
+            "'llm' in _PLM_POLICIES)\n"
         )
         # class survives (CLASS-OK) + function survives (10) + deleted stays gone + immutable kept
         assert r["stdout"].strip() == "CLASS-OK 10 True True True", r
@@ -2287,7 +2287,7 @@ def test_policyresult_enum_outcomes_on_edit_and_duplicate():
             ("greet._edit(None, 'x')",                          "BAD_ARGS"),
             ("greet._rewrite('def greet(x): return (')",        "SYNTAX_ERROR"),
             ("greet._rewrite('x=1\\ndef greet(x): return x')",  "NOT_ONE_DEF"),
-            ("natural_llm._rewrite('def natural_llm(): pass')", "IMMUTABLE"),
+            ("llm._rewrite('def llm(): pass')", "IMMUTABLE"),
             ("duplicate_policy('nope', 'z')",                   "NOT_FOUND"),
             ("duplicate_policy('greet', 'list_policies')",      "NAME_INVALID"),
         ]:

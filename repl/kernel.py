@@ -247,7 +247,7 @@ while True:
             # Discard the snapshot's copies of immutable LLM defaults and keep
             # PREFIX's freshly-installed v0. Guard A skips `ast.Subscript` targets,
             # so a previous-session cell could have written
-            # `_PLM_POLICIES["natural_llm"] = evil_proxy` (the dict is in
+            # `_PLM_POLICIES["llm"] = evil_proxy` (the dict is in
             # __main__ via `from plm.policy import (...)`); Guard C treats the
             # registry as canonical, so the poisoned proxy round-trips through
             # the snapshot. We keep the existing "snapshot is canonical for
@@ -285,12 +285,12 @@ while True:
             _builtins.globals().update(_repl_restored)
 
             # Force-rebind every SEALED name in __main__ to the registry's v0 proxy. REQUIRED because
-            # the snapshot carries sealed policies (`natural_llm`/`react_llm`/a sealed extra) as
+            # the snapshot carries sealed policies (`llm`/`react_auto`/a sealed extra) as
             # __main__ globals (they're NOT in _REPL_INJECTED), so globals().update(...) above would
             # otherwise overwrite PREFIX's v0 binding with the snapshot's OLD/poisoned proxy — leaving
             # _PLM_POLICIES (v0) inconsistent with __main__ (OLD). All `<sealed>(...)` calls from cells
             # look up __main__["<sealed>"], so this rebind is what guarantees PLM hits v0. (Known
-            # limitation, documented in the plan: a cell-level alias like `f = natural_llm` rehydrates
+            # limitation, documented in the plan: a cell-level alias like `f = llm` rehydrates
             # pointing at the OLD proxy via dill identity-preservation; PLM should look up via the
             # global at call time, not cache the reference.)
             _repl_g = _builtins.globals()

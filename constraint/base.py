@@ -370,7 +370,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
             "validate": classmethod(_validate),
             "describe": classmethod(_describe),
             "json_schema": classmethod(_json_schema),
-            "_constraint_is_factory": True,            # so _describe_factory / natural_llm's gate see it
+            "_constraint_is_factory": True,            # so _describe_factory / llm's gate see it
             "_constraint_is_field": True,              # so _describe_structural renders it fully
             "_constraint_field_inner_type": _vfi.annotation,
             "_constraint_field_annotation": _flat,     # so .field works as a list_of/set_of/.. element
@@ -479,7 +479,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
         if not cls._constraint_is_factory:
             # AIRTIGHT (mirrors the factory branch below): a structural field typed as an
             # arbitrary class with no JSON-Schema form makes model_json_schema() raise
-            # PydanticInvalidForJsonSchema. json_schema() must NEVER raise (natural_llm builds
+            # PydanticInvalidForJsonSchema. json_schema() must NEVER raise (llm builds
             # response_format from it OUTSIDE its retry loop), so degrade to a type-less skeleton
             # + x-description from the (airtight) describe(), exactly as the factory branch does.
             try:
@@ -493,7 +493,7 @@ class Constraint(pd.BaseModel, metaclass=_ConstraintMeta):
 
         # 1. Type skeleton from the type coercer. model_json_schema() can raise for an
         #    arbitrary-class type coercer (no JSON-Schema form) — json_schema() must NEVER
-        #    raise (natural_llm builds response_format from it OUTSIDE its retry loop), so
+        #    raise (llm builds response_format from it OUTSIDE its retry loop), so
         #    fall back to an empty (type-less) skeleton and let x-description carry the intent.
         try:
             schema = cls.model_json_schema()
@@ -526,7 +526,7 @@ def _iter_constraints_in(ann: Any):
     """Yield every Constraint subclass reachable in a type annotation — the annotation itself
     if it's a Constraint (a `.field` facade / struct), or any nested inside a typing
     generic (`list[X]`, `dict[K,V]`, `tuple[..]`, ...). Used to walk a factory's `type=` spec and
-    a struct's field annotations for the natural_llm description gate."""
+    a struct's field annotations for the llm description gate."""
     if isinstance(ann, type) and issubclass(ann, Constraint) and ann is not Constraint:
         yield ann
         return
@@ -535,15 +535,15 @@ def _iter_constraints_in(ann: Any):
 
 
 def _all_checks_described(constraint: type, _seen: Optional[set] = None) -> bool:
-    """natural_llm GATE (not a general-constraint rule): True iff EVERY user-supplied
+    """llm GATE (not a general-constraint rule): True iff EVERY user-supplied
     predicate / coercer / `@model_validator` / `@field_validator` anywhere in `constraint`'s
     tree carries a description (built-in refinements like int_range/str_pattern auto-describe,
     so they always pass).
 
-    natural_llm steers a single-shot model with the schema (shape) + `describe()` (the rules);
+    llm steers a single-shot model with the schema (shape) + `describe()` (the rules);
     a check with NO description is invisible to `describe()` — the model can never be told about
     it, so single-shot generation can only fail it. Such a constraint is rejected up front and
-    routed to `react_llm`. (Walks struct fields and `type=` generic elements.)"""
+    routed to `react_auto`. (Walks struct fields and `type=` generic elements.)"""
     if _seen is None:
         _seen = set()
     if id(constraint) in _seen:
@@ -590,7 +590,7 @@ def _has_generatable_structure(schema: Any) -> bool:
     """True iff a JSON schema pins a concrete generation target the model can produce against —
     a `type` / `enum` / `const` / `properties` / `items` / `$ref`, or a combinator (anyOf/allOf/
     oneOf) whose members ALL qualify. A schema that is only `{title, x-description}` (no type —
-    e.g. a bare predicate / is_instance_of on `type=object`) pins NO shape. natural_llm uses this
+    e.g. a bare predicate / is_instance_of on `type=object`) pins NO shape. llm uses this
     to decide whether to hard-set `response_format` (structured steering) or fall back to
     describe-only generation — NOT to accept/reject (that's `_all_checks_described`)."""
     if not isinstance(schema, dict):

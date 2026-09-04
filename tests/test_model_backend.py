@@ -37,7 +37,10 @@ def test_backend_from_spec_constructs(cls_name, mod_name):
     spec = {
         "model_backend_class_name": cls_name,
         "model": "test-model",
-        "api_key": "EMPTY",
+        # NOT "EMPTY": SlateBackend (v4) treats the vLLM-style "EMPTY" sentinel as
+        # not-set and falls back to env/auth-file, raising when neither exists —
+        # a concrete test key keeps this construction-only test offline.
+        "api_key": "test-key",
         "base_url": "http://localhost:1234/v1",
         "max_context_length": 4096,
     }

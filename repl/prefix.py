@@ -8,7 +8,7 @@ by-name helpers are available in every cell.
 Everything except PLM is a policy that runs in this same REPL — there are no
 separate sub-LLM or verifier REPLs, no injected-objects sidecar mechanism, and
 the Constraint class handles validation at the PLM layer. The
-model primitives are the `natural_llm` / `react_llm` policies loaded by the
+model primitives are the `llm` / `react_auto` policies loaded by the
 bootstrap loop below; depth gating lives entirely in
 `plm/policy/defaults/_llm_infra`.
 
@@ -70,7 +70,7 @@ _repl_ks.reset_buffers = _repl_reset_buffers
 # above. A minimal / dill-only kernel has no pydantic → skip and STILL BOOT (the hard
 # boot path stays pydantic-free). Done BEFORE the `_REPL_INJECTED` freeze so, when
 # present, the names join the frozen set (snapshot-skipped + shadow-protected). Sealed
-# machinery (react_llm) still lazy-imports for self-containment.
+# machinery (react_auto) still lazy-imports for self-containment.
 # Crash-restart RECIPE helpers for CALL-built constraints (`Constraint.field`),
 # used by `_repl_collect_vars` (snapshot) + the kernel's rehydrate. `_repl_`-prefixed so
 # they're kernel-internal (snapshot-skipped, not injected as cell names). None when no
@@ -302,6 +302,57 @@ def RETURN(obj):
 _repl_plm_messages = []
 plm_messages = []
 
+def copy_namespace(namespace):
+    """Copy a sub-agent's namespace for branching (ToT, portfolios, probes).
+
+    `copy.deepcopy` is NOT sufficient and fails silently: it treats functions as
+    ATOMIC, so a deep-copied namespace's functions are the SAME objects, still
+    bound to the PARENT's globals. A branch that calls a helper the parent wrote
+    then reads and WRITES the parent's variables — cross-branch corruption that
+    looks exactly like a model failure. Measured: a copy_namespace calling an inherited
+    helper drove the parent's counter 1 -> 101 while its own stayed 0.
+
+    `copy_namespace` copies the data and REBUILDS each function the sub-agent defined over
+    the child dict, so the branch is genuinely independent:
+
+        child_ns   = copy_namespace(ns)                     # state forks
+        child_msgs = copy.deepcopy(msgs)          # trajectory forks (plain dicts)
+        react(child_msgs, child_ns, rounds=2)     # an independent branch
+
+    Details: the sealed `__builtins__` is SHARED (copying the seal would be
+    pointless and expensive). Functions you GRANTED (llm, a policy, a helper of
+    your own) keep their own globals and are shared, which is correct — only the
+    sub-agent's own definitions are rebound. A value that cannot be deep-copied
+    (a module, an open handle, a live env) is shared by reference rather than
+    raising, so a copy never fails on an exotic grant; if that sharing matters
+    for your branch, remove the key from the child yourself. Closures still
+    capture the parent's cells — a nested closure is not rebound.
+    """
+    import copy as _fork_copy, types as _fork_types
+    if not isinstance(namespace, dict):
+        raise TypeError(f"copy_namespace: expects a namespace dict, got "
+                        f"{type(namespace).__name__}")
+    child, rebind = {}, {}
+    for k, v in namespace.items():
+        if k == "__builtins__":
+            child[k] = v                                  # share the seal
+        elif (isinstance(v, _fork_types.FunctionType)
+              and v.__globals__ is namespace):
+            rebind[k] = v                                 # rebuild once child exists
+        else:
+            try:
+                child[k] = _fork_copy.deepcopy(v)
+            except Exception:
+                child[k] = v                              # unforkable -> share
+    for k, v in rebind.items():
+        f = _fork_types.FunctionType(v.__code__, child, v.__name__,
+                                     v.__defaults__, v.__closure__)
+        f.__kwdefaults__ = v.__kwdefaults__
+        f.__dict__.update(v.__dict__)
+        child[k] = f
+    return child
+
+
 
 _REPL_INJECTED = {
     _k for _k in globals().keys()
@@ -340,7 +391,7 @@ _repl_ks.CANON = _REPL_INJECTED_CANON
 # for the blessed-caller gate in `_llm_infra`.
 #
 # Appended AFTER the `_REPL_INJECTED = {...}` freeze (so the policy NAMES like
-# `natural_llm` / `react_llm` are NOT in the freeze -> they're snapshotted and
+# `llm` / `react_auto` are NOT in the freeze -> they're snapshotted and
 # accepted by `@policy`; immutability is enforced separately via
 # `_SEALED_POLICIES`, not the freeze). All temps `_repl_`-prefixed -> never
 # snapshotted, never visible to dir() filtering.
@@ -402,7 +453,7 @@ for _repl_pn, _repl_ps in _repl_extra_pols.items():
 
 # SEALED extras (metaparams policies/sealed/): install like mutable extras (soft-fail), then
 # SEAL each below (immutable + un-duplicable) — WITHOUT blessing. A user's sealed policy is
-# locked from edit/duplicate but reaches the model only via natural_llm/react_llm like any
+# locked from edit/duplicate but reaches the model only via llm/react_auto like any
 # policy; only the LLM defaults get blessed for raw-primitive access.
 try:
     _repl_sealed_extras = _repl_json.loads(_os.environ.get("_PLM_SEALED_EXTRA_POLICIES") or "{}")
@@ -436,7 +487,7 @@ for _repl_pn, _repl_ps in _repl_sealed_extras.items():
                                "policy); nothing sealed for it.\n")
     _repl_sealed_extra_names.extend(_repl_new_names)
 
-# Seal the LLM-loop defaults (_LLM_DEFAULT_POLICIES — natural_llm / react_llm /
+# Seal the LLM-loop defaults (_LLM_DEFAULT_POLICIES — llm / react_auto /
 # react_verifier_llm) AND the user sealed extras: `_seal` sets the intrinsic
 # `_p_immutable` flag on each object AND records the name in `_SEALED_POLICIES`
 # (the one seal set). Other defaults (e.g. the mutable base_verifier) and the

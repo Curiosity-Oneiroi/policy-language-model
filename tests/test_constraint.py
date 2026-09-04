@@ -686,7 +686,7 @@ def test_coercer_can_raise_to_reject():
 
 
 def test_all_checks_described_walks_tree():
-    """`_all_checks_described` (natural_llm's M12 gate, which replaced `_contains_factory`) detects an
+    """`_all_checks_described` (llm's M12 gate, which replaced `_contains_factory`) detects an
     UNDESCRIBED user check in a factory's predicate/coercer OR a struct field; built-ins and described
     user checks pass."""
     from plm.constraint.base import _all_checks_described
@@ -807,7 +807,7 @@ def test_45_unique_one_shot_generator_with_unhashable_dup():
 
 def test_46_json_schema_survives_describe_failure():
     """#6 (completeness): a describe() failure must NOT propagate out of
-    json_schema() — natural_llm calls it to build response_format OUTSIDE its
+    json_schema() — llm calls it to build response_format OUTSIDE its
     retry loop, so an escape there would abort the call. x-description is omitted."""
     c = Constraint.of(type=int, int_ge=0, description="d")
 
@@ -1905,7 +1905,7 @@ def test_is_instance_of_json_schema_is_airtight():
 def test_structural_json_schema_airtight_for_arbitrary_field():
     """(A) Companion to the factory airtight test: a STRUCTURAL class with a field typed as a
     non-renderable arbitrary class must NOT crash json_schema() — the structural branch degrades
-    to {} + x-description like the factory branch (natural_llm builds response_format from it
+    to {} + x-description like the factory branch (llm builds response_format from it
     OUTSIDE its retry loop, so an escape there would abort the call)."""
     class Foo:                                         # arbitrary, non-JSON-renderable
         pass

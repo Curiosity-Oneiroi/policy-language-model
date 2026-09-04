@@ -237,7 +237,7 @@ def _coerce_budget(value: Any, default: int) -> int:
     """Coerce a model-supplied budget arg (`max_turns` / `return_budget`) to a
     non-negative int.
 
-    The sub-LLM policies (natural_llm / react_llm / react_verifier_llm) take
+    The sub-LLM policies (llm / react_auto / react_verifier_llm) take
     these from kwargs the MODEL controls in a cell. A `None` / non-int value
     would otherwise raise a raw `TypeError` at the `range(...)` bound, and a
     negative value would silently yield zero rounds. Normalize: `None` or any

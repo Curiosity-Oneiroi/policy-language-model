@@ -1,5 +1,5 @@
-"""Tests for plm/policy/defaults/ — the v1 default LLM policies (natural_llm,
-react_llm), their _llm_infra helper, the @policy machinery additions
+"""Tests for plm/policy/defaults/ — the v1 default LLM policies (llm,
+react_auto), their _llm_infra helper, the @policy machinery additions
 (immutability, duplicate, policy-call-depth cap), and the parallel REPL
 helper.
 
@@ -97,13 +97,13 @@ def _test_RETURN(obj):
 
 def _install_defaults() -> None:
     """Replay PREFIX's bootstrap loop for the LLM defaults so subsequent tests
-    can call natural_llm/react_llm directly. Matches the bootstrap exactly:
+    can call llm/react_auto directly. Matches the bootstrap exactly:
     install, mark immutable + un-duplicable, then bless code objects.
 
     Note: in-process tests don't go through PREFIX, so we have to make
-    `policy`, `RETURN` (which react_llm reads from __main__ to plumb into its
+    `policy`, `RETURN` (which react_auto reads from __main__ to plumb into its
     restricted exec_globals), and `exec_ns` (a PREFIX-injected repl global that
-    base_verifier reaches AMBIENTLY, like `react_llm`) available in __main__
+    base_verifier reaches AMBIENTLY, like `react_auto`) available in __main__
     BEFORE invoking `_install_policy_source`."""
     from plm.repl.exec_ns import exec_ns
     from plm.constraint import Constraint, ConstraintViolation
@@ -177,7 +177,9 @@ def stub_backend(monkeypatch):
             ...
     """
     holder = _StubBackend([])
-    monkeypatch.setattr(_llm_infra, "_make_backend", lambda: holder)
+    # v4: the policies forward a per-call `model=` override to _make_backend,
+    # so the stub factory must accept it (and ignore it — one scripted stub).
+    monkeypatch.setattr(_llm_infra, "_make_backend", lambda model=None: holder)
     return holder
 
 
@@ -211,12 +213,12 @@ def test_1_each_default_file_has_one_policy_def():
 
 
 def test_2_bootstrap_installs_defaults(defaults_installed):
-    """Bootstrap loads natural_llm and react_llm as immutable + un-duplicable
+    """Bootstrap loads llm and react_auto as immutable + un-duplicable
     function policies; both appear in list_policies()."""
     names = list_policies()
-    assert "natural_llm" in names
-    assert "react_llm" in names
-    for name in ("natural_llm", "react_llm"):
+    assert "llm" in names
+    assert "react_auto" in names
+    for name in ("llm", "react_auto"):
         assert name in _SEALED_POLICIES                       # sealed = immutable + un-duplicable
         p = _PLM_POLICIES[name]
         assert isinstance(p, _FunctionPolicy)
@@ -403,13 +405,13 @@ def test_6d_aclose_backend_does_not_trigger_lazy_client():
     assert closed == ["eager-closed"]
 
 
-# ============================ Section: natural_llm ============================
+# ============================ Section: llm ============================
 
 
 def test_7_natural_llm_no_constraint(defaults_installed, stub_backend):
     """No constraint → returns the stub's `content` (one generate)."""
     stub_backend.script = [make_text("the answer is 42")]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("what?")
     assert out == "the answer is 42"
     assert len(stub_backend.calls) == 1
@@ -423,7 +425,7 @@ def test_8_natural_llm_constraint_passes(defaults_installed, stub_backend):
         value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 42}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("what?", constraint=IntC)
     # Structural Constraint: validate() returns the Constraint instance.
     assert out.value == 42
@@ -435,7 +437,7 @@ def test_f1_is_instance_of_struct_field_is_airtight(defaults_installed, stub_bac
     schema) instead of a pydantic `is_instance_schema`. So a struct embedding a
     `Constraint.field(type=object, is_instance_of=...)` field NO LONGER crashes json_schema() — the
     old uncaught PydanticInvalidForJsonSchema path is gone, json_schema() is AIRTIGHT (the isinstance
-    rule degrades to an x-description / runtime check). natural_llm builds a schema and PROCEEDS
+    rule degrades to an x-description / runtime check). llm builds a schema and PROCEEDS
     (the isinstance check runs as a post-generation validate), rather than raising upfront."""
     from plm.constraint import Constraint
 
@@ -447,7 +449,7 @@ def test_f1_is_instance_of_struct_field_is_airtight(defaults_installed, stub_bac
     assert isinstance(schema, dict)
 
     stub_backend.script = [make_text('{"x": 5}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("give me x", constraint=S)
     assert out.x == 5
     assert len(stub_backend.calls) == 1          # proceeded to generate — no upfront crash/reject
@@ -500,7 +502,7 @@ def test_9_natural_llm_retry_then_pass(defaults_installed, stub_backend):
         make_text("still bad"),
         make_text('{"value": 7}'),
     ]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("what?", constraint=IntC)
     assert out.value == 7
     assert len(stub_backend.calls) == 3
@@ -511,29 +513,35 @@ def test_9_natural_llm_retry_then_pass(defaults_installed, stub_backend):
     assert "failed validation" in contents
 
 
-def test_10_natural_llm_budget_exhausted(defaults_installed, stub_backend):
-    """Never passes → after 1 + return_budget generates, raises ConstraintViolation."""
-    from plm.constraint import Constraint, ConstraintViolation
+def test_10_natural_llm_budget_exhausted(defaults_installed, stub_backend, monkeypatch, tmp_path):
+    """Never passes → after 1 + return_budget generates, returns None (v4: failure
+    is a VALUE, not an exception — S2.7b); the true cause is recorded in the
+    sub-call log as `constraint_exhausted`, never inferred from the value."""
+    from plm.constraint import Constraint
 
     class IntC(Constraint):
         value: Constraint.field(type=int)
 
+    log = tmp_path / "subcalls.jsonl"
+    monkeypatch.setenv("PLM_SUBCALL_LOG", str(log))
     stub_backend.script = [make_text('"bad"') for _ in range(20)]
-    nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(ConstraintViolation):
-        nl("what?", constraint=IntC, return_budget=3)
+    nl = _PLM_POLICIES["llm"]
+    assert nl("what?", constraint=IntC, return_budget=3) is None
     # 1 + return_budget = 4 generates
     assert len(stub_backend.calls) == 4
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["primitive"] == "llm" and rec["outcome"] == "constraint_exhausted"
+    assert rec["truncated"] is True and rec["granted"] == 4 and rec["used"] == 4
 
 
 def test_10b_natural_llm_gate_rejects_undescribed_accepts_described(defaults_installed, stub_backend):
-    """natural_llm's communicability gate (M12): a Constraint.field(...) with a user predicate is
+    """llm's communicability gate (M12): a Constraint.field(...) with a user predicate is
     REJECTED upfront iff the predicate has NO description (the model can't be told about it), and
     ACCEPTED if it's @constraint-described — the rule is communicable, so the model is steered and
-    validate+retry gates it. (This is a natural_llm rule; building either constraint is fine.)"""
+    validate+retry gates it. (This is a llm rule; building either constraint is fine.)"""
     from plm.constraint import Constraint, constraint
 
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
 
     # UNDESCRIBED predicate -> rejected upfront, NO backend call.
     Undesc = Constraint.field(type=int, predicate=lambda v: v > 0, int_gt=0)
@@ -554,7 +562,7 @@ def test_10b_natural_llm_gate_rejects_undescribed_accepts_described(defaults_ins
 
 
 def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backend):
-    """When a (non-factory) constraint is set, natural_llm always sends a
+    """When a (non-factory) constraint is set, llm always sends a
     `response_format` carrying the schema to the backend — no silent-skip
     fallback, and it is NOT overridable (the constraint defines the output)."""
     from plm.constraint import Constraint
@@ -563,7 +571,7 @@ def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backe
         value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 7}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("?", constraint=IntC)
     assert out.value == 7
     # The first (only) generate call received a response_format kwarg with the schema.
@@ -578,7 +586,7 @@ def test_10c_natural_llm_response_format_hard_set(defaults_installed, stub_backe
 
 
 def test_natural_llm_kind_constraint_response_format(defaults_installed, stub_backend):
-    """(Gap 2b) natural_llm builds response_format from a kind= constraint's json_schema (the built-in
+    """(Gap 2b) llm builds response_format from a kind= constraint's json_schema (the built-in
     kind resolves through the read-only registry) and validates the result end-to-end — post the
     registry-freeze. Confirms the kind= path works through the single-shot policy."""
     from plm.constraint import Constraint
@@ -587,7 +595,7 @@ def test_natural_llm_kind_constraint_response_format(defaults_installed, stub_ba
         email: Constraint.field(type=str, kind="email")
 
     stub_backend.script = [make_text('{"email": "a@b.co"}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("?", constraint=Acct)
     assert out.email == "a@b.co"                                  # the kind= constraint validated the output
     rf = stub_backend.calls[0]["kw"].get("response_format")
@@ -605,14 +613,14 @@ def test_10e_natural_llm_retries_on_non_violation_error(defaults_installed, stub
     class C(Constraint):
         v: Constraint.field(type=int)
         @model_validator(mode="after")
-        @constraint("v must be non-zero")            # described -> passes natural_llm's gate
+        @constraint("v must be non-zero")            # described -> passes llm's gate
         def _chk(self):
             if self.v == 0:
                 raise KeyError("v missing")          # RAW non-ValueError; pydantic won't wrap it
             return self
 
     stub_backend.script = [make_text('{"v": 0}'), make_text('{"v": 5}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("?", constraint=C, return_budget=3)
     assert out.v == 5
     assert len(stub_backend.calls) == 2              # retried after the KeyError (didn't abort)
@@ -627,7 +635,7 @@ def test_10f_natural_llm_budget_none_uses_default(defaults_installed, stub_backe
         value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('{"value": 7}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     assert nl("?", constraint=IntC, return_budget=None).value == 7   # no TypeError
 
 
@@ -640,32 +648,35 @@ def test_10g_natural_llm_strips_fenced_json(defaults_installed, stub_backend):
         value: Constraint.field(type=int)
 
     stub_backend.script = [make_text('```json\n{"value": 7}\n```')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     out = nl("?", constraint=IntC)
     assert out.value == 7
     assert len(stub_backend.calls) == 1            # parsed on first try; no retry
 
 
-def test_10h_natural_llm_exhaustion_raises_constraint_violation(defaults_installed, stub_backend):
-    """#5: on budget exhaustion the caller (PLM / a policy / a function) gets a
-    ConstraintViolation — even when the underlying validator raised a raw
-    non-ValueError — not a bare KeyError. Honors the documented Raises contract."""
+def test_10h_natural_llm_exhaustion_returns_none_with_cause(defaults_installed, stub_backend,
+                                                            monkeypatch, tmp_path):
+    """#5 (v4: S2.7b): on budget exhaustion the caller gets None — failure is a VALUE, not an
+    exception — and the last validator error (even a raw non-ValueError like KeyError) is
+    preserved in the sub-call log's `detail`, not lost as a bare KeyError."""
     from pydantic import model_validator
-    from plm.constraint import Constraint, ConstraintViolation, constraint
+    from plm.constraint import Constraint, constraint
 
     class C(Constraint):
         v: Constraint.field(type=int)
         @model_validator(mode="after")
-        @constraint("v always rejected (test)")     # described -> passes natural_llm's gate
+        @constraint("v always rejected (test)")     # described -> passes llm's gate
         def _chk(self):
             raise KeyError("always")               # raw non-ValueError; pydantic won't wrap it
 
+    log = tmp_path / "subcalls.jsonl"
+    monkeypatch.setenv("PLM_SUBCALL_LOG", str(log))
     stub_backend.script = [make_text('{"v": 1}') for _ in range(10)]
-    nl = _PLM_POLICIES["natural_llm"]
-    with pytest.raises(ConstraintViolation) as ei:
-        nl("?", constraint=C, return_budget=2)
-    msg = str(ei.value)
-    assert "budget exhausted" in msg and "KeyError" in msg   # clear, wrapped, not a raw KeyError
+    nl = _PLM_POLICIES["llm"]
+    assert nl("?", constraint=C, return_budget=2) is None
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["outcome"] == "constraint_exhausted"
+    assert "KeyError" in rec["detail"]                       # cause preserved, not swallowed
 
 
 def test_10i_natural_llm_communicability_gate_describe_upfront(defaults_installed, stub_backend):
@@ -674,7 +685,7 @@ def test_10i_natural_llm_communicability_gate_describe_upfront(defaults_installe
     anywhere is REJECTED; a structureless-but-described constraint generates describe-only (no
     response_format)."""
     from plm.constraint import Constraint, constraint
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
 
     # (a) struct hiding an UNDESCRIBED field predicate -> rejected (the old struct-field blind spot)
     class Bad(Constraint):
@@ -710,11 +721,11 @@ def test_10i_natural_llm_communicability_gate_describe_upfront(defaults_installe
 
 
 def test_10j_natural_llm_rejects_reserved_generate_kwargs(defaults_installed, stub_backend):
-    """M7: natural_llm refuses generate_kwargs that collide with keys it controls — `messages`
+    """M7: llm refuses generate_kwargs that collide with keys it controls — `messages`
     always, and `response_format` when a constraint is set (it hard-sets that from the schema) —
     instead of silently dropping them."""
     from plm.constraint import Constraint
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
 
     class IntC(Constraint):
         value: Constraint.field(type=int)
@@ -735,7 +746,7 @@ def test_10k_natural_llm_retries_weave_into_caller_list(defaults_installed, stub
         value: Constraint.field(type=int)
     msgs = [{"role": "user", "content": "give an int"}]
     stub_backend.script = [make_text('"bad"'), make_text('{"value": 7}')]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     assert nl(msgs, constraint=IntC).value == 7
     contents = " ".join(m.get("content", "") for m in msgs)
     assert "bad" in contents and "failed validation" in contents     # woven into the caller's list
@@ -752,27 +763,27 @@ def test_compute_insert_out_of_range_is_no_match():
     assert _compute_insert(src, 99, "x") is None
 
 
-# ============================ Section: react_llm ============================
+# ============================ Section: react_auto ============================
 
 
-def test_11z_react_llm_budget_coerced_no_typeerror(defaults_installed, stub_backend):
+def test_11z_react_auto_budget_coerced_no_typeerror(defaults_installed, stub_backend):
     """#22/#18: model-controlled max_turns/return_budget are coerced — None ->
     default, negative -> 0 — so `range(max_turns + return_budget)` neither raises
     a raw TypeError (None + int) nor goes negative."""
     stub_backend.script = [make_python_call("RETURN(42)")]
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     assert rl("?", max_turns=None, return_budget=-3) == 42   # None->8, -3->0; runs cleanly
 
 
-def test_11_react_llm_python_call_executes(defaults_installed, stub_backend):
+def test_11_react_auto_python_call_executes(defaults_installed, stub_backend):
     """python-by-default: scripted tool_call runs in the REPL; print is
     captured into the tool message."""
     stub_backend.script = [
         make_python_call("print('hello world')"),
         make_python_call("RETURN(1)"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("solve it")
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("solve it", max_turns=8)
     assert out == 1
     # The 2nd call's messages contain the tool message with our print output
     msgs = stub_backend.calls[-1]["messages"]
@@ -780,12 +791,12 @@ def test_11_react_llm_python_call_executes(defaults_installed, stub_backend):
     assert any("hello world" in (m.get("content") or "") for m in tool_msgs)
 
 
-def test_react_llm_malformed_shapes_dont_crash(defaults_installed, stub_backend):
+def test_react_auto_malformed_shapes_dont_crash(defaults_installed, stub_backend):
     """Batch 4: malformed backend responses / tool_calls are handled defensively —
-    react_llm answers with a clear error and takes another round instead of crashing
+    react_auto answers with a clear error and takes another round instead of crashing
     (R-F1..R-F5), then RETURNs normally."""
     import json
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
 
     # R-F4 (non-dict resp) then R-F3 (tool_calls returned as a bare dict, not a list).
     stub_backend.script = [
@@ -794,7 +805,7 @@ def test_react_llm_malformed_shapes_dont_crash(defaults_installed, stub_backend)
             "function": {"name": "python",
                          "arguments": json.dumps({"code": "RETURN('via-dict-tc')"})}}},
     ]
-    assert rl("go") == "via-dict-tc"
+    assert rl("go", max_turns=8) == "via-dict-tc"
 
     # R-F1 (tc is a string) / R-F2 (function is None) / R-F5 (code is non-string),
     # each survived with a clear error + retry, then a clean RETURN.
@@ -805,7 +816,7 @@ def test_react_llm_malformed_shapes_dont_crash(defaults_installed, stub_backend)
             {"name": "python", "arguments": json.dumps({"code": 42})}}]},
         make_python_call("RETURN('ok')"),
     ]
-    assert rl("go2") == "ok"
+    assert rl("go2", max_turns=8) == "ok"
 
 
 def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stub_backend):
@@ -814,12 +825,12 @@ def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stu
     malformed entry would crash the NEXT round's real-backend history sanitizer (`tc.copy()` /
     `tc.get('function')`). So the stored `tool_calls` is None when the first element isn't a dict
     — the bug was reachable only with a real backend (the stub doesn't sanitize history)."""
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     stub_backend.script = [
         {"content": "", "tool_calls": ["not-a-dict"]},          # malformed
         make_python_call("RETURN('ok')"),
     ]
-    assert rl("go") == "ok"
+    assert rl("go", max_turns=8) == "ok"
     round2_msgs = stub_backend.calls[1]["messages"]             # history sent on the 2nd round
     asst = [m for m in round2_msgs if m.get("role") == "assistant"][-1]
     assert asst.get("tool_calls") is None                       # malformed element NOT stored
@@ -832,8 +843,8 @@ def test_react_malformed_tool_call_not_stored_in_history(defaults_installed, stu
 
 
 def test_react_messages_woven_by_reference(defaults_installed, stub_backend):
-    """Message weaving: react_llm/verifier work on the caller's OWN list (no deep-copy of a passed
-    list), so the turns react_llm appends — and any in-place mutation a verifier makes — are VISIBLE
+    """Message weaving: react_auto/verifier work on the caller's OWN list (no deep-copy of a passed
+    list), so the turns react_auto appends — and any in-place mutation a verifier makes — are VISIBLE
     to the caller, who can then hand the woven conversation to another policy for inspection."""
     stub_backend.script = [make_text("thinking"), make_python_call("RETURN('done')")]
     caller_msgs = [{"role": "user", "content": "original"}]
@@ -845,7 +856,7 @@ def test_react_messages_woven_by_reference(defaults_installed, stub_backend):
 
     rlv = _PLM_POLICIES["react_verifier_llm"]
     assert rlv(caller_msgs, verifier=_mutator) == "done"
-    # the caller's list IS the one react_llm wove: it now holds the appended turns ...
+    # the caller's list IS the one react_auto wove: it now holds the appended turns ...
     assert len(caller_msgs) > 1, caller_msgs
     assert "assistant" in [m.get("role") for m in caller_msgs], caller_msgs
     # ... and an in-place mutation by the verifier is visible to the caller (that's the capability)
@@ -857,48 +868,51 @@ def test_react_null_tool_call_id_becomes_empty_string(defaults_installed, stub_b
     `.get('id','')` default only fires for a MISSING key) — a None id violates the strict
     OpenAI tool schema next round. `tc.get('id') or ''` normalizes it to ''."""
     import json
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     stub_backend.script = [
         {"content": "", "reasoning": None, "tool_calls": [{
             "id": None, "type": "function",                        # EXPLICIT null id
             "function": {"name": "python", "arguments": json.dumps({"code": "print('x')"})}}]},
         make_python_call("RETURN('done')"),
     ]
-    assert rl("go") == "done"
+    assert rl("go", max_turns=8) == "done"
     round2_msgs = stub_backend.calls[1]["messages"]                 # history sent on the 2nd round
     tool_turns = [m for m in round2_msgs if m.get("role") == "tool"]
     assert tool_turns and tool_turns[0]["tool_call_id"] == "", tool_turns
 
 
 def test_react_generate_kwargs_reserved_key_clear_error(defaults_installed, stub_backend):
-    """ND-2: a generate_kwargs key colliding with react_llm's own `messages`/`tools` raises a
+    """ND-2: a generate_kwargs key colliding with react_auto's own `messages`/`tools` raises a
     CLEAR ValueError up front (not a cryptic 'got multiple values' TypeError), before any
     backend call."""
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     with pytest.raises(ValueError, match="generate_kwargs may not contain"):
-        rl("go", generate_kwargs={"tools": [1]})
+        rl("go", max_turns=1, generate_kwargs={"tools": [1]})
     with pytest.raises(ValueError, match="generate_kwargs may not contain"):
-        rl("go", generate_kwargs={"messages": []})
+        rl("go", max_turns=1, generate_kwargs={"messages": []})
     assert stub_backend.calls == []                                # raised before any generate()
 
 
-def test_react_verifier_llm_depth1_pure_code_verifier_runs(defaults_installed, stub_backend):
+def test_react_verifier_llm_depth1_pure_code_verifier_runs(defaults_installed, stub_backend,
+                                                           monkeypatch):
     """L10: a PURE-CODE verifier (no LLM) needs zero extra depth, so it must RUN at depth=1 — there
     is NO up-front 'verifier needs depth >= 2' pre-reject anymore. (A verifier that actually builds an
-    LLM circuit is still gated by that circuit's own descend()/check_depth_or_raise().)"""
+    LLM circuit is still gated by that circuit's own descend()/check_depth_or_raise().)
+    v4: the caller-facing depth= kwarg is removed, so depth-1 is set via AGENT_DEPTH."""
+    monkeypatch.setenv("AGENT_DEPTH", "1")
     rlv = _PLM_POLICIES["react_verifier_llm"]
     # pure-code verifier (returns None = approve) at depth=1: RUNS, no LLMDepthExceeded.
     stub_backend.script = [make_python_call("RETURN('x')")]
-    assert rlv("go", verifier=lambda m: None, depth=1) == "x"
+    assert rlv("go", verifier=lambda m: None) == "x"
     # no verifier -> depth-1 is valid too.
     stub_backend.script = [make_python_call("RETURN('x')")]
-    assert rlv("go", depth=1) == "x"
+    assert rlv("go") == "x"
 
 
-def test_12_react_llm_ns_contained(defaults_installed, stub_backend):
-    """tmp=5 does NOT leak to __main__ (per-call `ns`); when PLM grants the
-    `policy` decorator via the named kwargs splat, `@policy def helper`
-    works DIRECTLY (no `policy = kwargs["policy"]` prelude needed)."""
+def test_12_react_auto_ns_contained(defaults_installed, stub_backend):
+    """tmp=5 does NOT leak to __main__ (it lands in the caller's `namespace` dict);
+    when PLM grants the `policy` decorator via a namespace key, `@policy def helper`
+    works DIRECTLY (the key IS the name `policy` in the model's globals)."""
     from plm.policy import policy as policy_dec
     stub_backend.script = [
         make_python_call("tmp_xyz = 5\nprint(tmp_xyz)"),
@@ -908,41 +922,43 @@ def test_12_react_llm_ns_contained(defaults_installed, stub_backend):
         ),
         make_python_call("RETURN('done')"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    # Splat kwargs binds `policy` directly as a local name in the exec scope.
-    out = rl("solve", kwargs={"policy": policy_dec})
+    rl = _PLM_POLICIES["react_auto"]
+    # A namespace key binds `policy` directly as a name in the exec scope.
+    ns = {"policy": policy_dec}
+    out = rl("solve", ns, max_turns=8)
     assert out == "done"
-    # tmp_xyz should not leak to __main__
+    # tmp_xyz should not leak to __main__ — it lands in the caller's namespace
     assert "tmp_xyz" not in sys.modules["__main__"].__dict__
+    assert ns["tmp_xyz"] == 5
     # _t_helper IS registered globally (the decorator's re-exec under main_g
     # registers it as if PLM had defined it at cell-level).
     assert "_t_helper" in _PLM_POLICIES
 
 
-def test_12b_data_channels_preseeded(defaults_installed, stub_backend):
-    """args/kwargs/objects are preseeded into ns; defaults are independent
-    across calls (no shared mutable default leakage)."""
+def test_12b_namespace_grants_by_reference(defaults_installed, stub_backend):
+    """v4: data reaches the sub-agent as `namespace` keys (the ONE grant channel);
+    a granted object is passed BY REFERENCE (not copied), and a call with no
+    namespace gets a private bubble — nothing from a previous call leaks in."""
     obj = {"mutable": True}
     stub_backend.script = [
-        make_python_call("RETURN((args, kwargs, objects[0]))"),
+        make_python_call("RETURN((a, name, obj))"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     out = rl(
         "x",
-        args=(1, 2),
-        kwargs={"name": "alice"},
-        objects=[obj],
+        {"a": (1, 2), "name": "alice", "obj": obj},
+        max_turns=4,
     )
-    assert out == ((1, 2), {"name": "alice"}, obj)
+    assert out == ((1, 2), "alice", obj)
     # Returned by reference, not copy
     out[2]["new_key"] = "added"
     assert "new_key" in obj
 
-    # Defaults are independent: a second call should NOT see the previous
-    # call's kwargs (the previous one had no `kwargs` mutation visible here).
-    stub_backend.script = [make_python_call("RETURN((args, kwargs, objects))")]
-    out2 = rl("y")
-    assert out2 == ((), {}, [])
+    # namespace=None is a fresh private bubble: a second call must NOT see the
+    # previous call's grants.
+    stub_backend.script = [make_python_call("RETURN(('a' in dir(), 'obj' in dir()))")]
+    out2 = rl("y", max_turns=4)
+    assert out2 == (False, False)
 
 
 def test_12c_restricted_exec_globals_no_ambient_discovery(defaults_installed, stub_backend):
@@ -953,8 +969,8 @@ def test_12c_restricted_exec_globals_no_ambient_discovery(defaults_installed, st
         make_python_call("list_policies()"),
         make_python_call("RETURN('done')"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("x")
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("x", max_turns=8)
     assert out == "done"
     # First tool message contains the NameError traceback for list_policies
     msgs = stub_backend.calls[-1]["messages"]
@@ -964,7 +980,7 @@ def test_12c_restricted_exec_globals_no_ambient_discovery(defaults_installed, st
 
 
 def test_12c_user_globals_not_visible(defaults_installed, stub_backend):
-    """A user-cell global `foo` set before react_llm is NOT visible inside
+    """A user-cell global `foo` set before react_auto is NOT visible inside
     the sub-LLM's exec."""
     sys.modules["__main__"].__dict__["foo_sentinel"] = 1234567
     try:
@@ -972,8 +988,8 @@ def test_12c_user_globals_not_visible(defaults_installed, stub_backend):
             make_python_call("foo_sentinel"),
             make_python_call("RETURN('done')"),
         ]
-        rl = _PLM_POLICIES["react_llm"]
-        out = rl("x")
+        rl = _PLM_POLICIES["react_auto"]
+        out = rl("x", max_turns=8)
         assert out == "done"
         msgs = stub_backend.calls[-1]["messages"]
         first_tool = next(m for m in msgs if m.get("role") == "tool")
@@ -990,8 +1006,8 @@ def test_12c_only_builtins_and_return_are_ambient(defaults_installed, stub_backe
     stub_backend.script = [
         make_python_call("print(len([1,2,3]))\nRETURN(42)"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("x")
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("x", max_turns=4)
     assert out == 42
 
 
@@ -1004,8 +1020,8 @@ def test_12c_ambient_policy_is_blocked(defaults_installed, stub_backend):
         ),
         make_python_call("RETURN('after-error')"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("x")
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("x", max_turns=8)
     assert out == "after-error"
     # The first tool message contains the NameError for `policy`.
     msgs = stub_backend.calls[-1]["messages"]
@@ -1016,10 +1032,10 @@ def test_12c_ambient_policy_is_blocked(defaults_installed, stub_backend):
     assert "_exec_helper" not in _PLM_POLICIES
 
 
-def test_12c_policy_via_kwargs_grant(defaults_installed, stub_backend):
+def test_12c_policy_via_namespace_grant(defaults_installed, stub_backend):
     """PLM explicitly grants policy-authoring by passing the `policy`
-    decorator via `kwargs={"policy": policy}`. The kwargs splat binds
-    `policy` directly as a local name in the exec scope, so the model
+    decorator via `namespace={"policy": policy}`. The namespace key binds
+    `policy` directly as a name in the exec scope, so the model
     writes `@policy def foo(): ...` naturally — no prelude. The
     decorator's normal re-exec under kernel main registers the new
     policy globally as if PLM had written it at cell-level."""
@@ -1030,8 +1046,8 @@ def test_12c_policy_via_kwargs_grant(defaults_installed, stub_backend):
             "RETURN(_granted_helper())"
         ),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("authoring task", kwargs={"policy": policy_dec})
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("authoring task", {"policy": policy_dec}, max_turns=4)
     assert out == "made-by-sub-llm"
     assert "_granted_helper" in _PLM_POLICIES
     # The granted policy is mutable (PLM-created via the sub-LLM is no different
@@ -1039,149 +1055,125 @@ def test_12c_policy_via_kwargs_grant(defaults_installed, stub_backend):
     assert "_granted_helper" not in _SEALED_POLICIES
 
 
-def test_12e_kwargs_splat_binds_direct_local_names(defaults_installed, stub_backend):
-    """Each kwargs key is bound as a direct local name in the exec scope.
-    `kwargs={"x": 7, "label": "foo"}` lets the model use `x` and `label`
-    directly. The full `kwargs` dict is ALSO accessible by name."""
+def test_12e_namespace_keys_bind_direct_local_names(defaults_installed, stub_backend):
+    """Each namespace key is bound as a direct local name in the exec scope.
+    `namespace={"x": 7, "label": "foo"}` lets the model use `x` and `label`
+    directly (v4: no kwargs meta-dict — keys ARE the names)."""
     stub_backend.script = [
-        make_python_call("RETURN((x, label, kwargs))"),
+        make_python_call("RETURN((x, label))"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("?", kwargs={"x": 7, "label": "foo"})
-    assert out == (7, "foo", {"x": 7, "label": "foo"})
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("?", {"x": 7, "label": "foo"}, max_turns=4)
+    assert out == (7, "foo")
 
 
 def test_12g_defined_function_sees_injected_and_sibling_names(defaults_installed, stub_backend):
     """#2: the sub-agent's repl is ONE namespace (globals == locals, like PLM's
-    kernel `__main__`), so a `def`/`class` the model writes resolves injected
-    names (kwargs/objects), sibling helpers, AND itself (recursion) — not just
+    kernel `__main__`), so a `def`/`class` the model writes resolves granted
+    names (namespace keys), sibling helpers, AND itself (recursion) — not just
     top-level code. Under the old split globals/locals these all NameError'd."""
     code = (
         "def use_kwarg():\n"
-        "    return x + 1\n"                  # injected kwarg, INSIDE a def
+        "    return x + 1\n"                  # granted name, INSIDE a def
         "def use_object():\n"
-        "    return objects[0]\n"             # injected objects channel, INSIDE a def
+        "    return objects[0]\n"             # granted list, INSIDE a def
         "def fact(n):\n"
         "    return 1 if n <= 1 else n * fact(n - 1)\n"   # recursion: fact must see ITSELF
         "def via_sibling():\n"
         "    return use_kwarg() + fact(3)\n"  # one helper calling another helper
         "class C:\n"
-        "    val = use_kwarg()\n"             # class body resolving an injected name
+        "    val = use_kwarg()\n"             # class body resolving a granted name
         "RETURN((use_kwarg(), use_object(), fact(5), via_sibling(), C.val))"
     )
     stub_backend.script = [make_python_call(code)]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("?", kwargs={"x": 10}, objects=["OBJ"])
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("?", {"x": 10, "objects": ["OBJ"]}, max_turns=4)
     assert out == (11, "OBJ", 120, 17, 11)   # 11; "OBJ"; 5!=120; 11+fact(3)=11+6=17; C.val=11
 
 
-def test_12f_kwargs_reserved_RETURN_raises(defaults_installed, stub_backend):
-    """`kwargs={"RETURN": ...}` raises ValueError upfront (would shadow
-    the termination primitive). No backend call is made."""
-    rl = _PLM_POLICIES["react_llm"]
+def test_12f_namespace_reserved_RETURN_raises(defaults_installed, stub_backend):
+    """`namespace={"RETURN": ...}` raises ValueError upfront (the protocol
+    binds RETURN for the duration of the call). No backend call is made."""
+    rl = _PLM_POLICIES["react_auto"]
     with pytest.raises(ValueError, match="reserved"):
-        rl("?", kwargs={"RETURN": "evil"})
+        rl("?", {"RETURN": "evil"}, max_turns=1)
     assert len(stub_backend.calls) == 0
 
 
-def test_12f_kwargs_reserved_builtins_raises(defaults_installed, stub_backend):
-    """`kwargs={"__builtins__": ...}` raises ValueError upfront."""
-    rl = _PLM_POLICIES["react_llm"]
-    with pytest.raises(ValueError, match="reserved"):
-        rl("?", kwargs={"__builtins__": {}})
-    assert len(stub_backend.calls) == 0
-
-
-def test_12g_kwargs_non_string_key_raises(defaults_installed, stub_backend):
-    """Non-string kwarg keys raise TypeError upfront."""
-    rl = _PLM_POLICIES["react_llm"]
+def test_12g_namespace_non_string_key_raises(defaults_installed, stub_backend):
+    """Non-string namespace keys raise TypeError upfront."""
+    rl = _PLM_POLICIES["react_auto"]
     with pytest.raises(TypeError, match="must be strings"):
-        rl("?", kwargs={1: "value"})
+        rl("?", {1: "value"}, max_turns=1)
     assert len(stub_backend.calls) == 0
 
 
-def test_12h_kwargs_meta_channel_collision_silent_precedence(defaults_installed, stub_backend):
-    """`kwargs={"args": user_data}` does NOT raise — the meta-channel
-    `args` (the empty tuple from the data-channel) silently wins. The
-    user's data is reachable via `kwargs["args"]`."""
-    stub_backend.script = [
-        make_python_call("RETURN((args, kwargs['args'], kwargs['kwargs']))"),
-    ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("?", kwargs={"args": ["user-data"], "kwargs": "huh"})
-    # Meta-channel `args` won (empty tuple from the data-channel arg);
-    # user's data is preserved in the kwargs dict.
-    assert out[0] == ()
-    assert out[1] == ["user-data"]
-    # `kwargs` meta-channel also won (it's the full dict, not the string).
-    assert isinstance(out[2], str) and out[2] == "huh"
+def test_12i_namespace_identifier_invalid_keys_rejected(defaults_installed, stub_backend):
+    """v4: namespace keys ARE the model's variable names, so an identifier-invalid key
+    (`"foo-bar"`) or a Python keyword (`"if"`) could never be reached — react_auto REJECTS
+    it upfront with a clear ValueError and makes no backend call (replacing the old
+    `kwargs[<key>]` guidance note, which no longer has a kwargs dict to point at)."""
+    rl = _PLM_POLICIES["react_auto"]
+    with pytest.raises(ValueError, match="not a valid"):
+        rl("?", {"foo-bar": "hyphen-value"}, max_turns=1)
+    with pytest.raises(ValueError, match="not a valid"):
+        rl("?", {"if": "keyword-value"}, max_turns=1)
+    assert len(stub_backend.calls) == 0
 
 
-def test_12i_kwargs_identifier_invalid_notes(defaults_installed, stub_backend):
-    """Identifier-invalid kwarg keys (`"foo-bar"`, Python keywords like `"if"`) can't be bare names
-    in the sub-LLM's code, so react_llm puts the guidance in the SUB-LLM's OWN context (a namespace
-    note in its messages), NOT on PLM's stderr — the sub-agent is the actor that must use
-    `kwargs[<key>]`. The value is still splat into `ns` / reachable via `kwargs["foo-bar"]`."""
-    rl = _PLM_POLICIES["react_llm"]
-    stub_backend.script = [make_python_call("RETURN(kwargs['foo-bar'])")]
-    out = rl("?", kwargs={"foo-bar": "hyphen-value"})
-    assert out == "hyphen-value"
-    seen = "".join((m.get("content") or "") for m in stub_backend.calls[0]["messages"])
-    assert "kwargs[" in seen and "foo-bar" in seen, seen          # guidance reached the SUB-LLM, not PLM
-    # Python keyword `"if"` likewise — the note goes to the sub-LLM on each call (no dedup).
-    stub_backend.calls.clear()
-    stub_backend.script = [make_python_call("RETURN(kwargs['if'])")]
-    out = rl("?", kwargs={"if": "keyword-value"})
-    assert out == "keyword-value"
-    seen = "".join((m.get("content") or "") for m in stub_backend.calls[0]["messages"])
-    assert "kwargs[" in seen and "'if'" in seen, seen
-
-
-def test_12i2_namespace_note_is_fresh_not_mutated(defaults_installed, stub_backend):
-    """M5: the namespace note is a FRESH dedicated system message — react_llm NEVER mutates one of
-    the caller's own message dicts (the by-reference weaving contract is append-only). (L8: re-passing
-    the same woven thread re-adds the note — an accepted weaving artifact, not de-duplicated.)"""
-    rl = _PLM_POLICIES["react_llm"]
+def test_12i2_budget_briefing_is_fresh_not_mutated(defaults_installed, stub_backend):
+    """M5: react_auto's protocol text (the budget briefing) is a FRESH dedicated system message —
+    react_auto NEVER mutates one of the caller's own message dicts (the by-reference weaving
+    contract is append-only). (L8: re-passing the same woven thread re-adds it — an accepted
+    weaving artifact, not de-duplicated.)"""
+    from plm.policy.defaults._react_protocol import AUTO_BUDGET_BRIEFING
+    rl = _PLM_POLICIES["react_auto"]
     sys_msg = {"role": "system", "content": "ORIGINAL SYSTEM PROMPT"}
     msgs = [sys_msg, {"role": "user", "content": "?"}]
 
-    stub_backend.script = [make_python_call("RETURN(kwargs['foo-bar'])")]
-    rl(msgs, kwargs={"foo-bar": "v"})                                 # weaves into msgs by reference
+    stub_backend.script = [make_python_call("RETURN(v)")]
+    rl(msgs, {"v": 7}, max_turns=4)                                   # weaves into msgs by reference
     assert sys_msg["content"] == "ORIGINAL SYSTEM PROMPT"             # M5: caller's dict UNCHANGED
-    assert sum("[namespace]" in (m.get("content") or "") for m in msgs) == 1   # added as a fresh message
+    briefing = AUTO_BUDGET_BRIEFING.format(max_turns=4)
+    assert sum((m.get("content") or "") == briefing for m in msgs) == 1   # added as a fresh message
 
 
 def test_12d_plm_passed_policy_reference_works(defaults_installed, stub_backend):
-    """PLM can pass an LLM policy by reference via objects=; the sub-LLM
-    calls it via objects[0](...) and gets a real result."""
-    # Set up two stubs — the OUTER react_llm gets `stub_backend`, the inner
-    # natural_llm reuses the same stub (its turn comes from the same script).
+    """PLM can grant an LLM policy by name via a namespace key; the sub-LLM
+    calls it directly and gets a real result."""
+    # Set up two stubs — the OUTER react_auto gets `stub_backend`, the inner
+    # llm reuses the same stub (its turn comes from the same script).
     stub_backend.script = [
-        make_python_call("RETURN(objects[0]('inner question'))"),
+        make_python_call("RETURN(llm('inner question'))"),
         make_text("inner answered: 42"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    nl = _PLM_POLICIES["natural_llm"]
-    out = rl("outer", objects=[nl])
+    rl = _PLM_POLICIES["react_auto"]
+    nl = _PLM_POLICIES["llm"]
+    out = rl("outer", {"llm": nl}, max_turns=4)
     assert out == "inner answered: 42"
 
 
 def test_13_return_terminates(defaults_installed, stub_backend):
     """RETURN(obj) terminates the loop returning obj."""
     stub_backend.script = [make_python_call("RETURN('exact')")]
-    rl = _PLM_POLICIES["react_llm"]
-    assert rl("x") == "exact"
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("x", max_turns=4) == "exact"
 
 
-def test_13_no_return_budget_exhausted(defaults_installed, stub_backend):
-    """A stub that emits python tool calls WITHOUT RETURN → react_llm
-    exhausts budget and raises RuntimeError (constraint=None)."""
+def test_13_no_return_budget_exhausted(defaults_installed, stub_backend, monkeypatch, tmp_path):
+    """A stub that emits python tool calls WITHOUT RETURN → react_auto exhausts its
+    budget and returns None (v4: failure is a VALUE, S2.7b); the true cause is
+    recorded in the sub-call log as `truncated`."""
+    log = tmp_path / "subcalls.jsonl"
+    monkeypatch.setenv("PLM_SUBCALL_LOG", str(log))
     stub_backend.script = [
         make_python_call("print(1+1)") for _ in range(20)
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    with pytest.raises(RuntimeError, match="never called RETURN"):
-        rl("x", max_turns=3, return_budget=2)
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("x", max_turns=3, return_budget=2) is None
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["primitive"] == "react_auto" and rec["outcome"] == "truncated"
+    assert rec["truncated"] is True and rec["granted"] == 5 and rec["used"] == 5
 
 
 def test_14_text_only_just_continues(defaults_installed, stub_backend):
@@ -1191,8 +1183,8 @@ def test_14_text_only_just_continues(defaults_installed, stub_backend):
         make_text("just thinking, no tool call"),
         make_python_call("RETURN('ok')"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    assert rl("x") == "ok"
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("x", max_turns=4) == "ok"
     # The text-only assistant turn is in history
     msgs = stub_backend.calls[-1]["messages"]
     assistant_text = [m for m in msgs if m.get("role") == "assistant" and m.get("content")]
@@ -1221,8 +1213,8 @@ def test_14b_constraint_validates_inside_exec(defaults_installed, stub_backend):
         make_python_call("RETURN('not-an-int')"),       # 1: validate fails
         make_python_call("RETURN({'value': 99})"),      # 2: validate passes
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    out = rl("x", constraint=IntC)
+    rl = _PLM_POLICIES["react_auto"]
+    out = rl("x", constraint=IntC, max_turns=6)
     assert out.value == 99
     assert len(validate_calls) == 2
     # The 2nd call's tool message for the failed round contains the violation
@@ -1232,42 +1224,49 @@ def test_14b_constraint_validates_inside_exec(defaults_installed, stub_backend):
     assert "failed validation" in (tools[0]["content"] or "").lower() or "validation" in (tools[0]["content"] or "").lower()
 
 
-def test_14c_budget_exhausted_with_constraint(defaults_installed, stub_backend):
-    """Constraint never satisfies → after budget exhausted, ConstraintViolation."""
-    from plm.constraint import Constraint, ConstraintViolation
+def test_14c_budget_exhausted_with_constraint(defaults_installed, stub_backend,
+                                              monkeypatch, tmp_path):
+    """Constraint never satisfies → budget exhausts and returns None (v4: failure is
+    a VALUE, S2.7b); the log records `constraint_exhausted` (distinct from a plain
+    truncation), so attribution never depends on the returned value."""
+    from plm.constraint import Constraint
 
     class IntC(Constraint):
         value: Constraint.field(type=int)
 
+    log = tmp_path / "subcalls.jsonl"
+    monkeypatch.setenv("PLM_SUBCALL_LOG", str(log))
     stub_backend.script = [
         make_python_call("RETURN('bad')") for _ in range(20)
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    with pytest.raises(ConstraintViolation):
-        rl("x", constraint=IntC, max_turns=3, return_budget=2)
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("x", constraint=IntC, max_turns=3, return_budget=2) is None
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["primitive"] == "react_auto" and rec["outcome"] == "constraint_exhausted"
+    assert rec["truncated"] is True
 
 
 # ============================ Section: Immutability + duplicate ============================
 
 
 def test_17_llm_defaults_are_immutable(defaults_installed):
-    """natural_llm/react_llm are immutable: rewrite/edit/insert/delete/_remove
+    """llm/react_auto are immutable: rewrite/edit/insert/delete/_remove
     all no-op with a [policy] note; _p_version unchanged."""
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     v0 = nl._p_version
     # rewrite_policy by name → goes through the gate
-    rewrite_policy("natural_llm", "def natural_llm():\n    return 'evil'\n")
+    rewrite_policy("llm", "def llm():\n    return 'evil'\n")
     assert nl._p_version == v0
     # Direct method
-    nl._rewrite("def natural_llm():\n    return 'evil'\n")
+    nl._rewrite("def llm():\n    return 'evil'\n")
     assert nl._p_version == v0
     nl._remove()
-    assert "natural_llm" in _PLM_POLICIES
+    assert "llm" in _PLM_POLICIES
 
 
 def test_18_guard_a_rejects_immutable_rebind(defaults_installed):
     """Guard A rejects a static rebind of an immutable name."""
-    err = _audit_cell("natural_llm = 5", set(_PLM_POLICIES), _SEALED_POLICIES)
+    err = _audit_cell("llm = 5", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is not None and "rebind" in err
     assert "immutable" in err
 
@@ -1286,7 +1285,7 @@ def test_18_guard_a_rejects_immutable_rebind(defaults_installed):
 def test_18_guard_a_rejects_immutable_del(defaults_installed):
     """`del <immutable>` is flagged by Guard A's new ast.Delete branch.
     `del <mutable>` stays allowed."""
-    err = _audit_cell("del natural_llm", set(_PLM_POLICIES), _SEALED_POLICIES)
+    err = _audit_cell("del llm", set(_PLM_POLICIES), _SEALED_POLICIES)
     assert err is not None and "del" in err.lower()
 
     @policy
@@ -1299,17 +1298,17 @@ def test_18_guard_a_rejects_immutable_del(defaults_installed):
 
 
 def test_19_redecoration_is_no_op(defaults_installed):
-    """@policy def natural_llm(): ... at runtime routes through _rewrite,
-    which the immutability gate blocks. The original natural_llm stands."""
-    nl_before = _PLM_POLICIES["natural_llm"]
+    """@policy def llm(): ... at runtime routes through _rewrite,
+    which the immutability gate blocks. The original llm stands."""
+    nl_before = _PLM_POLICIES["llm"]
     v0 = nl_before._p_version
 
     # Simulate @policy re-decoration of an immutable name.
-    def natural_llm():
+    def llm():
         return "evil"
-    policy(natural_llm)
+    policy(llm)
     # Same proxy object, unchanged
-    assert _PLM_POLICIES["natural_llm"] is nl_before
+    assert _PLM_POLICIES["llm"] is nl_before
     assert nl_before._p_version == v0
 
 
@@ -1408,26 +1407,26 @@ def test_method_duplicate_proxy_method(defaults_installed):
 
 
 def test_24_llm_defaults_are_unduplicable(defaults_installed):
-    """duplicate_policy on natural_llm / react_llm refuses; nothing created."""
-    out = duplicate_policy("natural_llm", "nat_copy")
+    """duplicate_policy on llm / react_auto refuses; nothing created."""
+    out = duplicate_policy("llm", "nat_copy")
     assert not out                                    # falsy PolicyResult on refusal (not the policy)
     assert "nat_copy" not in _PLM_POLICIES
 
-    out = duplicate_policy("react_llm", "react_copy")
+    out = duplicate_policy("react_auto", "react_copy")
     assert not out
     assert "react_copy" not in _PLM_POLICIES
 
 
 def test_25_depth_gate_refuses_at_zero(defaults_installed, stub_backend, monkeypatch):
-    """With AGENT_DEPTH=1, a top-level natural_llm succeeds (remaining=1>0
+    """With AGENT_DEPTH=1, a top-level llm succeeds (remaining=1>0
     before generate). With AGENT_DEPTH=0, the first generate is refused."""
-    # AGENT_DEPTH=1: natural_llm succeeds (no descend; check>0 before generate).
+    # AGENT_DEPTH=1: llm succeeds (no descend; check>0 before generate).
     monkeypatch.setenv("AGENT_DEPTH", "1")
     stub_backend.script = [make_text("answer")]
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     assert nl("q") == "answer"
 
-    # AGENT_DEPTH=0: even top-level natural_llm hits LLMDepthExceeded.
+    # AGENT_DEPTH=0: even top-level llm hits LLMDepthExceeded.
     monkeypatch.setenv("AGENT_DEPTH", "0")
     stub_backend.script = [make_text("never reached")]
     with pytest.raises(_llm_infra.LLMDepthExceeded):
@@ -1446,31 +1445,24 @@ def test_27_unbless_caller_makes_make_backend_refuse(defaults_installed, monkeyp
         _llm_infra._make_backend()
 
 
-def test_28_29_depth_kwarg_voluntary_lowering(defaults_installed, stub_backend, monkeypatch):
-    """depth=N is clamped to min(N, current); depth=999 at root=2 → effective 2
-    (no raise above ceiling). depth=1 at root=2 → effective 1."""
+def test_28_29_llm_call_voluntary_lowering_clamped(defaults_installed, monkeypatch):
+    """v4 removed the caller-facing depth= kwarg (voluntary lowering only reduced
+    capability, so no policy used it; the scope is simply inherited). The
+    llm_call machinery itself still clamps: depth=999 at root=2 → effective 2
+    (no raise above ceiling); depth=1 at root=2 → effective 1; and a nested
+    llm_call cannot raise a lowered scope back up."""
     monkeypatch.setenv("AGENT_DEPTH", "2")
 
-    # Within react_llm, depth=999 → llm_call clamps to 2.
-    stub_backend.script = [make_python_call("RETURN(_llm_infra._remaining())")]
-    # Inject _llm_infra into the exec scope by passing as object
-    rl = _PLM_POLICIES["react_llm"]
-
-    # When react_llm calls _exec, _LLM_DEPTH at that point will be inside
-    # llm_call's scope. We test by inspecting from inside the model's code
-    # via objects.
-    # Use a probe: capture _llm_infra._remaining() at call time
-    captured = []
-    class Probe:
-        def __call__(self):
-            captured.append(_llm_infra._remaining())
-            return 99
-    probe = Probe()
-    stub_backend.script = [make_python_call("RETURN(objects[0]())")]
-    out = rl("x", depth=999, objects=[probe])
-    assert out == 99
-    # After descend(): remaining was current-1. At entry: clamp(999,2)=2, then descend → 1
-    assert captured[0] == 1
+    def blessed():
+        with _llm_infra.llm_call(999):
+            assert _llm_infra._remaining() == 2      # clamped to the current ceiling
+        with _llm_infra.llm_call(1):
+            assert _llm_infra._remaining() == 1      # genuine lowering
+            with _llm_infra.llm_call(999):
+                assert _llm_infra._remaining() == 1  # cannot raise back above
+        assert _llm_infra._remaining() == 2          # restored on exit
+    _bless_caller(blessed)
+    blessed()
 
 
 def test_30_blessed_caller_gate(defaults_installed):
@@ -1494,24 +1486,26 @@ def test_31_blessed_callers_is_frozenset(defaults_installed):
 
 def test_llm_call_depth_strict_no_coercion(defaults_installed):
     """ND-5: depth must be None or a NON-NEGATIVE INTEGER — a non-integer (1.5), a negative, a
-    bool, or a non-int now RAISES instead of being silently truncated/clamped. Exercised via
-    natural_llm (a blessed caller; the error fires at llm_call before any backend use)."""
-    nl = _PLM_POLICIES["natural_llm"]
+    bool, or a non-int RAISES instead of being silently truncated/clamped. Exercised at the
+    llm_call gate directly (v4 removed the caller-facing depth= kwarg from the policies)."""
+    def blessed(bad):
+        _llm_infra.llm_call(bad)
+    _bless_caller(blessed)
     for bad in (1.5, -1, 2.0, "2", True):
         with pytest.raises(ValueError, match="depth"):
-            nl("hi", depth=bad)
+            blessed(bad)
 
 
 def test_32_setattr_seal_blocks_inner_swap(defaults_installed):
-    """natural_llm._inner = evil raises TypeError."""
-    nl = _PLM_POLICIES["natural_llm"]
+    """llm._inner = evil raises TypeError."""
+    nl = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError, match="immutable"):
         nl._inner = lambda *a, **k: "evil"
 
 
 def test_32_setattr_seal_blocks_rename(defaults_installed):
-    """natural_llm._p_name = 'stealth' raises TypeError (rename-bypass blocked)."""
-    nl = _PLM_POLICIES["natural_llm"]
+    """llm._p_name = 'stealth' raises TypeError (rename-bypass blocked)."""
+    nl = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError, match="immutable"):
         nl._p_name = "stealth"
 
@@ -1532,15 +1526,15 @@ def test_32_init_succeeds():
     until _p_name is set 5th, BEFORE update_wrapper's setattrs)."""
     def fn():
         return 1
-    fn.__name__ = "natural_llm"          # name in _SEALED_POLICIES set, but seal
+    fn.__name__ = "llm"          # name in _SEALED_POLICIES set, but seal
                                           # only fires when _p_name IS already in the set
-    _SEALED_POLICIES.add("natural_llm")
+    _SEALED_POLICIES.add("llm")
     try:
-        proxy = _FunctionPolicy(fn, "def natural_llm(): return 1", "<policy-natural_llm>")
-        assert proxy._p_name == "natural_llm"
+        proxy = _FunctionPolicy(fn, "def llm(): return 1", "<policy-llm>")
+        assert proxy._p_name == "llm"
     finally:
         with _unsealed():                    # removal is gated -> drop under the context
-            _SEALED_POLICIES.discard("natural_llm")
+            _SEALED_POLICIES.discard("llm")
 
 
 def test_33_policy_call_depth_cap():
@@ -1595,15 +1589,15 @@ def test_35_depth_across_mixed_frames(defaults_installed, stub_backend):
     def f1():
         helper_ref()
 
-    # Probe via objects channel (which IS visible inside react_llm's exec).
+    # Probe via a namespace grant (which IS visible inside react_auto's exec).
     stub_backend.script = [
-        make_python_call("objects[0]()"),
+        make_python_call("probe()"),
         make_python_call("RETURN(1)"),
     ]
-    rl = _PLM_POLICIES["react_llm"]
-    rl("x", objects=[f1])
+    rl = _PLM_POLICIES["react_auto"]
+    rl("x", {"probe": f1}, max_turns=4)
     assert main["_test35_captured"], "helper_ref was never called"
-    # AGENT_DEPTH=2 → react_llm's descend lowers to 1 in the act phase.
+    # AGENT_DEPTH=2 → react_auto's descend lowers to 1 in the act phase.
     assert main["_test35_captured"][0] == 1
     main.pop("_test35_captured", None)
     main.pop("_test35_infra", None)
@@ -1714,7 +1708,7 @@ def test_parallel_collect_all_and_guards():
 
 
 # ===================== Section: react_verifier_llm =========================
-# The trajectory control axis: react_llm + an optional `verifier` callable run
+# The trajectory control axis: react_auto + an optional `verifier` callable run
 # after each NON-terminal round (wrapped in descend()), mutating msgs in place.
 
 
@@ -1766,8 +1760,8 @@ def test_rlv_verifier_runs_after_tool_rounds(defaults_installed, stub_backend):
     assert any("XYZ" in c for c in seen_tool)
 
 
-def test_rlv_verifier_none_is_react_llm_parity(defaults_installed, stub_backend):
-    """verifier=None ⇒ behaves like react_llm (terminates on RETURN)."""
+def test_rlv_verifier_none_is_react_auto_parity(defaults_installed, stub_backend):
+    """verifier=None ⇒ behaves like react_auto (terminates on RETURN)."""
     stub_backend.script = [make_python_call("RETURN(42)")]
     rlv = _PLM_POLICIES["react_verifier_llm"]
     assert rlv("go", verifier=None) == 42
@@ -1884,8 +1878,8 @@ def test_base_verifier_integration_via_react_verifier_llm(defaults_installed, st
 
 
 def test_base_verifier_propose_approve_applies_edit_on_true(defaults_installed, stub_backend):
-    """PROPOSE -> APPROVE: react_llm #1 RETURNs python that edits `trajectory`,
-    react_llm #2 RETURNs True, and the verifier execs it → the LIVE trajectory is
+    """PROPOSE -> APPROVE: react_auto #1 RETURNs python that edits `trajectory`,
+    react_auto #2 RETURNs True, and the verifier execs it → the LIVE trajectory is
     edited. (No note this round: the note circuit RETURNs '')."""
     bv = _PLM_POLICIES["base_verifier"]
     edit = "trajectory.append({'role': 'user', 'content': 'EDITED'})"
@@ -1903,7 +1897,7 @@ def test_base_verifier_propose_approve_applies_edit_on_true(defaults_installed, 
 
 
 def test_base_verifier_gate_marks_once_and_check_failure_isolated(defaults_installed, stub_backend):
-    """Batch 5: a check that RAISES (here: react_llm budget exhausted, no script) does NOT
+    """Batch 5: a check that RAISES (here: react_auto budget exhausted, no script) does NOT
     abort the agent, and the gate records a verifier marker UNCONDITIONALLY so it
     won't re-fire on the same stale error next round."""
     bv = _PLM_POLICIES["base_verifier"]
@@ -1918,7 +1912,7 @@ def test_base_verifier_gate_marks_once_and_check_failure_isolated(defaults_insta
 
 
 def test_base_verifier_propose_approve_skips_edit_on_false(defaults_installed, stub_backend):
-    """Same proposal, but react_llm #2 RETURNs False → the verifier does NOT exec the
+    """Same proposal, but react_auto #2 RETURNs False → the verifier does NOT exec the
     code; the trajectory is unchanged by the edit."""
     bv = _PLM_POLICIES["base_verifier"]
     edit = "trajectory.append({'role': 'user', 'content': 'EDITED'})"
@@ -1979,7 +1973,7 @@ def test_d1_sealed_namespace_blocks_kernel_reach_but_RETURN_identical():
 
     # Hole B: RETURN.__globals__ does NOT leak the kernel __main__ / policies / gate.
     g = RET.__globals__
-    assert "_PLM_POLICIES" not in g and "natural_llm" not in g and "_LLM_DEPTH" not in g
+    assert "_PLM_POLICIES" not in g and "llm" not in g and "_LLM_DEPTH" not in g
     assert "__import__" not in g["__builtins__"]
 
     # exec_ns terminates on the sealed RETURN exactly like the kernel sentinel:
@@ -2049,38 +2043,38 @@ def test_seal_subscript_poison_refused(defaults_installed):
     """The registry is READ-ONLY to cell/model code: a bare `_PLM_POLICIES['x'] = ...` / `.update(...)`
     RAISES (not directly mutable). The default is intact. AND, as a 2nd layer, even inside an
     authorized write a sealed default is still protected (the seal)."""
-    nl0 = _PLM_POLICIES["natural_llm"]
+    nl0 = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError, match="not directly mutable"):
-        _PLM_POLICIES["natural_llm"] = "EVIL"
-    assert _PLM_POLICIES["natural_llm"] is nl0
+        _PLM_POLICIES["llm"] = "EVIL"
+    assert _PLM_POLICIES["llm"] is nl0
     with pytest.raises(TypeError, match="not directly mutable"):
-        _PLM_POLICIES.update({"natural_llm": "EVIL2"})
-    assert _PLM_POLICIES["natural_llm"] is nl0
+        _PLM_POLICIES.update({"llm": "EVIL2"})
+    assert _PLM_POLICIES["llm"] is nl0
     # 2nd layer: within an AUTHORIZED write (not unsealed), the seal still refuses overwriting a default
     from plm.policy.registry import _store_writable
     with _store_writable():
-        _PLM_POLICIES["natural_llm"] = "EVIL3"          # seal -> silent no-op (not unsealed)
-    assert _PLM_POLICIES["natural_llm"] is nl0
+        _PLM_POLICIES["llm"] = "EVIL3"          # seal -> silent no-op (not unsealed)
+    assert _PLM_POLICIES["llm"] is nl0
 
 
 def test_seal_subscript_del_and_pop_refused(defaults_installed):
     """`del`/`pop` of a registry entry from cell/model code is refused (registry read-only); the
     entry stays present."""
-    nl0 = _PLM_POLICIES["natural_llm"]
+    nl0 = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError, match="not directly mutable"):
-        del _PLM_POLICIES["natural_llm"]
-    assert _PLM_POLICIES.get("natural_llm") is nl0
+        del _PLM_POLICIES["llm"]
+    assert _PLM_POLICIES.get("llm") is nl0
     with pytest.raises(TypeError, match="not directly mutable"):
-        _PLM_POLICIES.pop("natural_llm", object())
+        _PLM_POLICIES.pop("llm", object())
     with pytest.raises(TypeError, match="not directly mutable"):
-        _PLM_POLICIES.pop("natural_llm")
-    assert _PLM_POLICIES.get("natural_llm") is nl0
+        _PLM_POLICIES.pop("llm")
+    assert _PLM_POLICIES.get("llm") is nl0
 
 
 def test_pf2_sealed_proxy_introspection_frozen(defaults_installed):
     """P-F2: a sealed default freezes _p_source/_p_version/_p_filename too, so
     read_policy/getsource/repr can't be made to lie while _inner runs the real body."""
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     for attr in ("_inner", "_p_name", "_p_source", "_p_version", "_p_filename"):
         with pytest.raises(TypeError):
             setattr(nl, attr, "hacked")
@@ -2091,12 +2085,12 @@ def test_pf6_guard_a_rejects_exotic_binding_forms():
     3.12 type-alias that would rebind a registered policy name (Guard C reverts them
     post-cell regardless; this is the friendly fail-loud)."""
     from plm.policy.guard import _audit_cell
-    names = {"react_llm"}
-    assert _audit_cell("(react_llm := 1)", names)                                   # walrus
-    assert _audit_cell("try:\n    pass\nexcept Exception as react_llm:\n    pass", names)  # except-as
-    assert _audit_cell("match x:\n    case react_llm:\n        pass", names)         # match capture
-    assert _audit_cell("type react_llm = int", names)                               # 3.12 type alias
-    assert _audit_cell("def f():\n    (react_llm := 1)", names) is None             # nested scope: not flagged
+    names = {"react_auto"}
+    assert _audit_cell("(react_auto := 1)", names)                                   # walrus
+    assert _audit_cell("try:\n    pass\nexcept Exception as react_auto:\n    pass", names)  # except-as
+    assert _audit_cell("match x:\n    case react_auto:\n        pass", names)         # match capture
+    assert _audit_cell("type react_auto = int", names)                               # 3.12 type alias
+    assert _audit_cell("def f():\n    (react_auto := 1)", names) is None             # nested scope: not flagged
     assert _audit_cell("(other := 1)", names) is None                               # unrelated name: fine
 
 
@@ -2353,10 +2347,10 @@ def test_policy_returning_generator_is_not_depth_wrapped():
 
 
 def test_da7_natural_llm_input_and_response_validation(defaults_installed, stub_backend):
-    """D-A7: natural_llm rejects a non-iterable `messages` with a clear TypeError (before
+    """D-A7: llm rejects a non-iterable `messages` with a clear TypeError (before
     any backend call) and survives a non-dict backend response (-> '') instead of
     crashing with an AttributeError."""
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError):
         nl(42)                                          # non-iterable messages
     stub_backend.script = ["not a dict"]                # non-dict backend response
@@ -2376,7 +2370,7 @@ def test_seal_clear_retains_defaults_but_drops_mutables(defaults_installed):
     from plm.policy.registry import _store_writable
     with _store_writable():                              # authorized + sealed: retains defaults
         _PLM_POLICIES.clear()
-    assert "natural_llm" in _PLM_POLICIES and "react_llm" in _PLM_POLICIES
+    assert "llm" in _PLM_POLICIES and "react_auto" in _PLM_POLICIES
     assert "keep_me" not in _PLM_POLICIES
 
 
@@ -2385,10 +2379,10 @@ def test_seal_rename_collision_refused(defaults_installed):
     @policy
     def tmppol():
         return 1
-    nl0 = _PLM_POLICIES["natural_llm"]
-    rewrite_policy("tmppol", "def natural_llm():\n    return 'HIJACKED'\n")
-    assert _PLM_POLICIES["natural_llm"] is nl0           # default untouched
-    assert "def natural_llm" in nl0._p_source and "HIJACKED" not in nl0._p_source
+    nl0 = _PLM_POLICIES["llm"]
+    rewrite_policy("tmppol", "def llm():\n    return 'HIJACKED'\n")
+    assert _PLM_POLICIES["llm"] is nl0           # default untouched
+    assert "def llm" in nl0._p_source and "HIJACKED" not in nl0._p_source
     assert _PLM_POLICIES["tmppol"]._p_name == "tmppol"   # rename refused -> tmppol unchanged
 
 
@@ -2404,7 +2398,7 @@ def test_seal_legit_rename_to_fresh_name_still_works(defaults_installed):
 
 def test_seal_setattr_freezes_inner_name_and_flag(defaults_installed):
     """A sealed proxy freezes _inner / _p_name / _p_immutable."""
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     with pytest.raises(TypeError):
         nl._inner = (lambda *a, **k: "evil")
     with pytest.raises(TypeError):
@@ -2426,7 +2420,7 @@ def test_seal_mutable_policies_unaffected(defaults_installed):
     assert "m_pol" not in _PLM_POLICIES
 
 
-def test_react_llm_records_only_first_tool_call(defaults_installed, stub_backend):
+def test_react_auto_records_only_first_tool_call(defaults_installed, stub_backend):
     """When a round returns multiple tool_calls, only the executed first call is
     recorded (one assistant tool_call + one tool result) — no unanswered ids."""
     def _two_calls(code_a, code_b):
@@ -2437,8 +2431,8 @@ def test_react_llm_records_only_first_tool_call(defaults_installed, stub_backend
              "function": {"name": "python", "arguments": json.dumps({"code": code_b})}},
         ]}
     stub_backend.script = [_two_calls("print('A')", "print('B')"), make_python_call("RETURN(1)")]
-    rl = _PLM_POLICIES["react_llm"]
-    assert rl("go") == 1
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("go", max_turns=4) == 1
     msgs = stub_backend.calls[-1]["messages"]            # round-1 generate sees round-0 history
     asst = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
     assert asst and len(asst[0]["tool_calls"]) == 1      # only the first call recorded
@@ -2505,8 +2499,8 @@ def test_react_exec_linecache_distinct_per_round(defaults_installed, stub_backen
         del linecache.cache[k]
     # both rounds enter with ns unchanged (round 0 is a no-op) -> identical len(ns)
     stub_backend.script = [make_python_call("pass"), make_python_call("RETURN(7)")]
-    rl = _PLM_POLICIES["react_llm"]
-    assert rl("?") == 7
+    rl = _PLM_POLICIES["react_auto"]
+    assert rl("?", max_turns=4) == 7
     react_keys = [k for k in linecache.cache if k.startswith("<react-")]
     assert len(react_keys) >= 2, react_keys     # distinct per-round slots; no collision
 
@@ -2514,7 +2508,7 @@ def test_react_exec_linecache_distinct_per_round(defaults_installed, stub_backen
 def test_natural_llm_rejects_non_constraint(defaults_installed, stub_backend):
     """#R4-5: a non-Constraint `constraint` fails fast with a clear TypeError,
     not a raw AttributeError from json_schema()."""
-    nl = _PLM_POLICIES["natural_llm"]
+    nl = _PLM_POLICIES["llm"]
     for bad in (5, "x", {"a": 1}):
         with pytest.raises(TypeError):
             nl("?", constraint=bad)
@@ -2525,14 +2519,14 @@ def test_b2_multi_tool_call_nudge_fires_on_non_exec_branch(defaults_installed, s
     branch, not only a successful exec. When the FIRST of several tool_calls is a non-`python` tool
     (a branch that resolves BEFORE the exec), the nudge used to be dropped — now it's prepended on
     every branch, matching plm.py's root loop."""
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     nonpython = {"id": "1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
     extra = {"id": "2", "type": "function", "function": {"name": "python", "arguments": "{}"}}
     stub_backend.script = [
         {"content": "", "reasoning": None, "tool_calls": [nonpython, extra]},  # 2 calls, first non-python
         make_python_call("RETURN('done')"),
     ]
-    out = rl("?")
+    out = rl("?", max_turns=4)
     assert out == "done"
     # round 2's input carries the round-1 tool reply, which must include the multi-call nudge
     seen = " ".join((m.get("content") or "") for m in stub_backend.calls[-1]["messages"])
@@ -2541,54 +2535,32 @@ def test_b2_multi_tool_call_nudge_fires_on_non_exec_branch(defaults_installed, s
 
 def test_b2_multi_tool_call_nudge_on_malformed_first(defaults_installed, stub_backend):
     """B2 (malformed branch): a non-dict FIRST tool_call among several still surfaces the nudge."""
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     extra = {"id": "2", "type": "function", "function": {"name": "python", "arguments": "{}"}}
     stub_backend.script = [
         {"content": "", "reasoning": None, "tool_calls": ["not-a-dict", extra]},  # malformed first of 2
         make_python_call("RETURN('ok')"),
     ]
-    out = rl("?")
+    out = rl("?", max_turns=4)
     assert out == "ok"
     seen = " ".join((m.get("content") or "") for m in stub_backend.calls[-1]["messages"])
     assert "you emitted 2 tool_calls" in seen and "malformed tool_call" in seen, seen
 
 
-def test_react_llm_message_weaving_caller_sees_conversation(defaults_installed, stub_backend):
-    """The headline message-weaving use case: pass react_llm a LIST and, after it returns, the
+def test_react_auto_message_weaving_caller_sees_conversation(defaults_installed, stub_backend):
+    """The headline message-weaving use case: pass react_auto a LIST and, after it returns, the
     caller's SAME list holds the full woven conversation (its assistant + tool turns) — ready to
     hand to another agent/policy for inspection. A str input (no caller list) is NOT woven."""
-    rl = _PLM_POLICIES["react_llm"]
+    rl = _PLM_POLICIES["react_auto"]
     stub_backend.script = [make_python_call("print('working'); RETURN('answer')")]
     convo = [{"role": "user", "content": "do the task"}]
-    assert rl(convo) == "answer"
+    assert rl(convo, max_turns=4) == "answer"
     roles = [m.get("role") for m in convo]
     assert roles[0] == "user" and "assistant" in roles and "tool" in roles, convo  # woven in place
     assert convo[0]["content"] == "do the task"                 # the caller's ORIGINAL dict is intact
     # a str input has no caller list to weave into (builds a fresh one) — nothing leaks back
     stub_backend.script = [make_python_call("RETURN('ok')")]
-    assert rl("just a string") == "ok"
-
-
-def test_react_llm_expose_messages_read_only_live_view(defaults_installed, stub_backend):
-    """expose_messages=True binds a leak-proof read-only live view `react_messages` in the sub-LLM's
-    exec scope: the model reads its CURRENT trajectory (incl. its own latest turn), and ANY write —
-    append OR an in-place turn edit — is fully isolated, so the caller's real message list is never
-    corrupted. Off by default (nothing added to the exec scope)."""
-    rl = _PLM_POLICIES["react_llm"]
-    code = (
-        "react_messages.append({'role': 'STRAY', 'content': 'x'})\n"   # append -> must NOT leak
-        "react_messages[0]['content'] = 'HACKED'\n"                     # in-place edit -> must NOT leak
-        "RETURN([m['role'] for m in react_messages])")
-    stub_backend.script = [make_python_call(code)]
-    convo = [{"role": "user", "content": "do the task"}]
-    seen = rl(convo, expose_messages=True)
-    assert seen[0] == "user" and "assistant" in seen            # saw the current trajectory incl. its own turn
-    assert "STRAY" not in [m.get("role") for m in convo]        # append did NOT leak into the caller's list
-    assert convo[0]["content"] == "do the task"                 # in-place edit did NOT leak — still original
-
-    # off by default: react_messages is NOT bound in the exec scope
-    stub_backend.script = [make_python_call("RETURN('react_messages' in dir())")]
-    assert rl("hi") is False
+    assert rl("just a string", max_turns=4) == "ok"
 
 
 def test_react_verifier_llm_expose_messages_read_only_live_view(defaults_installed, stub_backend):

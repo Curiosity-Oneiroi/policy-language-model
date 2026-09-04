@@ -53,6 +53,7 @@ _OPENAI_COMMON_KWARGS = frozenset({
 # Extra params accepted only by /v1/responses.
 _RESPONSES_API_KWARGS = _OPENAI_COMMON_KWARGS | frozenset({
     "store", "include", "previous_response_id", "truncation",
+    "text",          # structured output on this API (the `response_format` analogue)
 })
 
 # Extra params accepted only by /v1/chat/completions.
@@ -211,7 +212,7 @@ class OpenAIBackend(BaseModelBackend):
         self._client: Optional[AsyncOpenAI] = None
         # Expose as plain attrs so PLM's spec builder (a hasattr loop) round-trips
         # them into the kernel sub-LLM's `_PLM_BACKEND_SPEC`. Without this, an
-        # in-cell natural_llm/react_llm rebuilt via from_spec loses a custom
+        # in-cell llm/react_auto rebuilt via from_spec loses a custom
         # api_key/base_url and silently falls back to OPENAI_API_KEY + the default
         # api.openai.com endpoint. Mirrors Slate/VLLM which already do this.
         self.api_key = api_key_value
@@ -388,6 +389,18 @@ class OpenAIBackend(BaseModelBackend):
         self.logger.info(f"[OpenAI] Using {api_type} for model {self.model}")
 
         if self.use_responses_api:
+            # `response_format` is Chat-Completions vocabulary; the Responses API
+            # expresses the same thing as `text.format`. Callers (e.g. a policy
+            # attaching a Constraint) legitimately pass the former without
+            # knowing which API a given model routes to, so translate rather than
+            # forwarding an argument the SDK will reject.
+            _rf = kwargs.pop("response_format", None)
+            if isinstance(_rf, dict) and _rf.get("type") == "json_schema" and "text" not in kwargs:
+                _js = _rf.get("json_schema") or {}
+                kwargs["text"] = {"format": {"type": "json_schema",
+                                             "name": _js.get("name", "answer"),
+                                             "strict": _js.get("strict", False),
+                                             "schema": _js.get("schema", {})}}
             return await self._generate_with_responses_api(messages, tools, **kwargs)
         else:
             return await self._generate_with_completions_api(messages, tools, **kwargs)

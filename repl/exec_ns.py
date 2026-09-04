@@ -1,13 +1,13 @@
 """`exec_ns` — the shared REPL code-runner.
 
 Runs a code STRING in a namespace the way PLM's kernel runs a cell and the way
-`react_llm` runs a sub-agent's tool code: ONE dict used as BOTH globals and locals,
+`react_auto` runs a sub-agent's tool code: ONE dict used as BOTH globals and locals,
 stdout+stderr captured, any exception's traceback captured INTO the output (the
 caller's loop never crashes on user/model code), and a linecache slot so tracebacks
 show the real source lines.
 
 This is the single core every "run this code" site builds on:
-  * `react_llm._exec` — the sub-agent tool runner (adds RETURN/constraint handling
+  * `react_auto._exec` — the sub-agent tool runner (adds RETURN/constraint handling
     via `on_return`); behavior is identical to the old inline version.
   * verifiers — apply an approved trajectory edit against a restricted namespace.
   * any policy / PLM that holds code-as-data and wants to run it.
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from plm._branch_state import _CURRENT_ERR, _CURRENT_OUT, _ERR_PROXY, _OUT_PROXY
 
 
-# ===== sealed-namespace helpers — the react_llm sub-LLM ns is a CONTAINMENT boundary =====
+# ===== sealed-namespace helpers — the react_auto sub-LLM ns is a CONTAINMENT boundary =====
 #
 # A sub-LLM's ns must hold ONLY `__builtins__` + `RETURN` + deliberate grants. Two
 # leaks made that a fiction: a FULL `builtins` module (so `__import__('sys').modules

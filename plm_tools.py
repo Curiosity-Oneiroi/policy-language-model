@@ -10,7 +10,7 @@ def _tool_python() -> dict[str, Any]:
     # passes non-Chat-Completions-shaped tools through unchanged, so this dict
     # reaches the API as-is.
     #
-    # Used by BOTH PLM's top-level loop AND react_llm's inner loop, so the
+    # Used by BOTH PLM's top-level loop AND react_auto's inner loop, so the
     # description is intentionally GENERIC — just the python-REPL mechanics plus
     # the universal `RETURN(value)` finalize primitive.
     return {

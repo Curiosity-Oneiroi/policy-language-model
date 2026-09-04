@@ -16,7 +16,7 @@ def base_verifier(messages):
     correction, or steer the next round — adding a turn is just the simplest case.
 
     THIS is the base/reference, and it is MUTABLE + DUPLICABLE (unlike
-    natural_llm / react_llm / react_verifier_llm, which are sealed). Recommended:
+    llm / react_auto / react_verifier_llm, which are sealed). Recommended:
         duplicate_policy("base_verifier", "my_verifier") or my_verifier = base_verifier.duplicate()
         my_verifier._edit(...)            # specialize prompts / gate / checks
         react_verifier_llm(task, verifier=my_verifier)
@@ -55,7 +55,7 @@ def base_verifier(messages):
         it and verify every round. Keep any gate LIGHT.
       * one or more `_verify_*(messages)` — the actual verification(s). EACH IS
         ITSELF A VERIFICATION POLICY: ordinary Python that may compose any
-        combination of depth-1 `react_llm` / `natural_llm` / 'react_verifier_llm'
+        combination of depth-1 `react_auto` / `llm` / 'react_verifier_llm'
         circuits AND/OR plain code — or no LLM at all — exactly like any policy.
         The DEPTH-1 limit is on the NESTING of each LLM call, NOT on how many you make or how much
         code you run: one check can fan out several depth-1 circuits, run Python
@@ -67,7 +67,7 @@ def base_verifier(messages):
     hypothesis/claim, an assumption, a tool result, output format... anything.
 
     Depth (HARD LIMIT, for now): each LLM CALL must stay DEPTH-1 — use only
-    `natural_llm` or `react_llm` or `react_verifier_llm`, and pass `depth=1`. This caps the NESTING of a
+    `llm` or `react_auto` or `react_verifier_llm`, and pass `depth=1`. This caps the NESTING of a
     call, not the verification: you may still make as many depth-1 calls and run
     as much Python as you like — the verification is a full policy. Via
     `react_verifier_llm` the `descend()` wrap already caps you at depth-1 (root=2);
@@ -77,7 +77,7 @@ def base_verifier(messages):
     code object against `_BLESSED_CALLERS`) refuses any caller that isn't a
     sanctioned LLM default. A mutable policy — this base, or any duplicate — is
     NOT blessed, so importing the helper succeeds but the CALL raises RuntimeError.
-    Reach the model only through `natural_llm` / `react_llm` (which are blessed and
+    Reach the model only through `llm` / `react_auto` (which are blessed and
     reach `_make_backend` on your behalf).
     """
     import copy   # used to hand a verification circuit a non-aliased trajectory
@@ -90,15 +90,15 @@ def base_verifier(messages):
         it — verifying every round is wasteful.
 
         Like `_verify_*`, the gate is ITSELF A POLICY: it can be plain code, an
-        LLM, a react_llm, or any combination — there is NO restriction on the
+        LLM, a react_auto, or any combination — there is NO restriction on the
         form (don't read the examples below as the only options). The ONLY
         requirement is that it be VERY LIGHT, because it runs every round: keep
         any LLM use to a very restricted number of calls / rounds (e.g. depth=1
-        with 1-2 rounds, or a single yes/no `natural_llm`). Examples, not limits:
+        with 1-2 rounds, or a single yes/no `llm`). Examples, not limits:
           * code-based: scan the trajectory for a trigger — an error in the latest
             tool output, a suspicious value, a phase boundary, a task marker.
-          * a light LLM / react_llm: a single `natural_llm(..., depth=1)` yes/no,
-            or a short `react_llm(..., depth=1, max_turns=1)` inspecting the
+          * a light LLM / react_auto: a single `llm(...)` yes/no,
+            or a short `react_auto(..., max_turns=1)` inspecting the
             trajectory. Pass the messages via `kwargs={"trajectory": messages}`
             (the circuit reads the local `trajectory`) or fold a summary into the
             prompt; combine code + LLM however you like.
@@ -114,7 +114,7 @@ def base_verifier(messages):
             if role == "verifier":
                 return False                       # already verified since the last signal
             if role == "tool":
-                # Anchor on a REAL error section, not the bare word "Error": react_llm
+                # Anchor on a REAL error section, not the bare word "Error": react_auto
                 # prefixes a failed tool's output with "stderr:" and a captured traceback
                 # contains "Traceback". Dropping "Error" avoids firing on benign prose like
                 # "Error rate: 0.05" or "no errors found".
@@ -123,7 +123,7 @@ def base_verifier(messages):
 
     # ===== VERIFICATION(S): each is its own function; you can run several =====
     # Each `_verify_*` is itself a VERIFICATION POLICY: it may combine several
-    # depth-1 react_llm / natural_llm / react_verifier_llm calls/circuits with arbitrary Python — or use no LLM
+    # depth-1 react_auto / llm / react_verifier_llm calls/circuits with arbitrary Python — or use no LLM
     # at all — just like any policy. depth-1 caps each LLM call's nesting, not the
     # orchestration. The system + user prompts below are GENERIC placeholders and
     # are the KNOB you turn: a verifier "system instruction" can be many things —
@@ -145,7 +145,7 @@ def base_verifier(messages):
         smoke-check like the generic example below is fine too. Keep the prompts
         unbiased toward any one task — customize them for the behavior YOU check.
 
-        The example: a depth-1 react_llm with a python tool that reads a COPY of
+        The example: a depth-1 react_auto with a python tool that reads a COPY of
         the trajectory (`trajectory` kwarg), checks it looks sound, and RETURNs a
         short note ('' if fine). The note is then (a) surfaced as a model-visible
         turn to STEER the next round, and (b) recorded on the private `verifier`
@@ -158,7 +158,7 @@ def base_verifier(messages):
             "that does not add up; verify independently where you can (you have a "
             "python tool). <customize: spell out exactly what THIS verifier checks. If "
             "your check hands the circuit a python tool, also describe what that tool can "
-            "do — the REPL helpers in scope and how to use them — since react_llm's "
+            "do — the REPL helpers in scope and how to use them — since react_auto's "
             "sub-agent only knows what you tell it.>"
         )
         instruction = (
@@ -166,14 +166,14 @@ def base_verifier(messages):
             "worth double-checking, and RETURN a short note (empty string '' if it "
             "looks fine). <customize for your specific check>."
         )
-        note = react_llm(
+        note = react_auto(
             [{"role": "system", "content": system},
              {"role": "user", "content": instruction}],
-            # Hand the circuit a COPY: react_llm binds kwargs by reference into the
-            # sub-LLM's scope, so passing `messages` directly would let the
+            # Hand the circuit a COPY: the state dict IS the sub-LLM's namespace and
+            # is bound by reference, so passing `messages` directly would let the
             # verification sub-LLM mutate the AGENT's real trajectory.
-            kwargs={"trajectory": copy.deepcopy(messages)},
-            max_turns=3, depth=1,                # DEPTH-1 circuit; bounded rounds
+            {"trajectory": copy.deepcopy(messages)},
+            max_turns=3,                # DEPTH-1 circuit; bounded rounds
         )
         if note:
             # STEER the sub-LLM: a turn it SEES (its view) — inject doubt / force a
@@ -208,12 +208,12 @@ def base_verifier(messages):
         )
         Approval = Constraint.field(type=bool)
 
-        # react_llm #1 — PROPOSE the edit as code (reads a COPY; does NOT apply it).
+        # react_auto #1 — PROPOSE the edit as code (reads a COPY; does NOT apply it).
         # A proposer that can't produce a valid edit (or never RETURNs) just means
         # "no change this round" — catch the constraint failure rather than crashing
         # the agent over an auxiliary control circuit.
         try:
-            code = react_llm(
+            code = react_auto(
                 [{"role": "system", "content":
                   "You PROPOSE a repair to the agent's trajectory. `trajectory` is the list of "
                   "message dicts. RETURN a short PYTHON snippet (a string) that edits "
@@ -221,35 +221,35 @@ def base_verifier(messages):
                   "reorder — or RETURN '' if no edit is warranted. Do NOT apply anything "
                   "yourself; an independent reviewer decides whether to run your code."},
                  {"role": "user", "content": "Propose the edit as a python string, or ''."}],
-                kwargs={"trajectory": copy.deepcopy(messages)},
-                constraint=EditCode, max_turns=3, depth=1,
+                {"trajectory": copy.deepcopy(messages)},
+                constraint=EditCode, max_turns=3,
             )
         except ConstraintViolation:
             return                                   # no valid proposal -> no change
         if not code:
             return
-        # react_llm #2 — APPROVE or reject that exact code (an independent check).
+        # react_auto #2 — APPROVE or reject that exact code (an independent check).
         try:
-            approved = react_llm(
+            approved = react_auto(
                 [{"role": "system", "content":
                   "You are an INDEPENDENT reviewer. The python in `code` will be run against the "
                   "live `trajectory` if you approve. Judge whether it is a SAFE, correct repair. "
                   "RETURN True to apply it, False to reject."},
                  {"role": "user", "content": "Proposed edit:\n" + str(code)}],
-                kwargs={"trajectory": copy.deepcopy(messages), "code": str(code)},
-                constraint=Approval, max_turns=2, depth=1,
+                {"trajectory": copy.deepcopy(messages), "code": str(code)},
+                constraint=Approval, max_turns=2,
             )
         except ConstraintViolation:
             return                                   # reviewer gave no valid verdict -> don't apply
         if approved is True:
             # APPROVED: the VERIFIER (trusted scope) applies the edit to the LIVE
             # trajectory via `exec_ns` — a REPL global already in scope (injected by the
-            # kernel like `react_llm` / `parallel`; no import needed) — so the
+            # kernel like `react_auto` / `parallel`; no import needed) — so the
             # proposing/approving sub-LLMs never touched the real list. The restricted
             # builtins (list surgery only — no import/open/eval) raise the bar against the
             # obvious/accidental reach, but they are NOT a true sandbox (the deliberate
             # `().__class__.__subclasses__()` walk remains — the same residual the
-            # react_llm ns has; see exec_ns). The REAL gate is the two independent LLM
+            # react_auto ns has; see exec_ns). The REAL gate is the two independent LLM
             # reviewers above (propose -> approve); this is PLM's OWN code, self-approved.
             _safe = {"len": len, "range": range, "list": list, "dict": dict,
                      "str": str, "enumerate": enumerate, "sorted": sorted}

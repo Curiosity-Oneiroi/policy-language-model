@@ -233,7 +233,7 @@ def _policy_call(name: str):
     if d >= POLICY_CALL_DEPTH_CAP:
         raise RecursionError(
             f"Policy call depth {d} reached cap ({POLICY_CALL_DEPTH_CAP}) "
-            f"calling {name!r}. Refactor to iteration or compose with react_llm."
+            f"calling {name!r}. Refactor to iteration or compose with react_auto."
         )
     tok = _POLICY_CALL_DEPTH.set(d + 1)
     try:
@@ -426,7 +426,7 @@ class _FunctionPolicy:
                 return _fail(PolicyOp.NAME_INVALID,
                              f"{self._p_name}._rewrite: cannot rename to {new_name!r} — {_rn}")
         # Rename-collision guard: a rename must not CLOBBER another policy or a
-        # kernel-internal name. Without this, `mutable._rewrite("def natural_llm():
+        # kernel-internal name. Without this, `mutable._rewrite("def llm():
         # ...")` would take over the immutable default's slot (the gate above only
         # checks THIS proxy's flag). Editing in place (new_name == old) is fine.
         if new_name != self._p_name and (

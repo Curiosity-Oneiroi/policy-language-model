@@ -76,7 +76,7 @@ def parallel(*tasks, max_workers=None):
         # any zero-arg callables — plain functions, policies, sub-LLM calls, ...
         a, b, c = parallel(lambda: heavy_compute(data),
                            lambda: my_policy(x),
-                           lambda: natural_llm(m))
+                           lambda: llm(m))
 
         # editing one policy in a branch: grant it (read-only branches stay bare lambdas):
         r_edit, score = parallel(
